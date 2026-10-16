@@ -8,6 +8,8 @@
     { "path": "src/config" },
     { "path": "src/store" },
     { "path": "src/policy" },
+    { "path": "src/pairing" },
+    { "path": "src/vault" },
     { "path": "src/gateway" }
   ]
 }

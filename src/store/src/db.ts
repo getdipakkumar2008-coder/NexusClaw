@@ -17,6 +17,28 @@ const SCHEMA: readonly string[] = [
    );
    CREATE INDEX events_session_seq ON events(session, seq);
    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);`,
+  // v2: channel senders and pairing challenges (docs/05 section 2). Codes are stored only as hashes.
+  `CREATE TABLE senders (
+     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+     channel     TEXT NOT NULL,
+     account_id  TEXT NOT NULL,
+     external_id TEXT NOT NULL,
+     display     TEXT NOT NULL DEFAULT '',
+     status      TEXT NOT NULL CHECK (status IN ('pending','paired','blocked')),
+     role        TEXT NOT NULL DEFAULT 'guest' CHECK (role IN ('owner','guest')),
+     created_at  INTEGER NOT NULL,
+     paired_at   INTEGER,
+     last_challenge_at INTEGER,
+     UNIQUE (channel, account_id, external_id)
+   );
+   CREATE TABLE pairing_requests (
+     code_hash TEXT PRIMARY KEY,
+     sender_id INTEGER NOT NULL REFERENCES senders(id) ON DELETE CASCADE,
+     created_at INTEGER NOT NULL,
+     expires_at INTEGER NOT NULL
+   );
+   CREATE INDEX pairing_requests_sender ON pairing_requests(sender_id);
+   CREATE INDEX pairing_requests_created ON pairing_requests(created_at);`,
 ];
 
 export const SCHEMA_VERSION = SCHEMA.length;
