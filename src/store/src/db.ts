@@ -70,6 +70,14 @@ const SCHEMA: readonly string[] = [
      error      TEXT
    );
    CREATE INDEX runs_session ON runs(session_id, created_at);`,
+  // v4: plugin trust. A row exists only for a plugin the owner has approved; the hash pins the exact code and permissions.
+  `CREATE TABLE plugins (
+     id           TEXT PRIMARY KEY,
+     enabled      INTEGER NOT NULL DEFAULT 0,
+     version      TEXT NOT NULL,
+     approval     TEXT NOT NULL,
+     approved_at  INTEGER NOT NULL
+   );`,
 ];
 
 export const SCHEMA_VERSION = SCHEMA.length;

@@ -22,7 +22,7 @@
 2. **Estimates** are rough (no team velocity data).
 3. **Not independently verified:** the reference project's licence/trademark terms, ACP and A2A spec licences and stability, App Store/Play policies on AI host-control apps, WhatsApp/Signal/iMessage integration viability. These need owner/counsel/spike confirmation (11 §C).
 4. **Memory design** (FR-MEM) is intentionally minimal; retrieval quality and poisoning defences (T19) need deeper design before Phase 1 ends.
-5. **Plugin isolation** (child processes) may not enforce fs/network permissions on all OSes; some permissions are advisory.
+5. **Plugin isolation** (child processes) may not enforce fs/network permissions on all OSes; some permissions are advisory. *Update 2026-10-16 (WP9): measured. Node's permission model enforces file and exec/worker limits for plugin processes on the tested versions; network remains advisory and is labelled as such to the owner.*
 6. **Subagents/automations** are specified at requirement level only; detailed design deferred to Phase 2.
 7. Several req.odt-derived names remain as placeholders pending Q-19.
 8. Docs were reviewed by the author only; recommend one independent human review (security + product) before approval.

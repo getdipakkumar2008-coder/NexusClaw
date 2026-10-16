@@ -119,6 +119,9 @@ importers:
       '@clawnexus/plugin-sdk':
         specifier: workspace:*
         version: link:../../packages/plugin-sdk
+      '@clawnexus/plugins':
+        specifier: workspace:*
+        version: link:../plugins
       '@clawnexus/policy':
         specifier: workspace:*
         version: link:../policy
@@ -150,6 +153,24 @@ importers:
       '@clawnexus/store':
         specifier: workspace:*
         version: link:../store
+
+  src/plugins:
+    dependencies:
+      '@clawnexus/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+      '@clawnexus/policy':
+        specifier: workspace:*
+        version: link:../policy
+      '@clawnexus/store':
+        specifier: workspace:*
+        version: link:../store
+      '@clawnexus/tools':
+        specifier: workspace:*
+        version: link:../tools
+      zod:
+        specifier: ^4.0.0
+        version: 4.6.7
 
   src/policy: {}
 

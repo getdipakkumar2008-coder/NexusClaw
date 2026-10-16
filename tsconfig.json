@@ -12,6 +12,7 @@
     { "path": "src/sessions" },
     { "path": "src/tools" },
     { "path": "src/acp" },
+    { "path": "src/plugins" },
     { "path": "src/vault" },
     { "path": "src/gateway" },
     { "path": "src/daemon" }

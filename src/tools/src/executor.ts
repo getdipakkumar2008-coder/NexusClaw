@@ -95,6 +95,33 @@ export class ToolExecutor {
     this.o = { defaultTimeoutMs: 30_000, abortGraceMs: 3_000, maxOutputBytes: 256 * 1024, ...opts };
   }
 
+  /** Tool names grouped by who added them, so a plugin's tools can be withdrawn together. */
+  private readonly owned = new Map<string, string[]>();
+
+  /**
+   * Add tools on behalf of an owner (a plugin). A name that is already taken is an error: a plugin can never
+   * replace or shadow a built-in tool, nor another plugin's. All-or-nothing.
+   */
+  addTools(owner: string, defs: readonly ToolDef<any>[]): void { // eslint-disable-line @typescript-eslint/no-explicit-any
+    const names = new Set<string>();
+    const mine = new Set(this.owned.get(owner));
+    for (const d of defs) {
+      if ((this.tools.has(d.name) && !mine.has(d.name)) || names.has(d.name)) throw new Error(`tool ${d.name} already exists`);
+      names.add(d.name);
+    }
+    this.removeTools(owner);
+    for (const d of defs) this.tools.set(d.name, d);
+    this.owned.set(owner, [...names]);
+  }
+
+  removeTools(owner: string): void {
+    for (const n of this.owned.get(owner) ?? []) {
+      this.tools.delete(n);
+      this.schemas.delete(n);
+    }
+    this.owned.delete(owner);
+  }
+
   list(): Array<{ name: string; description: string; risk: Risk; inputSchema: Record<string, unknown> }> {
     return [...this.tools.values()].map((t) => ({ name: t.name, description: t.description, risk: t.risk, inputSchema: this.jsonSchema(t) }));
   }

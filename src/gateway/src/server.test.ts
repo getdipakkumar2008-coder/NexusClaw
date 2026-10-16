@@ -1,7 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { FakeProvider } from "@clawnexus/sessions";
@@ -625,4 +626,102 @@ describe("tool bridge credentials (model-driven tool calls)", () => {
     await gw.stop();
     expect(gw.bridgeGrants.lookup(m.token)).toBeUndefined();
   });
+});
+
+describe("plugins over the wire", () => {
+  const SAMPLE = fileURLToPath(new URL("../../../extensions/hello-tool", import.meta.url));
+
+  it("the sample plugin installs, is enabled only with the reviewed approval code, and its tools work", async () => {
+    await boot();
+    const c = await authed();
+    expect((await c.call("plugin.list")).result.plugins).toEqual([]);
+
+    const inst = await c.call("plugin.install", { path: SAMPLE });
+    expect(inst.ok).toBe(true);
+    expect(inst.result.plugin).toMatchObject({ id: "hello-tool", status: "disabled", trust: "local-unsigned" });
+    expect((await c.call("tool.list")).result.tools.map((t: { name: string }) => t.name)).not.toContain("hello-tool.greet");
+
+    const bad = await c.call("plugin.enable", { id: "hello-tool", approvalToken: "nope" });
+    expect(bad.error?.code).toBe("PLUGIN.CHANGED");
+    const token = inst.result.plugin.approvalToken as string;
+    const on = await c.call("plugin.enable", { id: "hello-tool", approvalToken: token });
+    expect(on.result.plugin.status).toBe("running");
+    expect(on.result.plugin.tools).toEqual(["hello-tool.greet", "hello-tool.add"]);
+
+    const tools = (await c.call("tool.list")).result.tools as Array<{ name: string; inputSchema: { properties: Record<string, unknown> } }>;
+    expect(tools.find((t) => t.name === "hello-tool.add")?.inputSchema.properties).toHaveProperty("a");
+    const g = await c.call("tool.call", { tool: "hello-tool.greet", args: { name: "Ada" } });
+    expect(g.result).toMatchObject({ status: "ok", output: "Hello, Ada!", taints: true });
+    expect((await c.call("tool.call", { tool: "hello-tool.add", args: { a: 2, b: 3 } })).result.output).toEqual({ sum: 5 });
+    expect((await c.call("tool.call", { tool: "hello-tool.add", args: { a: "2", b: 3 } })).result.status).toBe("error");
+  }, 30_000);
+
+  it("enabled plugins come back after a Gateway restart; changed ones do not", async () => {
+    await boot();
+    let c = await authed();
+    const inst = await c.call("plugin.install", { path: SAMPLE });
+    await c.call("plugin.enable", { id: "hello-tool", approvalToken: inst.result.plugin.approvalToken });
+    c.close();
+    await gw.stop();
+
+    await boot();
+    c = await authed();
+    expect((await c.call("plugin.info", { id: "hello-tool" })).result.plugin.status).toBe("running");
+    expect((await c.call("tool.call", { tool: "hello-tool.greet", args: { name: "again" } })).result.output).toBe("Hello, again!");
+    c.close();
+    await gw.stop();
+
+    writeFileSync(join(dir, "plugins", "hello-tool", "index.mjs"), `${readFileSync(join(dir, "plugins", "hello-tool", "index.mjs"), "utf8")}\n// edited\n`);
+    await boot();
+    c = await authed();
+    expect((await c.call("plugin.info", { id: "hello-tool" })).result.plugin.status).toBe("needs_approval");
+    expect((await c.call("tool.list")).result.tools.map((t: { name: string }) => t.name)).not.toContain("hello-tool.greet");
+  }, 60_000);
+
+  it("a model's tool bridge can use plugin tools under the same policy but cannot manage plugins", async () => {
+    await boot();
+    const o = await authed();
+    const inst = await o.call("plugin.install", { path: SAMPLE });
+    await o.call("plugin.enable", { id: "hello-tool", approvalToken: inst.result.plugin.approvalToken });
+
+    const m = gw.mintBridge({ session: "sess-P", principal: "owner" });
+    const a = await Client.open(port);
+    clients.push(a);
+    expect((await a.hello(m.token)).result.role).toBe("agent");
+    expect((await a.call("tool.list")).result.tools.map((t: { name: string }) => t.name)).toContain("hello-tool.greet");
+    expect((await a.call("tool.call", { tool: "hello-tool.greet", args: { name: "model" } })).result.output).toBe("Hello, model!");
+    for (const [method, params] of [
+      ["plugin.list", {}],
+      ["plugin.info", { id: "hello-tool" }],
+      ["plugin.install", { path: SAMPLE, replace: true }],
+      ["plugin.enable", { id: "hello-tool", approvalToken: "x" }],
+      ["plugin.disable", { id: "hello-tool" }],
+      ["plugin.remove", { id: "hello-tool" }],
+    ] as const) {
+      expect((await a.call(method, params)).error?.code, method).toBe("AUTH.FORBIDDEN");
+    }
+  }, 30_000);
+
+  it("rejects hostile plugin requests: bad ids, relative paths, missing folders, unknown plugins", async () => {
+    await boot();
+    const c = await authed();
+    for (const id of ["../etc", "A", "a/b", "x".repeat(70)]) {
+      expect((await c.call("plugin.info", { id })).ok, id).toBe(false);
+    }
+    expect((await c.call("plugin.install", { path: "relative/dir" })).error?.code).toBe("UNSUPPORTED.BAD_PARAMS");
+    expect((await c.call("plugin.install", { path: join(dir, "does-not-exist") })).error?.code).toBe("PLUGIN.INVALID");
+    expect((await c.call("plugin.info", { id: "ghost" })).error?.code).toBe("PLUGIN.NOT_FOUND");
+    expect((await c.call("plugin.install", { path: SAMPLE, extra: 1 })).error?.code).toBe("UNSUPPORTED.BAD_PARAMS");
+  });
+
+  it("disable and remove take the tools away", async () => {
+    await boot();
+    const c = await authed();
+    const inst = await c.call("plugin.install", { path: SAMPLE });
+    await c.call("plugin.enable", { id: "hello-tool", approvalToken: inst.result.plugin.approvalToken });
+    expect((await c.call("plugin.disable", { id: "hello-tool" })).result.plugin.status).toBe("disabled");
+    expect((await c.call("tool.call", { tool: "hello-tool.greet", args: { name: "x" } })).result.code).toBe("UNKNOWN_TOOL");
+    expect((await c.call("plugin.remove", { id: "hello-tool" })).ok).toBe(true);
+    expect((await c.call("plugin.list")).result.plugins).toEqual([]);
+  }, 30_000);
 });

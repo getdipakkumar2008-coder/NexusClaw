@@ -63,3 +63,11 @@ Before accepting a new channel/MCP path, check the "existing infrastructure" lis
 
 ## 9. Acceptance
 Plugin conformance kit; crash-isolation test; permission-enforcement tests; signature-verification tests (tampered package must fail); SDK API-diff gate; sample plugins (hello-tool, hello-channel, hello-bundle) built in CI.
+
+## 10. Implementation status (WP9 slice 1, 2026-10-16)
+What exists today (see docs/15 for the full decision note):
+- **Code plugins with tools only.** `definePlugin`/`ctx.registerTool` with a typed argument spec; channels, providers, hooks, services, `ctx.config`, `ctx.secrets`, `ctx.http` and `ctx.storage` are not built yet. SDK version 0.2.0 (pre-1.0: caret ranges need the same minor).
+- **Manifest rules actually enforced:** `permissions.fs` is only `["data"]`; `permissions.exec` starts programs; `permissions.network` is a declaration only; `permissions.secrets` are accepted but none are given yet. `entry` must be an ES module inside the folder.
+- **Enforcement:** file access and program/worker creation are enforced by Node's permission model (`--permission`), measured on Node 24 (Windows) and checked in CI on Node 22. Network is advisory. This closes the open question in the isolation spike for file and exec permissions.
+- **Trust:** installing is a copy plus checks; enabling needs the approval code for the exact code and permissions; any change forces a new approval. There are no signatures, tiers or registry yet, so every plugin is shown as `local-unsigned`.
+- **Sample:** `extensions/hello-tool`. `hello-channel` and `hello-bundle` come with channels and bundle support.

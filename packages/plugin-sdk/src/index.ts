@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /** Semver of this SDK. Only symbols exported here are public API (docs/04 section 4). */
-export const SDK_VERSION = "0.1.0";
+export const SDK_VERSION = "0.2.0";
 
 export const pluginKindSchema = z.enum(["code", "bundle"]);
 
@@ -60,9 +60,62 @@ export function sdkRangeSatisfied(range: string, host: string = SDK_VERSION): bo
   return hp >= wp;
 }
 
+/** Upper bounds the host enforces on everything a plugin declares. They protect the model's context and the Gateway. */
+export const LIMITS = {
+  toolsPerPlugin: 32,
+  argsPerTool: 16,
+  descriptionChars: 500,
+  stringMax: 65_536,
+  enumValues: 64,
+  resultBytes: 256 * 1024,
+  toolTimeoutMs: 120_000,
+} as const;
+
+const argBase = { description: z.string().max(200).optional(), optional: z.boolean().optional() };
+
+/**
+ * One argument of a plugin tool. Deliberately small: the host builds a strict validator from this, so arguments are
+ * checked before the plugin ever sees them, and the same declaration becomes the model's input schema.
+ */
+export const argSpecSchema = z.discriminatedUnion("type", [
+  z.strictObject({
+    type: z.literal("string"),
+    maxLength: z.number().int().min(1).max(LIMITS.stringMax).optional(),
+    enum: z.array(z.string().max(200)).min(1).max(LIMITS.enumValues).optional(),
+    ...argBase,
+  }),
+  z.strictObject({ type: z.literal("integer"), min: z.number().int().optional(), max: z.number().int().optional(), ...argBase }),
+  z.strictObject({ type: z.literal("number"), min: z.number().finite().optional(), max: z.number().finite().optional(), ...argBase }),
+  z.strictObject({ type: z.literal("boolean"), ...argBase }),
+]);
+export type ArgSpec = z.infer<typeof argSpecSchema>;
+
+/** What a plugin tells the host about a tool (plain data; the function stays inside the plugin process). */
+export const toolRegistrationSchema = z.strictObject({
+  name: z.string().regex(/^[a-z][a-z0-9_]{0,39}$/, "tool names are lowercase letters, digits and underscores"),
+  description: z.string().min(1).max(LIMITS.descriptionChars),
+  /** Declared risk. The host never goes below what the manifest's permissions imply. */
+  risk: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3), z.literal(4)]).default(0),
+  args: z
+    .record(z.string().regex(/^[a-z][A-Za-z0-9_]{0,39}$/), argSpecSchema)
+    .refine((a) => Object.keys(a).length <= LIMITS.argsPerTool, `at most ${LIMITS.argsPerTool} arguments`)
+    .default({}),
+  timeoutMs: z.number().int().min(100).max(LIMITS.toolTimeoutMs).optional(),
+});
+export type ToolRegistration = z.infer<typeof toolRegistrationSchema>;
+
+export interface PluginToolDefinition extends z.input<typeof toolRegistrationSchema> {
+  /** Runs inside the plugin process. The result must be JSON-serialisable. `signal` aborts on timeout or cancel. */
+  run(args: Record<string, unknown>, call: { signal: AbortSignal }): unknown | Promise<unknown>;
+}
+
 export interface PluginContext {
   readonly pluginId: string;
   log: (level: "debug" | "info" | "warn" | "error", message: string, fields?: Record<string, unknown>) => void;
+  /** Directory this plugin may read and write, present only if the manifest asked for `data` access. */
+  readonly dataDir: string | undefined;
+  /** Register a tool. Only possible during `setup`. */
+  registerTool(def: PluginToolDefinition): void;
 }
 
 export interface PluginDefinition {

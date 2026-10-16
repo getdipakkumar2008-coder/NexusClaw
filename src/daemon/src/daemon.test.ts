@@ -511,3 +511,50 @@ describe("tool bridge end to end (WP7 slice 2)", () => {
     expect(io.errText).toContain("not meant to be run by hand");
   });
 });
+
+describe("plugins from the command line", () => {
+  const SAMPLE = fileURLToPath(new URL("../../../extensions/hello-tool", import.meta.url));
+
+  it("install, review, enable only with --yes, use a tool, disable, remove", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    const port = String(await start(true));
+    const p = (...a: string[]) => cli([...a, "--port", port]);
+
+    expect((await p("plugins", "list")).out).toContain("No plugins installed");
+    const inst = await p("plugins", "install", SAMPLE);
+    expect(inst.code).toBe(0);
+    expect(inst.out).toContain("Nothing has been run and it is not enabled");
+    expect(inst.out).toContain("cannot start programs (enforced)");
+    expect(inst.out).toContain("not signed");
+
+    const review = await p("plugins", "enable", "hello-tool");
+    expect(review.code).toBe(1);
+    expect(review.err).toContain("CONFIRM_REQUIRED");
+    expect(review.out).toContain("it will be allowed to");
+    expect((await p("plugins", "list")).out).toMatch(/hello-tool\s+disabled/);
+
+    const on = await p("plugins", "enable", "hello-tool", "--yes");
+    expect(on.code).toBe(0);
+    expect(on.out).toContain("hello-tool.greet");
+    expect((await p("plugins", "list")).out).toMatch(/hello-tool\s+running/);
+
+    const call = await p("tool", "call", "hello-tool.greet", "--args", '{"name":"CLI"}');
+    expect(call.out).toContain("Hello, CLI!");
+
+    expect((await p("plugins", "disable", "hello-tool")).out).toContain("Disabled");
+    expect((await p("tool", "call", "hello-tool.greet", "--args", '{"name":"x"}')).out).toContain("UNKNOWN_TOOL");
+    const rm = await p("plugins", "remove", "hello-tool");
+    expect(rm.out).toContain("data folder was kept");
+    expect((await p("plugins", "list")).out).toContain("No plugins installed");
+  }, 60_000);
+
+  it("explains a bad folder and an unknown command", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    const port = String(await start(true));
+    const bad = await cli(["plugins", "install", join(base, "nothing-here"), "--port", port]);
+    expect(bad.code).toBe(1);
+    expect(bad.err).toContain("PLUGIN.INVALID");
+    expect(bad.err).toContain("Fix:");
+    expect((await cli(["plugins", "frobnicate", "--port", port])).err).toContain("USAGE");
+  });
+});

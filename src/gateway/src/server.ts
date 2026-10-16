@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { Duplex } from "node:stream";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
 import { BRAND } from "@clawnexus/brand";
@@ -19,6 +19,7 @@ import { PairingError, PairingService } from "@clawnexus/pairing";
 import { ApprovalError, ApprovalStore } from "@clawnexus/policy";
 import { BUILTIN_TOOLS, ToolExecutor, WorkspaceGuard } from "@clawnexus/tools";
 import { BridgeRegistry, type BridgeGrant, type MintOptions } from "./bridge.js";
+import { PluginError, PluginHost, type HostOptions } from "@clawnexus/plugins";
 import { SessionError, SessionManager, type Provider, type SessionManagerOptions } from "@clawnexus/sessions";
 
 export interface GatewayOptions {
@@ -27,6 +28,8 @@ export interface GatewayOptions {
   /** Defaults to the config's gateway.bind / gateway.port, else 127.0.0.1:7391. Port 0 picks a free port. */
   host?: string;
   port?: number;
+  /** Tuning for the plugin host (mainly for tests). */
+  plugins?: Partial<Pick<HostOptions, "childFile" | "restart" | "startTimeoutMs" | "graceMs" | "memoryMb" | "hostSdk">>;
   config?: Pick<Config, "gateway"> & Partial<Pick<Config, "security">>;
   /** Model runtime for session runs. Without one, `session.send` fails with PROVIDER.NOT_CONFIGURED. */
   provider?: Provider;
@@ -92,6 +95,7 @@ export class Gateway {
   readonly tools: ToolExecutor;
   readonly approvals: ApprovalStore;
   readonly bridgeGrants: BridgeRegistry;
+  readonly plugins: PluginHost;
   private readonly profile: "standard" | "locked-down" | "trusted";
   readonly tokenPath: string;
 
@@ -145,6 +149,7 @@ export class Gateway {
     const workspace = opts.workspace ?? join(opts.dataDir, "workspace");
     mkdirSync(workspace, { recursive: true, mode: 0o700 });
     this.tools = new ToolExecutor({ events: this.events, approvals: this.approvals, guard: new WorkspaceGuard([workspace]), tools: BUILTIN_TOOLS });
+    this.plugins = new PluginHost({ dataDir: opts.dataDir, db: this.db, events: this.events, tools: this.tools, now: this.o.now, ...opts.plugins });
     this.sessions = opts.provider ? new SessionManager(this.db, this.events, opts.provider, { now: this.o.now, ...opts.sessions }) : undefined;
 
     this.http = createServer((req, res) => this.handleHttp(req, res));
@@ -163,6 +168,8 @@ export class Gateway {
     });
     const addr = this.http.address();
     this.boundPort = typeof addr === "object" && addr ? addr.port : this.requestedPort;
+    // Enabled plugins start now. A plugin that cannot start is contained and reported; it never blocks the Gateway.
+    await this.plugins.startEnabled().catch(() => undefined);
     this.ready = true;
     this.events.append([{ type: "gateway.started", data: { version: VERSION } }]);
     return { host: this.host, port: this.boundPort };
@@ -182,6 +189,7 @@ export class Gateway {
       c.ws.close(1001, "gateway shutting down");
     }
     await this.sessions?.close();
+    await this.plugins.stop();
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     this.http.closeAllConnections();
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
@@ -489,6 +497,15 @@ export class Gateway {
         });
       }
 
+      case "plugin.list":
+        return { plugins: this.plugins.list() };
+      case "plugin.info":
+      case "plugin.install":
+      case "plugin.enable":
+      case "plugin.disable":
+      case "plugin.remove":
+        return this.pluginMethod(method, params);
+
       case "session.list":
       case "session.get":
       case "session.create":
@@ -501,6 +518,39 @@ export class Gateway {
 
       default:
         throw new MethodError(err("UNSUPPORTED.METHOD", `unknown method ${method}`, "See docs/03-gateway-protocol.md for the method list."));
+    }
+  }
+
+  private async pluginMethod(method: string, params: unknown): Promise<unknown> {
+    const id = z.string().min(1).max(64);
+    try {
+      switch (method) {
+        case "plugin.info": {
+          const p = z.strictObject({ id }).parse(params);
+          return { plugin: this.plugins.info(p.id) };
+        }
+        case "plugin.install": {
+          const p = z.strictObject({ path: z.string().min(1).max(1024), replace: z.boolean().optional() }).parse(params);
+          if (!isAbsolute(p.path)) throw new MethodError(err("UNSUPPORTED.BAD_PARAMS", "the plugin path must be absolute", "Pass the full path of the plugin folder."));
+          return { plugin: await this.plugins.install(p.path, { replace: p.replace === true }) };
+        }
+        case "plugin.enable": {
+          const p = z.strictObject({ id, approvalToken: z.string().min(1).max(128) }).parse(params);
+          return { plugin: await this.plugins.enable(p.id, p.approvalToken) };
+        }
+        case "plugin.disable": {
+          const p = z.strictObject({ id }).parse(params);
+          return { plugin: await this.plugins.disable(p.id) };
+        }
+        default: {
+          const p = z.strictObject({ id, purgeData: z.boolean().optional() }).parse(params);
+          await this.plugins.remove(p.id, { purgeData: p.purgeData === true });
+          return {};
+        }
+      }
+    } catch (e) {
+      if (e instanceof PluginError) throw new MethodError(err(`PLUGIN.${e.code}`, e.message, e.remediation));
+      throw e;
     }
   }
 

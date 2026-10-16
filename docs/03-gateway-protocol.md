@@ -35,6 +35,7 @@ Max frame 1 MiB; larger payloads via `/v1/upload` + blob reference.
 | connect | `hello`, `auth.challenge`, `auth.verify`, `auth.refresh` |
 | sessions | `session.list`, `session.get`, `session.create`, `session.send`, `session.cancel`, `session.export`, `session.delete` |
 | approvals | `approval.list`, `approval.decide` (owner); `approval.status` (tool bridge, own approvals only) |
+| plugins (owner only) | `plugin.list`, `plugin.info`, `plugin.install` (absolute folder path, `replace`), `plugin.enable` (`id`, `approvalToken`), `plugin.disable`, `plugin.remove` (`purgeData`) |
 | tools | `tool.list`, `tool.call` (owner; a tool bridge may call these as its session's principal) |
 | events | `events.subscribe {sessions?, since:seq}`, `events.unsubscribe` |
 | channels | `channel.list`, `channel.status`, `channel.enable/disable`, `pairing.list`, `pairing.approve`, `pairing.deny` |

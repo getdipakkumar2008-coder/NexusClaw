@@ -15,6 +15,7 @@
       "@clawnexus/sessions": ["src/sessions/src/index.ts"],
       "@clawnexus/tools": ["src/tools/src/index.ts"],
       "@clawnexus/acp": ["src/acp/src/index.ts"],
+      "@clawnexus/plugins": ["src/plugins/src/index.ts"],
       "@clawnexus/vault": ["src/vault/src/index.ts"],
       "@clawnexus/gateway": ["src/gateway/src/index.ts"],
       "@clawnexus/daemon": ["src/daemon/src/index.ts"]

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { BRAND } from "@clawnexus/brand";
 import { PROTOCOL_VERSION } from "@clawnexus/protocol";
 import { parseArgs, strFlag, type Parsed } from "./args.js";
@@ -47,6 +47,7 @@ Talk to a running Gateway
   pairing list|approve|deny [CODE]
   approvals list|approve|deny [ID]
   tool list | tool call <name> --args '<json>' [--approval ID]
+  plugins list|info|install|enable|disable|remove [ID | PATH]  [--yes] [--replace] [--purge-data]
 
 Options
   --json            machine-readable output
@@ -275,7 +276,87 @@ const tool: Handler = (c) =>
     return 0;
   });
 
-const HANDLERS: Record<string, Handler> = { status, chat, sessions, pairing, approvals, tool };
+interface PluginView {
+  id: string;
+  status: string;
+  reason?: string;
+  trust: string;
+  name?: string;
+  version?: string;
+  kind?: string;
+  permissions?: { network: string[]; fs: string[]; exec: boolean; secrets: string[] };
+  enforcement?: { fs: string; exec: string; network: string; secrets: string };
+  riskFloor?: number;
+  approvalToken?: string;
+  tools: string[];
+  problems?: string[];
+}
+
+/** What the owner is agreeing to, in plain words, with honesty about what the system can and cannot hold the plugin to. */
+function describePlugin(p: PluginView): string {
+  const perm = p.permissions;
+  const lines = [
+    `${p.id}${p.name ? `  (${p.name}${p.version ? ` ${p.version}` : ""})` : ""}`,
+    `  status:   ${p.status}${p.reason ? ` - ${p.reason}` : ""}`,
+    `  trust:    ${p.trust} (not signed, not from a registry; only install code you trust)`,
+  ];
+  if (p.problems && p.problems.length > 1) lines.push(...p.problems.map((x) => `  problem:  ${x}`));
+  if (perm) {
+    lines.push(
+      "  it will be allowed to:",
+      `    files:    ${perm.fs.length ? "read and write its own data folder (enforced)" : "no file access beyond its own code (enforced)"}`,
+      `    programs: ${perm.exec ? "start other programs (enforced) - treat as full access to this computer" : "cannot start programs (enforced)"}`,
+      `    network:  ${perm.network.length ? `${perm.network.join(", ")} - declared only; NOT enforced, the plugin could reach other hosts` : "none declared (not enforced: a plugin can still try to reach the network)"}`,
+      `    secrets:  ${perm.secrets.length ? `${perm.secrets.join(", ")} - not available yet; none will be given` : "none"}`,
+      `  its tools are never rated below risk class R${p.riskFloor ?? 0}, and their output is treated as untrusted`,
+    );
+  }
+  if (p.tools.length) lines.push(`  tools:    ${p.tools.join(", ")}`);
+  return `${lines.join("\n")}\n`;
+}
+
+const plugins: Handler = (c) =>
+  withClient(c, async (g) => {
+    const sub = c.p.positionals[1] ?? "list";
+    if (sub === "list") {
+      const r = await g.call<{ plugins: PluginView[] }>("plugin.list", {});
+      show(c, r, () =>
+        r.plugins.length
+          ? `${r.plugins.map((p) => `${p.id.padEnd(22)} ${p.status.padEnd(15)} ${p.version ?? ""}${p.reason && p.status !== "disabled" ? `   ${p.reason}` : ""}`).join("\n")}\n`
+          : `No plugins installed. Install one with \`${BRAND.cli} plugins install <folder>\`.\n`,
+      );
+    } else if (sub === "info") {
+      const r = await g.call<{ plugin: PluginView }>("plugin.info", { id: need(c.p, 2, "plugin id") });
+      show(c, r, () => describePlugin(r.plugin));
+    } else if (sub === "install") {
+      const path = resolve(need(c.p, 2, "plugin folder"));
+      const r = await g.call<{ plugin: PluginView }>("plugin.install", { path, replace: c.p.flags.replace === true });
+      show(c, r, () => `Installed ${r.plugin.id}. Nothing has been run and it is not enabled.\n\n${describePlugin(r.plugin)}\nTo enable it: ${BRAND.cli} plugins enable ${r.plugin.id} --yes\n`);
+    } else if (sub === "enable") {
+      const id = need(c.p, 2, "plugin id");
+      const { plugin } = await g.call<{ plugin: PluginView }>("plugin.info", { id });
+      if (plugin.status === "invalid") throw new CliError("PLUGIN.INVALID", plugin.reason ?? "invalid plugin", "Fix the plugin or reinstall it.");
+      const pinned = strFlag(c.p, "approval");
+      if (c.p.flags.yes !== true && c.p.flags.y !== true) {
+        c.io.out(describePlugin(plugin));
+        throw new CliError("CONFIRM_REQUIRED", "enabling a plugin lets its code run on this computer", `Review the above, then run: ${BRAND.cli} plugins enable ${id} --yes`);
+      }
+      const r = await g.call<{ plugin: PluginView }>("plugin.enable", { id, approvalToken: pinned ?? plugin.approvalToken ?? "" });
+      show(c, r, () => `Enabled ${id}: ${r.plugin.status}${r.plugin.reason ? ` - ${r.plugin.reason}` : ""}\n${r.plugin.tools.length ? `Tools: ${r.plugin.tools.join(", ")}\n` : ""}`);
+      return r.plugin.status === "running" || r.plugin.status === "enabled" ? 0 : 1;
+    } else if (sub === "disable") {
+      const r = await g.call<{ plugin: PluginView }>("plugin.disable", { id: need(c.p, 2, "plugin id") });
+      show(c, r, () => `Disabled ${r.plugin.id}.\n`);
+    } else if (sub === "remove") {
+      const id = need(c.p, 2, "plugin id");
+      const purge = c.p.flags["purge-data"] === true;
+      const r = await g.call("plugin.remove", { id, purgeData: purge });
+      show(c, r, () => `Removed ${id}.${purge ? "" : " Its data folder was kept; add --purge-data to delete it too."}\n`);
+    } else throw new CliError("USAGE", `unknown plugins command ${sub}`, "Use list, info, install, enable, disable or remove.");
+    return 0;
+  });
+
+const HANDLERS: Record<string, Handler> = { status, chat, sessions, pairing, approvals, tool, plugins };
 export const CLIENT_COMMANDS = Object.keys(HANDLERS);
 
 /** Print an error the way users should see it: code, cause, fix. No stack traces. */

@@ -31,7 +31,7 @@ Caveats: a process kill is **not** a power loss. `synchronous=NORMAL` in WAL mod
 | In-process call | ~0.0002 ms |
 | Plugin throws | host kept running; child exited code 1 and the exit was observable |
 
-Conclusion: out-of-process plugins cost ~50 ms to start and ~0.1 ms per call — negligible for channel/tool plugins; ADR-0006 holds. Not measured: per-process memory of many plugins, Windows vs Linux differences, and permission enforcement (Node's permission model or OS sandboxing) — still open (docs/13 weakness 5).
+Conclusion: out-of-process plugins cost ~50 ms to start and ~0.1 ms per call — negligible for channel/tool plugins; ADR-0006 holds. Permission enforcement was measured later (WP9, 2026-10-16, Node 24.18 on Windows): with `--permission` a plugin process could not read files outside its allowed folders, write outside its data folder, import code from elsewhere, start programs or worker threads, and saw none of the parent's environment variables (Windows adds its own standard ones). It could still make network requests, so network permission is advisory. Node 22 is checked in CI. Still not measured: per-process memory of many plugins.
 
 ## Spike 4 — Delegated send grant (`spikes/send-grant`) — **PASS (logic only)**
 Ed25519 Gateway-signed grant bound to device, relay, token hash, expiry, nonce and send quota. Relay accepted valid sends and refused: unattested registration, tampered grant, grant signed by another gateway key, expired, wrong relay, wrong push token, and sends beyond the quota. **This does not validate Apple App Attest or Play Integrity** (needs real devices and vendor services); the attestation step is a stub boolean. ADR-0011's binding logic is sound; the attestation integration remains to be proven in Phase 2/3.
