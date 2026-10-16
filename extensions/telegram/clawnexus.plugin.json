@@ -1,0 +1,17 @@
+{
+  "id": "telegram",
+  "name": "Telegram channel",
+  "version": "0.1.0",
+  "kind": "code",
+  "sdkRange": "^0.3.0",
+  "entry": "index.mjs",
+  "provides": ["channel:telegram"],
+  "permissions": {
+    "network": ["api.telegram.org"],
+    "secrets": ["bot_token"]
+  },
+  "configSchema": {
+    "apiBase": { "type": "string", "maxLength": 200, "optional": true, "description": "Bot API address; leave unset for Telegram itself" },
+    "pollSeconds": { "type": "integer", "min": 0, "max": 50, "optional": true, "description": "How long each wait for new messages lasts (default 25)" }
+  }
+}

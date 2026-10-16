@@ -158,9 +158,11 @@ export function defineConformance(t: TestApi, name: string, make: (s?: Conforman
 
     run("a very long reply is split to fit the platform, in order", async (c) => {
       const a = await pair(c, "alice");
-      const words = Array.from({ length: 150 }, (_, i) => `w${i}`).join(" ");
+      // long enough to need at least three messages on this platform
+      const count = Math.max(150, Math.ceil((c.maxTextChars * 2.5) / 5));
+      const words = Array.from({ length: count }, (_, i) => `w${i}`).join(" ");
       await a.say(words, { messageId: "long-1" });
-      await eventually(() => a.received().join(" ").includes("w149"), "the whole reply");
+      await eventually(() => a.received().join(" ").includes(`w${count - 1}`), "the whole reply");
       const parts = a.received().filter((m) => m.startsWith("echo:") || m.startsWith("w") || m.includes("w1"));
       expect(parts.length).toBeGreaterThan(1);
       for (const p of a.received()) expect(p.length).toBeLessThanOrEqual(c.maxTextChars);
