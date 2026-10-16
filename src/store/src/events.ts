@@ -1,4 +1,4 @@
-import { inTransaction, type Db } from "./db.js";
+import { afterCommit, inTransaction, type Db } from "./db.js";
 
 export interface NewEvent {
   type: string;
@@ -80,14 +80,17 @@ export class EventLog {
       });
     });
 
-    // Notify only after COMMIT; a faulty listener must never affect durability or other listeners.
-    for (const l of [...this.listeners]) {
-      try {
-        l(stored);
-      } catch {
-        /* isolated by design */
+    // Notify only after COMMIT (the outermost one, if the caller opened a transaction); a faulty listener
+    // must never affect durability or other listeners.
+    afterCommit(this.db, () => {
+      for (const l of [...this.listeners]) {
+        try {
+          l(stored);
+        } catch {
+          /* isolated by design */
+        }
       }
-    }
+    });
     return stored;
   }
 

@@ -12,6 +12,7 @@
       "@clawnexus/store": ["src/store/src/index.ts"],
       "@clawnexus/policy": ["src/policy/src/index.ts"],
       "@clawnexus/pairing": ["src/pairing/src/index.ts"],
+      "@clawnexus/sessions": ["src/sessions/src/index.ts"],
       "@clawnexus/vault": ["src/vault/src/index.ts"],
       "@clawnexus/gateway": ["src/gateway/src/index.ts"]
     }

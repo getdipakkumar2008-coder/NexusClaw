@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
+import { FakeProvider } from "@clawnexus/sessions";
 import { Gateway, startGateway, type GatewayOptions } from "./index.js";
 
 interface Res {
@@ -364,5 +365,73 @@ describe("approvals over the protocol", () => {
     expect(gw.approvals.consume(a.id, "exec", { cmd: "ls" })).toBe(true);
     const again = await c.call("approval.decide", { id: a.id, approve: false });
     expect(again.error?.code).toBe("POLICY.APPROVAL");
+  });
+});
+
+describe("sessions over the wire (milestone M1)", () => {
+  it("fails clearly when no provider is configured", async () => {
+    await boot();
+    const c = await authed();
+    const r = await c.call("session.list");
+    expect(r.ok).toBe(false);
+    expect(r.error?.code).toBe("PROVIDER.NOT_CONFIGURED");
+  });
+
+  it("client -> gateway -> fake provider -> streamed reply, then export", async () => {
+    await boot({ provider: new FakeProvider({ chunkSize: 4 }), sessions: { deltaFlushMs: 0 } });
+    const c = await authed();
+    await c.call("events.subscribe");
+    const created = await c.call("session.create", {});
+    expect(created.ok).toBe(true);
+    const sid = created.result.session.id as string;
+    const sent = await c.call("session.send", { session: sid, text: "hello there" });
+    expect(sent.ok).toBe(true);
+    await c.waitFor(() => c.events.some((e) => e.type === "run.completed"));
+    const types = c.events.filter((e) => e.session === sid).map((e) => e.type);
+    expect(types).toEqual(expect.arrayContaining(["message.inbound", "run.started", "run.delta", "message.outbound", "run.completed"]));
+    const got = await c.call("session.get", { session: sid });
+    expect(got.result.messages.map((m: { content: string }) => m.content)).toEqual(["hello there", "echo: hello there"]);
+    const exp = await c.call("session.export", { session: sid });
+    expect(exp.result.content).toContain("echo: hello there");
+    const md = await c.call("session.export", { session: sid, format: "markdown" });
+    expect(md.result.content).toContain("echo: hello there");
+    expect((await c.call("session.delete", { session: sid })).ok).toBe(true);
+    expect((await c.call("session.get", { session: sid })).error?.code).toBe("SESSION.NOT_FOUND");
+  });
+
+  it("session.create is idempotent per key and validates input", async () => {
+    await boot({ provider: new FakeProvider() });
+    const c = await authed();
+    const a = await c.call("session.create", { scope: "x" });
+    const b = await c.call("session.create", { scope: "x" });
+    expect(a.result.session.id).toBe(b.result.session.id);
+    expect((await c.call("session.create", { scope: "" })).ok).toBe(false);
+    expect((await c.call("session.create", { bogus: 1 })).ok).toBe(false);
+    expect((await c.call("session.send", { session: a.result.session.id, text: "  " })).error?.code).toBe("SESSION.INVALID");
+  });
+
+  it("cancels a long run", async () => {
+    await boot({ provider: new FakeProvider({ hang: true }) });
+    const c = await authed();
+    await c.call("events.subscribe");
+    const sid = (await c.call("session.create", {})).result.session.id as string;
+    await c.call("session.send", { session: sid, text: "x" });
+    expect((await c.call("session.cancel", { session: sid })).result.cancelled).toBe(1);
+    await c.waitFor(() => c.events.some((e) => e.type === "run.cancelled"));
+  });
+
+  it("imports an exported transcript", async () => {
+    await boot({ provider: new FakeProvider(), sessions: { deltaFlushMs: 0 } });
+    const c = await authed();
+    const sid = (await c.call("session.create", {})).result.session.id as string;
+    await c.call("session.send", { session: sid, text: "keep me" });
+    await c.waitFor(() => gw.sessions?.messages(sid).length === 2);
+    const content = (await c.call("session.export", { session: sid })).result.content as string;
+    await c.call("session.delete", { session: sid });
+    const imp = await c.call("session.import", { content });
+    expect(imp.ok).toBe(true);
+    const back = await c.call("session.get", { session: imp.result.session.id });
+    expect(back.result.messages).toHaveLength(2);
+    expect((await c.call("session.import", { content: "garbage" })).error?.code).toBe("SESSION.INVALID");
   });
 });

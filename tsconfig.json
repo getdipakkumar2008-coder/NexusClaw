@@ -9,6 +9,7 @@
     { "path": "src/store" },
     { "path": "src/policy" },
     { "path": "src/pairing" },
+    { "path": "src/sessions" },
     { "path": "src/vault" },
     { "path": "src/gateway" }
   ]

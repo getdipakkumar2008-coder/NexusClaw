@@ -23,6 +23,7 @@
     "@clawnexus/store": "workspace:*",
     "@clawnexus/policy": "workspace:*",
     "@clawnexus/pairing": "workspace:*",
+    "@clawnexus/sessions": "workspace:*",
     "ws": "^8.18.0",
     "zod": "^4.0.0"
   },

@@ -19,6 +19,7 @@ export const ERROR_CODE_FAMILIES = [
   "SLOW_CONSUMER",
   "BAD_FRAME",
   "SYNC",
+  "SESSION",
 ] as const;
 
 export const errorCodeSchema = z

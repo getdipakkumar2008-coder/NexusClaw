@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CursorExpiredError, EventLog, MAX_EVENT_BYTES, openDb, type Db } from "./index.js";
+import { CursorExpiredError, EventLog, MAX_EVENT_BYTES, inTransaction, openDb, type Db } from "./index.js";
 
 let dir: string;
 let db: Db;
@@ -104,5 +104,44 @@ describe("schema", () => {
     db.close();
     expect(() => openDb(join(dir, "gw.db"))).toThrow(/newer/);
     db = openDb(join(dir, "other.db"));
+  });
+});
+
+describe("nested transactions", () => {
+  it("notifies listeners only after the outermost commit", () => {
+    const seen: number[] = [];
+    log.subscribe((evs) => seen.push(...evs.map((e) => e.seq)));
+    inTransaction(db, () => {
+      log.append([{ type: "a" }]);
+      expect(seen).toEqual([]);
+      log.append([{ type: "b" }]);
+    });
+    expect(seen).toEqual([1, 2]);
+  });
+
+  it("rolls back events and notifications when the outer transaction fails", () => {
+    const seen: number[] = [];
+    log.subscribe((evs) => seen.push(...evs.map((e) => e.seq)));
+    expect(() =>
+      inTransaction(db, () => {
+        log.append([{ type: "a" }]);
+        throw new Error("boom");
+      }),
+    ).toThrow("boom");
+    expect(seen).toEqual([]);
+    expect(log.readSince(0)).toEqual([]);
+  });
+
+  it("an inner failure rolls back only the inner work", () => {
+    inTransaction(db, () => {
+      log.append([{ type: "keep" }]);
+      expect(() =>
+        inTransaction(db, () => {
+          log.append([{ type: "drop" }]);
+          throw new Error("inner");
+        }),
+      ).toThrow("inner");
+    });
+    expect(log.readSince(0).map((e) => e.type)).toEqual(["keep"]);
   });
 });

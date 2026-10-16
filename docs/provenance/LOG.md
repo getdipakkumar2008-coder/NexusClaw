@@ -13,6 +13,7 @@ Per docs/12 section 4: for each module, what spec it implements and which extern
 | 2026-10-16 | src/pairing | docs/05 §2, docs/06 T2/T3 | Node.js crypto docs | Phase 1 WP3 |
 | 2026-10-16 | src/vault | docs/06 SEC-8 | Node.js crypto docs (AES-GCM, scrypt); NIST SP 800-38D (GCM) | Phase 1 WP4 |
 | 2026-10-16 | src/gateway (server) | docs/03, docs/06 T6/T18 | `ws` library documentation; Node.js http docs | Phase 1 WP5 slice 1 |
+| 2026-10-16 | src/sessions | docs/01 FR-SES, docs/02 §7, docs/03 | Node.js docs (AbortController, async iterators); SQLite savepoint docs | Phase 1 WP6 |
 | 2026-10-16 | spikes/* | docs/11 section D | Node.js docs (node:sqlite, node:crypto, child_process) | Phase 0 scaffold |
 
 Note: the planning docs themselves were derived from `req.odt`, a brief that the owner states was reconstructed from the reference project's public artifacts. See docs/12 section 3 for the renames/rewrites still pending (Q-19).

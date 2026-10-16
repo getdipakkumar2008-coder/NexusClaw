@@ -17,6 +17,7 @@ import { isLoopback, type Config } from "@clawnexus/config";
 import { EventLog, CursorExpiredError, openDb, type Db, type StoredEvent } from "@clawnexus/store";
 import { PairingError, PairingService } from "@clawnexus/pairing";
 import { ApprovalError, ApprovalStore } from "@clawnexus/policy";
+import { SessionError, SessionManager, type Provider, type SessionManagerOptions } from "@clawnexus/sessions";
 
 export interface GatewayOptions {
   /** Directory holding the database and token file. Created (mode 0700) if missing. */
@@ -25,6 +26,9 @@ export interface GatewayOptions {
   host?: string;
   port?: number;
   config?: Pick<Config, "gateway">;
+  /** Model runtime for session runs. Without one, `session.send` fails with PROVIDER.NOT_CONFIGURED. */
+  provider?: Provider;
+  sessions?: SessionManagerOptions;
   /** Browser origins allowed to open a WebSocket. Default: none (non-browser clients only). */
   allowedOrigins?: readonly string[];
   /** Unauthenticated connections are dropped after this long without a successful hello. */
@@ -78,6 +82,7 @@ const sha = (s: string): Buffer => createHash("sha256").update(s).digest();
 export class Gateway {
   readonly events: EventLog;
   readonly pairing: PairingService;
+  readonly sessions: SessionManager | undefined;
   readonly approvals: ApprovalStore;
   readonly tokenPath: string;
 
@@ -124,6 +129,7 @@ export class Gateway {
     this.events = new EventLog(this.db, this.o.now);
     this.pairing = new PairingService(this.db, { now: this.o.now, audit: this.events });
     this.approvals = new ApprovalStore(this.o.now);
+    this.sessions = opts.provider ? new SessionManager(this.db, this.events, opts.provider, { now: this.o.now, ...opts.sessions }) : undefined;
 
     this.http = createServer((req, res) => this.handleHttp(req, res));
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
@@ -158,6 +164,7 @@ export class Gateway {
     for (const c of this.conns) {
       c.ws.close(1001, "gateway shutting down");
     }
+    await this.sessions?.close();
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     this.http.closeAllConnections();
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
@@ -380,8 +387,73 @@ export class Gateway {
         }
       }
 
+      case "session.list":
+      case "session.get":
+      case "session.create":
+      case "session.send":
+      case "session.cancel":
+      case "session.export":
+      case "session.import":
+      case "session.delete":
+        return this.sessionMethod(method, params);
+
       default:
         throw new MethodError(err("UNSUPPORTED.METHOD", `unknown method ${method}`, "See docs/03-gateway-protocol.md for the method list."));
+    }
+  }
+
+  private sessionMethod(method: string, params: unknown): unknown {
+    const mgr = this.sessions;
+    if (!mgr) throw new MethodError(err("PROVIDER.NOT_CONFIGURED", "no model provider is configured", "Configure a provider before using sessions."));
+    const id = z.string().min(1).max(64);
+    try {
+      switch (method) {
+        case "session.list": {
+          const p = z.strictObject({ channel: z.string().min(1).optional(), limit: z.number().int().positive().optional() }).parse(params ?? {});
+          return { sessions: mgr.list(p) };
+        }
+        case "session.get": {
+          const p = z.strictObject({ session: id, limit: z.number().int().positive().optional() }).parse(params);
+          return { session: mgr.get(p.session), messages: mgr.messages(p.session, p.limit === undefined ? {} : { limit: p.limit }) };
+        }
+        case "session.create": {
+          const p = z
+            .strictObject({
+              channel: z.string().min(1).max(64).default("local"),
+              conversation: z.string().min(1).max(256).default("main"),
+              scope: z.string().min(1).max(256).default("owner"),
+            })
+            .parse(params ?? {});
+          return { session: mgr.getOrCreate(p) };
+        }
+        case "session.send": {
+          const p = z.strictObject({ session: id, text: z.string() }).parse(params);
+          return mgr.send(p.session, p.text, { sender: "owner" });
+        }
+        case "session.cancel": {
+          const p = z.strictObject({ session: id }).parse(params);
+          mgr.get(p.session);
+          return { cancelled: mgr.cancel(p.session) };
+        }
+        case "session.export": {
+          const p = z.strictObject({ session: id, format: z.enum(["jsonl", "markdown"]).default("jsonl") }).parse(params);
+          return { format: p.format, content: p.format === "jsonl" ? mgr.exportJsonl(p.session) : mgr.exportMarkdown(p.session) };
+        }
+        case "session.import": {
+          const p = z.strictObject({ content: z.string().max(900_000) }).parse(params);
+          return { session: mgr.importJsonl(p.content) };
+        }
+        default: {
+          const p = z.strictObject({ session: id }).parse(params);
+          mgr.delete(p.session);
+          return {};
+        }
+      }
+    } catch (e) {
+      if (e instanceof SessionError) {
+        throw new MethodError(err(`SESSION.${e.code}`, e.message, "Check the session id and the size of your input.", e.code === "QUEUE_FULL"));
+      }
+      throw e;
     }
   }
 

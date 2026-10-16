@@ -28,6 +28,9 @@
     },
     {
       "path": "../pairing"
+    },
+    {
+      "path": "../sessions"
     }
   ]
 }

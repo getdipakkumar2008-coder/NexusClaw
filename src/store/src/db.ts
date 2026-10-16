@@ -39,6 +39,37 @@ const SCHEMA: readonly string[] = [
    );
    CREATE INDEX pairing_requests_sender ON pairing_requests(sender_id);
    CREATE INDEX pairing_requests_created ON pairing_requests(created_at);`,
+  // v3: sessions, transcript messages and runs (docs/02 section 7, FR-SES). Deleting a session cascades.
+  `CREATE TABLE sessions (
+     id           TEXT PRIMARY KEY,
+     channel      TEXT NOT NULL,
+     conversation TEXT NOT NULL,
+     scope        TEXT NOT NULL,
+     created_at   INTEGER NOT NULL,
+     state        TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','archived')),
+     UNIQUE (channel, conversation, scope)
+   );
+   CREATE TABLE messages (
+     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+     run_id     TEXT,
+     role       TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
+     sender     TEXT NOT NULL DEFAULT '',
+     content    TEXT NOT NULL,
+     ts         INTEGER NOT NULL
+   );
+   CREATE INDEX messages_session ON messages(session_id, id);
+   CREATE TABLE runs (
+     id         TEXT PRIMARY KEY,
+     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+     provider   TEXT NOT NULL,
+     status     TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','cancelled')),
+     created_at INTEGER NOT NULL,
+     started_at INTEGER,
+     ended_at   INTEGER,
+     error      TEXT
+   );
+   CREATE INDEX runs_session ON runs(session_id, created_at);`,
 ];
 
 export const SCHEMA_VERSION = SCHEMA.length;
@@ -72,15 +103,70 @@ export function openDb(path: string, opts: OpenOptions = {}): Db {
   return db;
 }
 
-/** Run `fn` in one immediate transaction; roll back on throw. */
+interface TxState {
+  depth: number;
+  hooks: Array<() => void>;
+}
+const txState = new WeakMap<Db, TxState>();
+const stateOf = (db: Db): TxState => {
+  let st = txState.get(db);
+  if (!st) txState.set(db, (st = { depth: 0, hooks: [] }));
+  return st;
+};
+
+/** True while `fn` of an `inTransaction` call is running on this connection. */
+export function inTx(db: Db): boolean {
+  return stateOf(db).depth > 0;
+}
+
+/** Run `fn` once the outermost transaction commits (immediately if none is open). Dropped on rollback. */
+export function afterCommit(db: Db, fn: () => void): void {
+  const st = stateOf(db);
+  if (st.depth === 0) fn();
+  else st.hooks.push(fn);
+}
+
+/**
+ * Run `fn` in one immediate transaction; roll back on throw. Calls nest: an inner call is a savepoint, so
+ * a failing inner step rolls back only its own work, and `afterCommit` hooks run after the outermost COMMIT.
+ */
 export function inTransaction<T>(db: Db, fn: () => T): T {
+  const st = stateOf(db);
+  if (st.depth > 0) {
+    const sp = `sp_${st.depth}`;
+    db.exec(`SAVEPOINT ${sp}`);
+    st.depth++;
+    const mark = st.hooks.length;
+    try {
+      const out = fn();
+      db.exec(`RELEASE ${sp}`);
+      return out;
+    } catch (e) {
+      db.exec(`ROLLBACK TO ${sp}; RELEASE ${sp}`);
+      st.hooks.length = mark;
+      throw e;
+    } finally {
+      st.depth--;
+    }
+  }
   db.exec("BEGIN IMMEDIATE");
+  st.depth = 1;
   try {
     const out = fn();
     db.exec("COMMIT");
+    st.depth = 0;
+    const hooks = st.hooks;
+    st.hooks = [];
+    for (const h of hooks) h();
     return out;
   } catch (e) {
-    db.exec("ROLLBACK");
+    st.depth = 0;
+    st.hooks = [];
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* already rolled back by SQLite */
+    }
     throw e;
   }
 }
