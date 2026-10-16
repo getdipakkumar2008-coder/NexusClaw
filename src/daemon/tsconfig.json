@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "include": ["src"],
+  "references": [
+    {"path":"../../packages/brand"},
+    {"path":"../../packages/cli"},
+    {"path":"../config"},
+    {"path":"../gateway"},
+    {"path":"../sessions"},
+    {"path":"../store"}
+  ]
+}

@@ -43,6 +43,13 @@ importers:
       '@clawnexus/protocol':
         specifier: workspace:*
         version: link:../protocol
+      ws:
+        specifier: ^8.18.0
+        version: 8.22.0
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.5.13
+        version: 8.18.2
 
   packages/plugin-sdk:
     dependencies:
@@ -64,6 +71,27 @@ importers:
       zod:
         specifier: ^4.0.0
         version: 4.6.7
+
+  src/daemon:
+    dependencies:
+      '@clawnexus/brand':
+        specifier: workspace:*
+        version: link:../../packages/brand
+      '@clawnexus/cli':
+        specifier: workspace:*
+        version: link:../../packages/cli
+      '@clawnexus/config':
+        specifier: workspace:*
+        version: link:../config
+      '@clawnexus/gateway':
+        specifier: workspace:*
+        version: link:../gateway
+      '@clawnexus/sessions':
+        specifier: workspace:*
+        version: link:../sessions
+      '@clawnexus/store':
+        specifier: workspace:*
+        version: link:../store
 
   src/gateway:
     dependencies:
@@ -91,6 +119,9 @@ importers:
       '@clawnexus/store':
         specifier: workspace:*
         version: link:../store
+      '@clawnexus/tools':
+        specifier: workspace:*
+        version: link:../tools
       ws:
         specifier: ^8.18.0
         version: 8.22.0
@@ -120,6 +151,18 @@ importers:
         version: 4.6.7
 
   src/store: {}
+
+  src/tools:
+    dependencies:
+      '@clawnexus/policy':
+        specifier: workspace:*
+        version: link:../policy
+      '@clawnexus/store':
+        specifier: workspace:*
+        version: link:../store
+      zod:
+        specifier: ^4.0.0
+        version: 4.6.7
 
   src/vault: {}
 

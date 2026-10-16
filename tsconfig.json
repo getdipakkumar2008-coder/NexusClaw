@@ -10,7 +10,9 @@
     { "path": "src/policy" },
     { "path": "src/pairing" },
     { "path": "src/sessions" },
+    { "path": "src/tools" },
     { "path": "src/vault" },
-    { "path": "src/gateway" }
+    { "path": "src/gateway" },
+    { "path": "src/daemon" }
   ]
 }

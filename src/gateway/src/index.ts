@@ -3,7 +3,7 @@ import { CURRENT_CONFIG_VERSION } from "@clawnexus/config";
 import { PROTOCOL_VERSION } from "@clawnexus/protocol";
 import { SDK_VERSION } from "@clawnexus/plugin-sdk";
 
-export { Gateway, startGateway, type GatewayOptions } from "./server.js";
+export { Gateway, startGateway, ensureGatewayToken, type GatewayOptions } from "./server.js";
 
 /** Versions this build speaks; used by `status` tooling and tests. */
 export function gatewayInfo(): {

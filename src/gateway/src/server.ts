@@ -17,6 +17,7 @@ import { isLoopback, type Config } from "@clawnexus/config";
 import { EventLog, CursorExpiredError, openDb, type Db, type StoredEvent } from "@clawnexus/store";
 import { PairingError, PairingService } from "@clawnexus/pairing";
 import { ApprovalError, ApprovalStore } from "@clawnexus/policy";
+import { BUILTIN_TOOLS, ToolExecutor, WorkspaceGuard } from "@clawnexus/tools";
 import { SessionError, SessionManager, type Provider, type SessionManagerOptions } from "@clawnexus/sessions";
 
 export interface GatewayOptions {
@@ -28,6 +29,8 @@ export interface GatewayOptions {
   config?: Pick<Config, "gateway">;
   /** Model runtime for session runs. Without one, `session.send` fails with PROVIDER.NOT_CONFIGURED. */
   provider?: Provider;
+  /** Directory tools may read and write. Default: `<dataDir>/workspace` (created if missing). */
+  workspace?: string;
   sessions?: SessionManagerOptions;
   /** Browser origins allowed to open a WebSocket. Default: none (non-browser clients only). */
   allowedOrigins?: readonly string[];
@@ -83,6 +86,7 @@ export class Gateway {
   readonly events: EventLog;
   readonly pairing: PairingService;
   readonly sessions: SessionManager | undefined;
+  readonly tools: ToolExecutor;
   readonly approvals: ApprovalStore;
   readonly tokenPath: string;
 
@@ -129,6 +133,9 @@ export class Gateway {
     this.events = new EventLog(this.db, this.o.now);
     this.pairing = new PairingService(this.db, { now: this.o.now, audit: this.events });
     this.approvals = new ApprovalStore(this.o.now);
+    const workspace = opts.workspace ?? join(opts.dataDir, "workspace");
+    mkdirSync(workspace, { recursive: true, mode: 0o700 });
+    this.tools = new ToolExecutor({ events: this.events, approvals: this.approvals, guard: new WorkspaceGuard([workspace]), tools: BUILTIN_TOOLS });
     this.sessions = opts.provider ? new SessionManager(this.db, this.events, opts.provider, { now: this.o.now, ...opts.sessions }) : undefined;
 
     this.http = createServer((req, res) => this.handleHttp(req, res));
@@ -387,6 +394,31 @@ export class Gateway {
         }
       }
 
+      case "tool.list":
+        return { tools: this.tools.list() };
+      case "tool.call": {
+        const p = z
+          .strictObject({
+            tool: z.string().min(1).max(128),
+            args: z.unknown().default({}),
+            approvalId: z.string().min(1).max(64).optional(),
+            session: z.string().min(1).max(64).optional(),
+            tainted: z.boolean().default(false),
+          })
+          .parse(params);
+        // Only the owner reaches this method in this slice; guests and channels get their own principals in WP10.
+        return this.tools.call({
+          tool: p.tool,
+          args: p.args,
+          principal: "owner",
+          principalId: "owner",
+          profile: "standard",
+          tainted: p.tainted,
+          ...(p.approvalId === undefined ? {} : { approvalId: p.approvalId }),
+          ...(p.session === undefined ? {} : { session: p.session }),
+        });
+      }
+
       case "session.list":
       case "session.get":
       case "session.create":
@@ -503,6 +535,12 @@ export class Gateway {
     };
     return { from: since ?? latest, latestSeq: latest, replaying: backlog.length };
   }
+}
+
+/** Read the owner token from `<dataDir>/gateway.token`, creating it (mode 0600) on first use. */
+export function ensureGatewayToken(dataDir: string): string {
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  return loadOrCreateToken(join(dataDir, TOKEN_FILE));
 }
 
 function loadOrCreateToken(path: string): string {

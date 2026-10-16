@@ -170,3 +170,32 @@ export function inTransaction<T>(db: Db, fn: () => T): T {
     throw e;
   }
 }
+
+export interface DbInspection {
+  userVersion: number;
+  supportedVersion: number;
+  /** Result of SQLite's `PRAGMA integrity_check`; "ok" when healthy. */
+  integrity: string;
+}
+
+/** Read-only health check that never creates, migrates or locks the database for writing. */
+export function inspectDb(path: string): DbInspection {
+  const db = new Database(path, { readOnly: true });
+  try {
+    const v = db.prepare("PRAGMA user_version").get() as { user_version: number };
+    const ic = db.prepare("PRAGMA integrity_check").all() as Array<{ integrity_check: string }>;
+    return { userVersion: v.user_version, supportedVersion: SCHEMA_VERSION, integrity: ic.map((r) => r.integrity_check).join("; ") };
+  } finally {
+    db.close();
+  }
+}
+
+/** Write a consistent copy of the database to `dest` (which must not exist), safe while the Gateway runs. */
+export function snapshotDb(path: string, dest: string): void {
+  const db = new Database(path, { readOnly: true });
+  try {
+    db.exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
+  } finally {
+    db.close();
+  }
+}

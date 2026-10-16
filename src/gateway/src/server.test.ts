@@ -435,3 +435,34 @@ describe("sessions over the wire (milestone M1)", () => {
     expect((await c.call("session.import", { content: "garbage" })).error?.code).toBe("SESSION.INVALID");
   });
 });
+
+describe("tools over the wire", () => {
+  it("lists tools, runs R0/R1 directly and gates exec behind owner approval", async () => {
+    await boot();
+    const c = await authed();
+    await c.call("events.subscribe");
+    expect((await c.call("tool.list")).result.tools.map((t: { name: string }) => t.name)).toEqual(["fs.read", "fs.list", "fs.write", "exec.run"]);
+
+    const w = await c.call("tool.call", { tool: "fs.write", args: { path: "hello.txt", content: "hi" } });
+    expect(w.result.status).toBe("ok");
+    expect(readFileSync(join(dir, "workspace", "hello.txt"), "utf8")).toBe("hi");
+    const r = await c.call("tool.call", { tool: "fs.read", args: { path: "hello.txt" } });
+    expect(r.result.output.content).toBe("hi");
+
+    const escape = await c.call("tool.call", { tool: "fs.read", args: { path: "../gateway.token" } });
+    expect(escape.result.status).toBe("error");
+    expect(JSON.stringify(escape)).not.toContain(token());
+
+    const args = { command: process.execPath, args: ["-e", "console.log(40+2)"] };
+    const first = await c.call("tool.call", { tool: "exec.run", args });
+    expect(first.result.status).toBe("approval_required");
+    const id = first.result.approvalId as string;
+    await c.waitFor(() => c.events.some((e) => e.type === "approval.requested"));
+    expect((await c.call("approval.list")).result.approvals.map((a: { id: string }) => a.id)).toContain(id);
+    expect((await c.call("approval.decide", { id, approve: true })).ok).toBe(true);
+    const done = await c.call("tool.call", { tool: "exec.run", args, approvalId: id });
+    expect(done.result.status).toBe("ok");
+    expect(done.result.output.stdout.trim()).toBe("42");
+    expect((await c.call("tool.call", { tool: "exec.run", args, approvalId: id })).result.code).toBe("BAD_APPROVAL");
+  });
+});

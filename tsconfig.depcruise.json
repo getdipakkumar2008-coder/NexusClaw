@@ -13,8 +13,10 @@
       "@clawnexus/policy": ["src/policy/src/index.ts"],
       "@clawnexus/pairing": ["src/pairing/src/index.ts"],
       "@clawnexus/sessions": ["src/sessions/src/index.ts"],
+      "@clawnexus/tools": ["src/tools/src/index.ts"],
       "@clawnexus/vault": ["src/vault/src/index.ts"],
-      "@clawnexus/gateway": ["src/gateway/src/index.ts"]
+      "@clawnexus/gateway": ["src/gateway/src/index.ts"],
+      "@clawnexus/daemon": ["src/daemon/src/index.ts"]
     }
   }
 }

@@ -1,4 +1,4 @@
-export { openDb, inTransaction, afterCommit, inTx, SCHEMA_VERSION, type Db, type OpenOptions } from "./db.js";
+export { openDb, inTransaction, afterCommit, inTx, SCHEMA_VERSION, inspectDb, snapshotDb, type DbInspection, type Db, type OpenOptions } from "./db.js";
 export {
   EventLog,
   CursorExpiredError,
