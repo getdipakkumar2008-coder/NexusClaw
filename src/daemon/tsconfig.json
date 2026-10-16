@@ -2,7 +2,7 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": { "rootDir": "src", "outDir": "dist" },
   "include": ["src"],
-  "references": [
+  "references": [{"path":"../acp"},
     {"path":"../../packages/brand"},
     {"path":"../../packages/cli"},
     {"path":"../config"},

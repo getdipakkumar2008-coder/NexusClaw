@@ -10,6 +10,7 @@
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
   "files": ["dist"],
   "dependencies": {
+    "@clawnexus/acp": "workspace:*",
     "@clawnexus/brand": "workspace:*",
     "@clawnexus/cli": "workspace:*",
     "@clawnexus/config": "workspace:*",

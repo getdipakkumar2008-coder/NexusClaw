@@ -16,6 +16,7 @@ Per docs/12 section 4: for each module, what spec it implements and which extern
 | 2026-10-16 | src/sessions | docs/01 FR-SES, docs/02 §7, docs/03 | Node.js docs (AbortController, async iterators); SQLite savepoint docs | Phase 1 WP6 |
 | 2026-10-16 | src/tools | docs/06 T14/T1, docs/01 | Node.js docs (child_process, fs.realpath); Windows taskkill docs | Phase 1 WP8 |
 | 2026-10-16 | packages/cli, src/daemon | docs/14, docs/03 | Node.js docs (readline, http, fs.statfs); SQLite VACUUM INTO docs | Phase 1 WP12 |
+| 2026-10-16 | src/acp (+ provider config, `provider test`) | docs/04 §7, docs/02 | Agent Client Protocol specification and vendor ACP docs (agentclientprotocol.com, cursor.com/docs/cli/acp, Gemini CLI docs); npm registry metadata for the adapters. A web search also listed pages from the reference project's documentation; they were **not opened or used** | Phase 1 WP7 slice 1 |
 | 2026-10-16 | spikes/* | docs/11 section D | Node.js docs (node:sqlite, node:crypto, child_process) | Phase 0 scaffold |
 
 Note: the planning docs themselves were derived from `req.odt`, a brief that the owner states was reconstructed from the reference project's public artifacts. See docs/12 section 3 for the renames/rewrites still pending (Q-19).

@@ -11,6 +11,7 @@
     { "path": "src/pairing" },
     { "path": "src/sessions" },
     { "path": "src/tools" },
+    { "path": "src/acp" },
     { "path": "src/vault" },
     { "path": "src/gateway" },
     { "path": "src/daemon" }

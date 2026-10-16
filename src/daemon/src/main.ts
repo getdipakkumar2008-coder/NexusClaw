@@ -8,6 +8,7 @@ import { CliError, defaultDataDir, parseArgs, reportError, runCli, strFlag, syst
 import { createBackup, restoreBackup } from "./backup.js";
 import { formatChecks, runDoctor } from "./doctor.js";
 import { runGateway } from "./serve.js";
+import { runProviderTest } from "./providertest.js";
 import { runSetup } from "./setup.js";
 
 /** Server-side commands live here; everything else is a Gateway client command handled by @clawnexus/cli. */
@@ -33,6 +34,7 @@ export async function main(argv: readonly string[], io: Io = systemIo()): Promis
           await runSetup({
             dataDir,
             profile: strFlag(p, "profile"),
+            harness: strFlag(p, "harness"),
             out: io.out,
             ...(rl ? { ask: async (q, choices, fallback) => (await rl.question(`${q} [${choices.join("/")}] (${fallback}): `)).trim() || fallback } : {}),
           });
@@ -40,6 +42,10 @@ export async function main(argv: readonly string[], io: Io = systemIo()): Promis
           rl?.close();
         }
         return 0;
+      }
+      case "provider": {
+        if (p.positionals[1] !== "test") throw new CliError("USAGE", "unknown provider command", `Use \`${BRAND.cli} provider test\`.`);
+        return await runProviderTest({ dataDir, io, json, prompt: strFlag(p, "prompt"), timeoutMs: strFlag(p, "timeout") === undefined ? undefined : Number(strFlag(p, "timeout")) * 1000 });
       }
       case "doctor": {
         const checks = await runDoctor({ dataDir, fix: p.flags.fix === true, ...(port === undefined ? {} : { port }) });

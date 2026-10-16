@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Io } from "@clawnexus/cli";
 import { EventLog, openDb } from "@clawnexus/store";
@@ -166,7 +167,7 @@ describe("doctor", () => {
   it("passes on a fresh setup and reports every area", async () => {
     await runSetup({ dataDir: dir, out: () => undefined });
     const checks = await runDoctor({ dataDir: dir, fix: false, port: 59999 });
-    expect(checks.map((c) => c.id)).toEqual(["node", "data-dir", "config", "exposure", "token", "database", "disk", "port"]);
+    expect(checks.map((c) => c.id)).toEqual(["node", "data-dir", "config", "exposure", "token", "database", "disk", "provider", "port"]);
     expect(checks.filter((c) => c.status === "fail")).toEqual([]);
     expect(formatChecks(checks)).toMatch(/All checks passed|warning/);
   });
@@ -307,5 +308,72 @@ describe("backup and restore", () => {
     expect(b.out).toContain("token is not included");
     expect((await cli(["backup", "--out", out])).err).toContain("BACKUP_EXISTS");
     expect((await cli(["restore"])).err).toContain("USAGE");
+  });
+});
+
+describe("model provider (WP7)", () => {
+  const FAKE = fileURLToPath(new URL("../../acp/test/fake-harness.mjs", import.meta.url));
+  const providerOf = (): unknown => {
+    const l = loadConfig(dir);
+    if (l.state !== "ok") throw new Error(`config not ok: ${l.state}`);
+    return l.config.provider;
+  };
+  const useFakeHarness = (): void => {
+    process.env["FAKE_MODE"] = "normal";
+    writeConfig(dir, { configVersion: 1, provider: { harness: "custom", command: process.execPath, args: [FAKE], env: ["FAKE_MODE"] } });
+  };
+  afterEach(() => {
+    delete process.env["FAKE_MODE"];
+  });
+
+  it("setup --harness records the choice, rejects unknown ones, and replaces overrides when switching", async () => {
+    const a = await cli(["setup", "--yes", "--harness", "gemini"]);
+    expect(a.code).toBe(0);
+    expect(a.out).toContain("model harness: gemini");
+    expect(providerOf()).toEqual({ harness: "gemini" });
+    expect((await cli(["setup", "--yes", "--harness", "nope"])).err).toContain("USAGE");
+    writeConfig(dir, { configVersion: 1, provider: { harness: "gemini", args: ["--acp", "--debug"] } });
+    await cli(["setup", "--yes", "--harness", "cursor"]);
+    expect(providerOf()).toEqual({ harness: "cursor" });
+  });
+
+  it("rejects a custom harness without a command", () => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ configVersion: 1, provider: { harness: "custom" } }));
+    expect(loadConfig(dir).state).toBe("invalid");
+  });
+
+  it("doctor warns without a provider and fails when the harness program is missing", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    const none = (await runDoctor({ dataDir: dir, fix: false, port: 59998 })).find((c) => c.id === "provider");
+    expect(none?.status).toBe("warn");
+    writeConfig(dir, { configVersion: 1, provider: { harness: "custom", command: "definitely-not-installed-xyz" } });
+    const missing = (await runDoctor({ dataDir: dir, fix: false, port: 59998 })).find((c) => c.id === "provider");
+    expect(missing?.status).toBe("fail");
+    expect(missing?.fix).toBeTruthy();
+    useFakeHarness();
+    const ok = (await runDoctor({ dataDir: dir, fix: false, port: 59998 })).find((c) => c.id === "provider");
+    expect(ok?.status).toBe("ok");
+  });
+
+  it("chat goes through the configured harness end to end", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    useFakeHarness();
+    const port = String(await start(false));
+    const r = await cli(["chat", "hello", "there", "--port", port]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pong: hello there");
+    const again = await cli(["chat", "second", "--port", port]);
+    expect(again.out).toContain("pong: second");
+  });
+
+  it("provider test prints the answer, and explains when nothing is configured", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    expect((await cli(["provider", "test"])).err).toContain("PROVIDER_NOT_CONFIGURED");
+    useFakeHarness();
+    const r = await cli(["provider", "test", "--prompt", "ping"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pong: ping");
+    expect((await cli(["provider", "nope"])).err).toContain("USAGE");
   });
 });

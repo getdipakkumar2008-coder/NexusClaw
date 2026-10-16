@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { AcpProvider, resolveSpec } from "@clawnexus/acp";
 import { BRAND } from "@clawnexus/brand";
 import { CliError, type Io } from "@clawnexus/cli";
 import { Gateway, startGateway } from "@clawnexus/gateway";
@@ -54,6 +55,7 @@ export interface ServeOptions {
 
 export interface Running {
   gateway: Gateway;
+  hasProvider: boolean;
   host: string;
   port: number;
   stop(): Promise<void>;
@@ -72,21 +74,30 @@ export async function startFromConfig(o: ServeOptions): Promise<Running> {
   const release = acquireLock(o.dataDir);
   try {
     const config = loaded.config;
+    const workspace = join(o.dataDir, "workspace");
+    mkdirSync(workspace, { recursive: true, mode: 0o700 });
+    const acp = !o.fakeProvider && config.provider ? new AcpProvider({ spec: resolveSpec(config.provider), cwd: workspace }) : undefined;
+    const provider = o.fakeProvider ? new FakeProvider({ chunkSize: 6 }) : acp;
     const started = await startGateway({
       dataDir: o.dataDir,
       config,
       ...(o.port === undefined ? {} : { port: o.port }),
-      ...(o.fakeProvider ? { provider: new FakeProvider({ chunkSize: 6 }) } : {}),
+      ...(provider ? { provider } : {}),
+    }).catch(async (e: unknown) => {
+      await acp?.close();
+      throw e;
     });
     let stopped = false;
     return {
       gateway: started.gateway,
+      hasProvider: provider !== undefined,
       host: started.host,
       port: started.port,
       async stop() {
         if (stopped) return;
         stopped = true;
         await started.gateway.stop();
+        await acp?.close();
         release();
       },
     };
@@ -104,7 +115,8 @@ export async function runGateway(o: ServeOptions): Promise<number> {
   const g = await startFromConfig(o);
   o.io.out(`${BRAND.name} Gateway listening on ws://${g.host}:${g.port}/v1/ws (data: ${o.dataDir})\n`);
   if (o.fakeProvider) o.io.err("Warning: running with the built-in echo provider. No model is connected.\n");
-  else o.io.err("Note: no model provider is configured yet; `chat` will say so. Use --fake-provider to try the flow.\n");
+  else if (g.hasProvider) o.io.out("Model provider: the configured harness starts on the first chat.\n");
+  else o.io.err(`Note: no model provider is configured; \`chat\` will say so. Run \`${BRAND.cli} setup --harness claude\` (or codex, cursor, gemini), or use --fake-provider to try the flow.\n`);
   await new Promise<void>((resolve) => {
     const done = (): void => resolve();
     process.once("SIGINT", done);

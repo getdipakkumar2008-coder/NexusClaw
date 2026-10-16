@@ -34,8 +34,21 @@ export const configSchema = z
         profile: z.enum(["standard", "locked-down", "trusted"]).default("standard"),
       })
       .default({ profile: "standard" }),
+    /** The model runtime: an ACP harness we launch as a child process. Absent = no model configured. */
+    provider: z
+      .strictObject({
+        harness: z.enum(["claude", "codex", "cursor", "gemini", "custom"]),
+        command: z.string().min(1).max(500).optional(),
+        args: z.array(z.string().max(500)).max(32).optional(),
+        /** Names (not values) of environment variables to pass to the harness, e.g. an API key. */
+        env: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/)).max(16).optional(),
+      })
+      .optional(),
   })
   .superRefine((cfg, ctx) => {
+    if (cfg.provider?.harness === "custom" && !cfg.provider.command) {
+      ctx.addIssue({ code: "custom", path: ["provider", "command"], message: "provider.harness \"custom\" needs provider.command." });
+    }
     // SEC-6: never listen beyond loopback without both TLS and auth, unless explicitly acknowledged.
     const g = cfg.gateway;
     if (!isLoopback(g.bind) && !g.insecureAcknowledged && !(g.tls.enabled && g.auth.required)) {

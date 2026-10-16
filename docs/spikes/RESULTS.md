@@ -2,8 +2,14 @@
 
 Throwaway code in `spikes/` (not part of the build). Environment: Windows 11, Node 24.18, local SSD, run once on 2026-10-16. Numbers are indicative, not benchmarks.
 
-## Spike 1 — ACP client against two harnesses: **NOT DONE**
-Needs real ACP-speaking harnesses and provider credentials, which were not available in this session. ADR-0007 therefore remains an **unvalidated assumption**. Next step: owner provides (or approves installing) two ACP harnesses; time-box 2 days; deliverable = minimal client that does prompt, stream, tool-call round-trip, cancel. Also verify the ACP specification's licence and stability.
+## Spike 1 - ACP client against real harnesses: **PARTIAL PASS (1 of 4 verified)** (2026-10-16, WP7 slice 1)
+Built a client from the public ACP specification (agentclientprotocol.com, protocol v1: JSON-RPC 2.0, one message per line on stdio) in `src/acp`, and ran it against the real **Claude Code** adapter (`@agentclientprotocol/claude-agent-acp@0.92.0`, Apache-2.0) with the owner's own login.
+- **Verified with a real model:** `initialize` (v1) -> `session/new` -> `session/prompt` -> streamed `agent_message_chunk` -> `end_turn`; through the full path `clawnexus chat` -> Gateway -> harness. A second chat in the same session got the earlier context. First start 64 s (adapter download), warm start about 10 s per fresh process; the harness is then kept alive for later chats. No stray processes after the Gateway was stopped.
+- **Permission gate verified with the real harness:** asked to run a shell command, Claude Code requested permission, the client rejected it, the command did not run and no file appeared in the workspace; the refusal was reported to the user (`note: 1 request(s) from the harness were declined`).
+- **Verified with a scripted harness (CI):** streaming, per-session isolation, permission requests (rejected by default, never an "always" option), refused file/terminal requests, cooperative cancel, kill after a harness ignores cancel, crash and restart, protocol-version mismatch, sign-in errors, runaway output cap, stray stdout noise, oversized messages.
+- **Not verified:** Codex (`@agentclientprotocol/codex-acp@2.2.2`), Cursor (`agent acp`, `authenticate` with `cursor_login`) and Gemini CLI (`gemini --acp`) are **not installed here**. Their command lines come from each vendor's public documentation and are untested. The Gemini flag was `--experimental-acp` in older releases; current docs say `--acp`.
+- **Not done:** the tool-call round trip. This slice grants the harness no file or terminal access and rejects its permission requests, so it can chat but cannot act. Bridging Gateway tools to a harness (ACP/MCP) is the next slice.
+- **ADR-0007 (providers via ACP harnesses):** supported by this result for Claude Code; stays "Proposed" until a second harness is verified.
 
 ## Spike 2 — Event log: crash-safe append and cursor resume (`spikes/event-log`) — **PASS**
 Writer process appends events to SQLite (`node:sqlite`, WAL) and reports an index only after COMMIT returns; the parent SIGKILLs it at random moments (20 kills per mode), then checks invariants.
@@ -34,7 +40,7 @@ Ed25519 Gateway-signed grant bound to device, relay, token hash, expiry, nonce a
 Needs a bot token and network access to a test account. Deferred to the start of Phase 1 when the Telegram adapter is built; baseline will be recorded then.
 
 ## Follow-ups
-1. Spike 1 (ACP) — blocker for locking ADR-0007.
+1. Spike 1 (ACP): verify a second harness (Codex, Cursor or Gemini) and the tool-call round trip before locking ADR-0007.
 2. Confirm `node:sqlite` stability on Node 22 or pick better-sqlite3 (ADR-0003 follow-up).
 3. Power-loss durability test for the event log (VM hard-reset) before 1.0.
 4. Plugin permission enforcement design.

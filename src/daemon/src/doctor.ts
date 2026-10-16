@@ -2,6 +2,7 @@ import { chmodSync, existsSync, mkdirSync, statSync, statfsSync } from "node:fs"
 import { get } from "node:http";
 import { createServer } from "node:net";
 import { join } from "node:path";
+import { HarnessError, planLaunch, resolveSpec } from "@clawnexus/acp";
 import { BRAND } from "@clawnexus/brand";
 import { isLoopback } from "@clawnexus/config";
 import { inspectDb } from "@clawnexus/store";
@@ -148,6 +149,21 @@ export async function runDoctor(o: DoctorOptions): Promise<Check[]> {
     else add({ id: "disk", status: "ok", message: `${freeMb} MB free` });
   } catch {
     add({ id: "disk", status: "warn", message: "could not read free disk space" });
+  }
+
+  // Model provider: only checks that the program can be found. Starting a model costs money and may need a login,
+  // so that is left to `provider test`.
+  if (config.provider === undefined) {
+    add({ id: "provider", status: "warn", message: "no model provider configured; chat will not work", fix: `Run \`${BRAND.cli} setup --harness claude\` (or codex, cursor, gemini).` });
+  } else {
+    try {
+      const spec = resolveSpec(config.provider);
+      planLaunch(spec);
+      add({ id: "provider", status: "ok", message: `harness "${spec.name}" found (${spec.command}); run \`${BRAND.cli} provider test\` to try it` });
+    } catch (e) {
+      if (e instanceof HarnessError) add({ id: "provider", status: "fail", message: e.message, fix: e.remediation });
+      else throw e;
+    }
   }
 
   // Port / running state

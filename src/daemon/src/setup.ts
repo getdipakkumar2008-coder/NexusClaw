@@ -7,6 +7,7 @@ import { ensureGatewayToken } from "@clawnexus/gateway";
 import { openDb } from "@clawnexus/store";
 import { defaultConfig, loadConfig, writeConfig } from "./configfile.js";
 
+export const HARNESSES: readonly string[] = ["claude", "codex", "cursor", "gemini"];
 export const PROFILES = ["standard", "locked-down", "trusted"] as const;
 export type SetupProfile = (typeof PROFILES)[number];
 
@@ -19,6 +20,8 @@ const PROFILE_HELP: Record<SetupProfile, string> = {
 export interface SetupOptions {
   dataDir: string;
   profile?: string | undefined;
+  /** Model harness to use: claude, codex, cursor, gemini. */
+  harness?: string | undefined;
   /** Asked only when no profile was given and the caller supplies a prompt. */
   ask?: (question: string, choices: readonly string[], fallback: string) => Promise<string>;
   out: (text: string) => void;
@@ -59,18 +62,31 @@ export async function runSetup(o: SetupOptions): Promise<SetupResult> {
     profile = (PROFILES as readonly string[]).includes(answer) ? (answer as SetupProfile) : "standard";
   }
 
+  const harness = o.harness;
+  if (harness !== undefined && !HARNESSES.includes(harness)) {
+    throw new CliError("USAGE", `unknown harness ${harness}`, `Choose one of: ${HARNESSES.join(", ")}.`);
+  }
+
   // b. config
   const base = loaded.config;
   if (loaded.state === "missing") {
-    const cfg = { ...defaultConfig(), security: { profile: profile ?? "standard" } };
+    const cfg = { ...defaultConfig(), security: { profile: profile ?? "standard" }, ...(harness ? { provider: { harness } } : {}) };
     const v = validateConfig(cfg);
     if (!v.ok) throw new CliError("INTERNAL", v.problems.join("; "), "Report this.");
     writeConfig(o.dataDir, v.config);
-    note("config", true, `wrote config.json (profile: ${cfg.security.profile})`);
-  } else if (profile !== undefined && profile !== base.security.profile) {
-    writeConfig(o.dataDir, { ...base, security: { ...base.security, profile } });
-    note("config", true, `security profile changed to ${profile}`);
-  } else note("config", false, `config.json already present (profile: ${base.security.profile})`);
+    note("config", true, `wrote config.json (profile: ${cfg.security.profile}${harness ? `, model harness: ${harness}` : ""})`);
+  } else if ((profile !== undefined && profile !== base.security.profile) || (harness !== undefined && harness !== base.provider?.harness)) {
+    const next = {
+      ...base,
+      security: { ...base.security, ...(profile ? { profile } : {}) },
+      // choosing a different harness replaces command/args/env overrides; they belong to the old one
+      ...(harness && harness !== base.provider?.harness ? { provider: { harness } } : {}),
+    };
+    const v = validateConfig(next);
+    if (!v.ok) throw new CliError("INTERNAL", v.problems.join("; "), "Report this.");
+    writeConfig(o.dataDir, v.config);
+    note("config", true, `updated config.json${profile ? ` (profile: ${profile})` : ""}${harness ? ` (model harness: ${harness})` : ""}`);
+  } else note("config", false, `config.json already present (profile: ${base.security.profile}${base.provider ? `, model harness: ${base.provider.harness}` : ""})`);
 
   // c. owner token and database
   const tokenExisted = existsSync(join(o.dataDir, "gateway.token"));
@@ -91,7 +107,10 @@ export async function runSetup(o: SetupOptions): Promise<SetupResult> {
       `  1. ${BRAND.cli} gateway run            start the Gateway (add --fake-provider to try it without a model)`,
       `  2. ${BRAND.cli} chat "hello"           in another terminal`,
       `  3. ${BRAND.cli} doctor                 verify the installation`,
-      "Connecting a model provider and a messaging channel arrives with later releases.",
+      harness || loaded.config.provider
+        ? `  4. ${BRAND.cli} provider test          check that the model harness starts and answers (it may use your plan's quota)`
+        : `  Model: choose a harness with \`${BRAND.cli} setup --harness claude\` (or codex, cursor, gemini).`,
+      "Connecting a messaging channel arrives with later releases.",
       "",
     ].join("\n"),
   );
