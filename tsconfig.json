@@ -6,6 +6,8 @@
     { "path": "packages/plugin-sdk" },
     { "path": "packages/cli" },
     { "path": "src/config" },
+    { "path": "src/store" },
+    { "path": "src/policy" },
     { "path": "src/gateway" }
   ]
 }
