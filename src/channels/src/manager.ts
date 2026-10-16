@@ -58,6 +58,8 @@ interface Entry {
   host: ChannelHost;
   /** True once `start` succeeded; only then is the adapter's own status report trusted. */
   started: boolean;
+  /** Set when the channel is withdrawn (its plugin stopped). Nothing more is accepted from or sent through it. */
+  detached?: boolean;
 }
 
 interface Tracked {
@@ -178,18 +180,44 @@ export class ChannelManager {
   async start(): Promise<void> {
     this.stopped = false;
     this.unsubscribe = this.c.events.subscribe((evs) => this.onEvents(evs));
-    await Promise.allSettled(
-      [...this.entries.values()].map(async (e) => {
-        this.setStatus(e, { state: "starting" });
-        try {
-          await withTimeout(e.adapter.start(e.host), this.o.adapterTimeoutMs, `starting ${e.adapter.id}`);
-          e.started = true;
-          this.setStatus(e, this.statusOf(e));
-        } catch (err) {
-          this.setStatus(e, { state: "degraded", detail: scrub(err instanceof Error ? err.message : "failed to start") });
-        }
-      }),
-    );
+    await Promise.allSettled([...this.entries.values()].map((e) => this.startEntry(e)));
+  }
+
+  private async startEntry(e: Entry): Promise<void> {
+    this.setStatus(e, { state: "starting" });
+    try {
+      await withTimeout(e.adapter.start(e.host), this.o.adapterTimeoutMs, `starting ${e.adapter.id}`);
+      if (e.detached) return;
+      e.started = true;
+      this.setStatus(e, this.statusOf(e));
+    } catch (err) {
+      this.setStatus(e, { state: "degraded", detail: scrub(err instanceof Error ? err.message : "failed to start") });
+    }
+  }
+
+  /** Add a channel while the Gateway is running (a plugin came up). It is started now if the router is already running. */
+  async attach(adapter: ChannelAdapter, policy: Partial<ChannelPolicy> = {}): Promise<void> {
+    this.register(adapter, policy);
+    if (this.unsubscribe) {
+      const e = this.entries.get(adapter.id);
+      if (e) await this.startEntry(e);
+    }
+  }
+
+  /** Withdraw a channel (its plugin stopped or crashed). Messages in flight for it are dropped. */
+  async detach(id: string): Promise<void> {
+    const e = this.entries.get(id);
+    if (!e) return;
+    e.detached = true;
+    this.entries.delete(id);
+    for (const [runId, t] of this.runs) if (t.entry === e) this.runs.delete(runId);
+    try {
+      await withTimeout(e.adapter.stop(), 5000, `stopping ${id}`);
+    } catch {
+      /* the plugin may already be gone */
+    }
+    e.started = false;
+    e.status = { state: "stopped" };
   }
 
   async stop(): Promise<void> {
@@ -240,7 +268,7 @@ export class ChannelManager {
   // ---------------- inbound ----------------
 
   async handleInbound(entry: Entry, raw: unknown): Promise<InboundOutcome> {
-    if (this.stopped) return { result: "unavailable" };
+    if (this.stopped || entry.detached) return { result: "unavailable" };
     const parsed = inboundSchema.safeParse(raw);
     if (!parsed.success) return { result: "invalid", reason: parsed.error.issues[0]?.message?.slice(0, 120) ?? "invalid message" };
     // The channel is whatever adapter is delivering. Nothing in the message can choose it.
@@ -391,7 +419,7 @@ export class ChannelManager {
 
   /** Same-conversation sends happen one after another, in order. */
   private queueSend(entry: Entry, target: SendTarget, text: string): void {
-    if (this.stopped) return;
+    if (this.stopped || entry.detached) return;
     const key = `${target.channel}|${target.accountId}|${target.conversationId}`;
     const prev = this.sendChains.get(key) ?? Promise.resolve();
     const next = prev.then(() => this.deliver(entry, target, text)).catch(() => undefined);

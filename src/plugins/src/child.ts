@@ -20,7 +20,27 @@ interface PluginModule {
 }
 
 const send = (m: object): void => void process.send?.(m);
+interface ChannelDef {
+  id: string;
+  capabilities: unknown;
+  start(host: unknown): unknown;
+  stop(): unknown;
+  send(target: unknown, content: unknown): unknown;
+  typing?(target: unknown, on: boolean): unknown;
+}
 const tools = new Map<string, Registered>();
+let channel: ChannelDef | undefined;
+const awaitingDeliver = new Map<number, (outcome: unknown) => void>();
+let nextDeliver = 1;
+const channelHost = {
+  deliver: (message: unknown): Promise<unknown> =>
+    new Promise((resolve) => {
+      const rid = nextDeliver++;
+      awaitingDeliver.set(rid, resolve);
+      send({ t: "deliver", rid, message });
+    }),
+  setStatus: (status: unknown): void => send({ t: "chstatus", status }),
+};
 const running = new Map<number, AbortController>();
 let def: PluginModule | undefined;
 let sealed = false;
@@ -51,6 +71,12 @@ async function init(m: { pluginId: string; entry: string; dataDir?: string; conf
     log(level: string, message: string, fields?: unknown): void {
       send({ t: "log", level, message: String(message).slice(0, 2000), fields });
     },
+    registerChannel(c: ChannelDef): void {
+      if (sealed) throw new Error("the channel can only be registered during setup");
+      if (channel) throw new Error("a plugin can register only one channel");
+      if (!c || typeof c.id !== "string" || typeof c.start !== "function" || typeof c.stop !== "function" || typeof c.send !== "function") throw new Error("registerChannel needs an id and start, stop and send functions");
+      channel = c;
+    },
     registerTool(t: Registered): void {
       if (sealed) throw new Error("tools can only be registered during setup");
       if (!t || typeof t.name !== "string" || typeof t.run !== "function") throw new Error("registerTool needs a name and a run function");
@@ -66,11 +92,43 @@ async function init(m: { pluginId: string; entry: string; dataDir?: string; conf
   sealed = true;
   send({
     t: "ready",
+    channel: channel ? { id: channel.id, capabilities: channel.capabilities } : undefined,
     tools: [...tools.values()].map((x) => ({ name: x.name, description: x.description, risk: x.risk, args: x.args, timeoutMs: x.timeoutMs })),
   });
 }
 
+/** Calls from the Gateway to this plugin's channel. The `channel:` prefix cannot clash with a tool name. */
+async function channelCall(op: string, args: Record<string, unknown>): Promise<unknown> {
+  if (!channel) throw new Error("this plugin has no channel");
+  switch (op) {
+    case "start":
+      await channel.start(channelHost);
+      return null;
+    case "stop":
+      await channel.stop();
+      return null;
+    case "send": {
+      const r = (await channel.send(args["target"], args["content"])) as { messageId?: unknown } | undefined | void;
+      return { messageId: r && typeof r.messageId === "string" ? r.messageId.slice(0, 256) : undefined };
+    }
+    case "typing":
+      await channel.typing?.(args["target"], args["on"] === true);
+      return null;
+    default:
+      throw new Error(`unknown channel operation ${op}`);
+  }
+}
+
 async function call(m: { id: number; tool: string; args: Record<string, unknown> }): Promise<void> {
+  if (m.tool.startsWith("channel:")) {
+    try {
+      const value = await channelCall(m.tool.slice(8), m.args);
+      send({ t: "result", id: m.id, ok: true, value: JSON.parse(JSON.stringify(value ?? null)) });
+    } catch (e) {
+      send({ t: "result", id: m.id, ok: false, error: (e instanceof Error ? e.message : String(e)).slice(0, 500) });
+    }
+    return;
+  }
   const t = tools.get(m.tool);
   if (!t) return send({ t: "result", id: m.id, ok: false, error: `no such tool ${m.tool}` });
   const ac = new AbortController();
@@ -95,6 +153,12 @@ process.on("message", (m: { t?: string } & Record<string, unknown>) => {
     case "call":
       void call(m as never);
       break;
+    case "deliverResult": {
+      const done = awaitingDeliver.get(m["rid"] as number);
+      awaitingDeliver.delete(m["rid"] as number);
+      done?.(m["outcome"]);
+      break;
+    }
     case "cancel":
       running.get(m["id"] as number)?.abort();
       break;

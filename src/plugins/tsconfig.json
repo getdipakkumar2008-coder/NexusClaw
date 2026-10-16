@@ -2,5 +2,5 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": { "rootDir": "src", "outDir": "dist" },
   "include": ["src"],
-  "references": [{"path":"../../packages/plugin-sdk"},{"path":"../policy"},{"path":"../store"},{"path":"../tools"}]
+  "references": [{"path":"../channels"},{"path":"../../packages/plugin-sdk"},{"path":"../policy"},{"path":"../store"},{"path":"../tools"}]
 }

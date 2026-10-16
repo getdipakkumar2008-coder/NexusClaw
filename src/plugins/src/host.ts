@@ -7,6 +7,8 @@ import type { PluginManifest, ToolRegistration, ArgSpec } from "@clawnexus/plugi
 import type { Risk } from "@clawnexus/policy";
 import type { Db, EventLog } from "@clawnexus/store";
 import type { ToolDef } from "@clawnexus/tools";
+import type { ChannelAdapter } from "@clawnexus/channels";
+import { PluginChannelAdapter } from "./channel.js";
 import { inspectPluginDir, type Enforcement, type PluginPackage } from "./package.js";
 import { PluginProcess, PluginProcessError } from "./process.js";
 
@@ -50,6 +52,8 @@ export interface PluginInfo {
   /** The value `enable` must be given: it pins the exact code and permissions that were reviewed. */
   approvalToken?: string;
   tools: string[];
+  /** The messaging channel this plugin provides, while it is running. */
+  channel?: string;
   problems?: string[];
   /** Settings or secrets the owner still has to provide. */
   missing?: string[];
@@ -76,6 +80,8 @@ export interface HostOptions {
   db: Db;
   events: EventLog;
   tools: ToolRegistry;
+  /** The channel router. Without it, a plugin that provides a channel cannot start. */
+  channels?: { attach(adapter: ChannelAdapter): Promise<void>; detach(id: string): Promise<void> };
   /** Without it, plugins that declare secrets cannot start. */
   secrets?: SecretStore;
   now?: () => number;
@@ -96,6 +102,7 @@ interface Runtime {
   state: "starting" | "running" | "crashed" | "degraded" | "needs_approval" | "needs_config";
   reason?: string;
   proc?: PluginProcess;
+  channelId?: string;
   crashes: number[];
   timer?: NodeJS.Timeout;
   toolNames: string[];
@@ -143,6 +150,20 @@ export function argsSchema(args: Record<string, ArgSpec>): z.ZodType<Record<stri
 /** Plugin text reaches the model's context. Keep it to one tidy line. */
 // eslint-disable-next-line no-control-regex
 const tidy = (s: string, max: number): string => s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+
+/** On Windows a folder can stay locked for a moment after the process that used it exits. */
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(from, to);
+      return;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (attempt >= 20 || (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES")) throw e;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+}
 
 export class PluginHost {
   private readonly runtime = new Map<string, Runtime>();
@@ -224,7 +245,7 @@ export class PluginHost {
     if (missing.length > 0) return { ...base, status: "needs_config", reason: `still needs: ${missing.join(", ")}`, missing };
     const rt = this.runtime.get(id);
     if (!rt) return { ...base, status: "starting", reason: "waiting to start" };
-    return { ...base, status: rt.state, ...(rt.reason ? { reason: rt.reason } : {}), tools: rt.toolNames };
+    return { ...base, status: rt.state, ...(rt.reason ? { reason: rt.reason } : {}), tools: rt.toolNames, ...(rt.channelId ? { channel: rt.channelId } : {}) };
   }
 
   // ---------------- changing ----------------
@@ -252,8 +273,8 @@ export class PluginHost {
       if (existsSync(dest)) {
         await this.stopOne(id);
         const old = join(this.pluginsDir, `.old-${randomBytes(6).toString("hex")}`);
-        renameSync(dest, old);
-        renameSync(tmp, dest);
+        await renameWithRetry(dest, old);
+        await renameWithRetry(tmp, dest);
         rmSync(old, { recursive: true, force: true });
       } else renameSync(tmp, dest);
     } finally {
@@ -323,6 +344,7 @@ export class PluginHost {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    await Promise.allSettled([...this.starting]);
     await Promise.allSettled([...this.runtime.keys()].map((id) => this.stopOne(id)));
   }
 
@@ -465,7 +487,16 @@ export class PluginHost {
     return insp.plugin;
   }
 
-  private async startOne(pkg: PluginPackage): Promise<void> {
+  /** Starts that have not finished. Shutdown waits for them so no plugin process outlives the Gateway. */
+  private readonly starting = new Set<Promise<void>>();
+
+  private startOne(pkg: PluginPackage): Promise<void> {
+    const p = this.doStart(pkg).finally(() => this.starting.delete(p));
+    this.starting.add(p);
+    return p;
+  }
+
+  private async doStart(pkg: PluginPackage): Promise<void> {
     if (this.stopped) return;
     const id = pkg.manifest.id;
     const rt: Runtime = this.runtime.get(id) ?? { state: "starting", crashes: [], toolNames: [] };
@@ -483,6 +514,7 @@ export class PluginHost {
       return;
     }
     const inputs = this.inputsFor(pkg);
+    const chan: { adapter?: PluginChannelAdapter } = {};
     try {
       const proc = await PluginProcess.start({
         id,
@@ -496,6 +528,8 @@ export class PluginHost {
         ...(this.o.memoryMb ? { memoryMb: this.o.memoryMb } : {}),
         ...(this.o.startTimeoutMs ? { startTimeoutMs: this.o.startTimeoutMs } : {}),
         ...(this.o.graceMs ? { graceMs: this.o.graceMs } : {}),
+        onDeliver: (m) => chan.adapter?.inbound(m) ?? Promise.resolve({ result: "unavailable" }),
+        onChannelStatus: (s) => chan.adapter?.report(s),
         onLog: (l) => {
           if (l.level === "warn" || l.level === "error") this.audit("plugin.log", { id, level: l.level, message: this.hide(l.message) });
         },
@@ -504,6 +538,21 @@ export class PluginHost {
       if (this.stopped) {
         await proc.stop();
         return;
+      }
+      if (proc.channel) {
+        const problem = !pkg.manifest.provides.includes(`channel:${proc.channel.id}`)
+          ? `the plugin registered channel "${proc.channel.id}" but its manifest does not list channel:${proc.channel.id} in provides`
+          : !this.o.channels
+            ? "this Gateway has no channel router"
+            : undefined;
+        if (problem) {
+          await proc.stop();
+          rt.state = "degraded";
+          rt.reason = problem;
+          this.audit("plugin.degraded", { id, reason: problem });
+          return;
+        }
+        chan.adapter = new PluginChannelAdapter(proc.channel, proc);
       }
       const defs = proc.tools.map((t) => this.toolDef(id, pkg, t, rt));
       try {
@@ -518,7 +567,23 @@ export class PluginHost {
       rt.proc = proc;
       rt.state = "running";
       rt.toolNames = defs.map((d) => d.name);
-      this.audit("plugin.started", { id, tools: rt.toolNames });
+      if (chan.adapter) {
+        try {
+          await this.o.channels?.attach(chan.adapter);
+          rt.channelId = chan.adapter.id;
+        } catch (e) {
+          // For instance another channel already uses that id. The plugin is stopped rather than left half-working.
+          this.o.tools.removeTools(id);
+          rt.proc = undefined;
+          rt.toolNames = [];
+          await proc.stop();
+          rt.state = "degraded";
+          rt.reason = e instanceof Error ? e.message.slice(0, 200) : "could not register the channel";
+          this.audit("plugin.degraded", { id, reason: rt.reason });
+          return;
+        }
+      }
+      this.audit("plugin.started", { id, tools: rt.toolNames, ...(rt.channelId ? { channel: rt.channelId } : {}) });
     } catch (e) {
       rt.proc = undefined;
       this.noteFailure(id, rt, e instanceof PluginProcessError || e instanceof Error ? e.message : "failed to start");
@@ -553,6 +618,7 @@ export class PluginHost {
     const rt = this.runtime.get(id);
     if (!rt || info.expected || this.stopped) return;
     this.o.tools.removeTools(id);
+    this.withdrawChannel(rt);
     rt.proc = undefined;
     rt.toolNames = [];
     this.audit("plugin.crashed", { id, exitCode: info.code, detail: info.detail.slice(0, 300) });
@@ -597,12 +663,22 @@ export class PluginHost {
     rt.timer.unref();
   }
 
+  /** Take a crashed plugin out of the router so nothing is routed to a dead process. */
+  private withdrawChannel(rt: Runtime): void {
+    const leaving = rt.channelId;
+    rt.channelId = undefined;
+    if (leaving) void this.o.channels?.detach(leaving);
+  }
+
   private async stopOne(id: string): Promise<void> {
     const rt = this.runtime.get(id);
     if (!rt) return;
     if (rt.timer) clearTimeout(rt.timer);
     rt.timer = undefined;
     this.o.tools.removeTools(id);
+    const leaving = rt.channelId;
+    rt.channelId = undefined;
+    if (leaving) await this.o.channels?.detach(leaving);
     const p = rt.proc;
     rt.proc = undefined;
     rt.toolNames = [];

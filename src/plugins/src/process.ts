@@ -1,7 +1,7 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { z } from "zod";
-import { LIMITS, toolRegistrationSchema, type ToolRegistration } from "@clawnexus/plugin-sdk";
+import { LIMITS, channelRegistrationSchema, toolRegistrationSchema, type ChannelRegistration, type ToolRegistration } from "@clawnexus/plugin-sdk";
 import { killTree } from "@clawnexus/tools";
 
 export class PluginProcessError extends Error {
@@ -31,6 +31,9 @@ export interface ProcessOptions {
   /** The owner's settings and the declared secrets this plugin receives. Nothing else is passed. */
   config?: Record<string, string | number | boolean>;
   secrets?: Record<string, string>;
+  /** The plugin's channel hands an inbound message to the router. Resolves with what the router did. */
+  onDeliver?(message: unknown): Promise<unknown>;
+  onChannelStatus?(status: unknown): void;
   /** Absolute path of the compiled child shim. */
   childFile: string;
   memoryMb?: number;
@@ -44,7 +47,9 @@ export interface ProcessOptions {
 }
 
 const messageSchema = z.discriminatedUnion("t", [
-  z.object({ t: z.literal("ready"), tools: z.array(z.unknown()).max(LIMITS.toolsPerPlugin) }),
+  z.object({ t: z.literal("ready"), tools: z.array(z.unknown()).max(LIMITS.toolsPerPlugin), channel: z.unknown().optional() }),
+  z.object({ t: z.literal("deliver"), rid: z.number().int(), message: z.unknown() }),
+  z.object({ t: z.literal("chstatus"), status: z.unknown() }),
   z.object({ t: z.literal("result"), id: z.number().int(), ok: z.boolean(), value: z.unknown().optional(), error: z.string().max(1000).optional() }),
   z.object({ t: z.literal("log"), level: z.enum(["debug", "info", "warn", "error"]), message: z.string().max(2000) }),
   z.object({ t: z.literal("fatal"), message: z.string().max(1000) }),
@@ -73,6 +78,9 @@ interface Pending {
  */
 export class PluginProcess {
   readonly tools: ToolRegistration[] = [];
+  /** The channel the plugin registered, validated. */
+  channel: ChannelRegistration | undefined;
+  private deliverInflight = 0;
   private readonly pending = new Map<number, Pending>();
   /** Calls we stopped waiting for. If the plugin never answers them it is stuck, and its process is ended. */
   private readonly abandoned = new Set<number>();
@@ -83,7 +91,7 @@ export class PluginProcess {
   private logTokens = 20;
   private logRefill = Date.now();
   private fatal: string | undefined;
-  private readyResolve?: (t: unknown[]) => void;
+  private readyResolve?: (r: { tools: unknown[]; channel: unknown }) => void;
   private readyReject?: (e: Error) => void;
 
   private constructor(
@@ -134,7 +142,7 @@ export class PluginProcess {
       throw new PluginProcessError("START_FAILED", `could not start the plugin process: ${e instanceof Error ? e.message : String(e)}`);
     }
     const p = new PluginProcess(child, o);
-    const ready = new Promise<unknown[]>((resolve, reject) => {
+    const ready = new Promise<{ tools: unknown[]; channel: unknown }>((resolve, reject) => {
       p.readyResolve = resolve;
       p.readyReject = reject;
     });
@@ -143,7 +151,12 @@ export class PluginProcess {
     child.send({ t: "init", pluginId: o.id, entry: o.entry, dataDir: o.dataDir, config: o.config ?? {}, secrets: o.secrets ?? {} });
     try {
       const raw = await ready;
-      for (const t of raw) {
+      if (raw.channel !== undefined) {
+        const c = channelRegistrationSchema.safeParse(raw.channel);
+        if (!c.success) throw new PluginProcessError("BAD_REPLY", `the plugin registered an invalid channel: ${c.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 300)}`);
+        p.channel = c.data;
+      }
+      for (const t of raw.tools) {
         const parsed = toolRegistrationSchema.safeParse(t);
         if (!parsed.success) {
           throw new PluginProcessError("BAD_REPLY", `the plugin registered an invalid tool: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ").slice(0, 300)}`);
@@ -168,8 +181,25 @@ export class PluginProcess {
     const m = parsed.data;
     switch (m.t) {
       case "ready":
-        this.readyResolve?.(m.tools);
+        this.readyResolve?.({ tools: m.tools, channel: m.channel });
         return;
+      case "chstatus":
+        this.o.onChannelStatus?.(m.status);
+        return;
+      case "deliver": {
+        // A channel can deliver many messages at once; do not let a flood pile up in the Gateway.
+        const reply = (outcome: unknown): void => {
+          try {
+            this.child.send({ t: "deliverResult", rid: m.rid, outcome });
+          } catch {
+            /* the plugin is gone */
+          }
+        };
+        if (!this.o.onDeliver || this.deliverInflight >= 32) return reply({ result: this.o.onDeliver ? "limited" : "unavailable" });
+        this.deliverInflight++;
+        this.o.onDeliver(m.message).then(reply, () => reply({ result: "unavailable" })).finally(() => void this.deliverInflight--);
+        return;
+      }
       case "fatal":
         this.fatal = scrub(m.message);
         this.readyReject?.(new PluginProcessError("START_FAILED", this.fatal));

@@ -20,6 +20,7 @@ Per docs/12 section 4: for each module, what spec it implements and which extern
 | 2026-10-16 | src/acp (MCP server, tool bridge), Gateway bridge credentials | docs/04 §7, docs/06 | Model Context Protocol public specification, revision 2025-06-18 (tools and lifecycle pages, fetched and compared against the implementation); ACP `session/new` and `session/request_permission` docs; behaviour of Claude Code's adapter observed by running it | Phase 1 WP7 slice 2 |
 | 2026-10-16 | src/plugins, extensions/hello-tool | docs/04, docs/06 SEC-12/T4 | Node.js permission model and child_process.fork (general knowledge of the public documentation; the actual enforcement was verified by running it, not assumed) | Phase 1 WP9 slice 1 |
 | 2026-10-16 | src/vault (LocalVault), plugin settings and secrets | docs/04, docs/06 SEC-8 | Node.js crypto and fs docs; no reference-project material | Phase 1 WP9 slice 2 |
+| 2026-10-16 | plugin channel API (SDK, src/plugins channel adapter, router attach/detach) | docs/05, docs/04 | No external material; built on the existing adapter contract | Phase 1 WP10 slice 2 |
 | 2026-10-16 | src/channels (router, WebChat, conformance suite) | docs/05, docs/06 T2/T3 | `ws` library documentation; general web security practice (CSP, same-origin checks); no reference-project material | Phase 1 WP10 slice 1 |
 | 2026-10-16 | spikes/* | docs/11 section D | Node.js docs (node:sqlite, node:crypto, child_process) | Phase 0 scaffold |
 

@@ -368,6 +368,8 @@ interface PluginView {
   riskFloor?: number;
   approvalToken?: string;
   tools: string[];
+  channel?: string;
+  provides?: string[];
   problems?: string[];
   missing?: string[];
 }
@@ -410,6 +412,8 @@ function describePlugin(p: PluginView): string {
       `  its tools are never rated below risk class R${p.riskFloor ?? 0}, and their output is treated as untrusted`,
     );
   }
+  const channels = (p.provides ?? []).filter((x) => x.startsWith("channel:"));
+  if (channels.length) lines.push(`  channel:  ${channels.join(", ")} - connects a messaging platform. It tells the Gateway who is writing, so it can claim to be anyone on its own channel (never on another); you still approve each person by pairing code.`);
   if (p.tools.length) lines.push(`  tools:    ${p.tools.join(", ")}`);
   return `${lines.join("\n")}\n`;
 }

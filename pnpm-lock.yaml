@@ -191,6 +191,9 @@ importers:
 
   src/plugins:
     dependencies:
+      '@clawnexus/channels':
+        specifier: workspace:*
+        version: link:../channels
       '@clawnexus/plugin-sdk':
         specifier: workspace:*
         version: link:../../packages/plugin-sdk

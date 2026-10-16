@@ -129,6 +129,8 @@ export interface PluginContext {
   readonly secrets: { get(name: string): string | undefined };
   /** Register a tool. Only possible during `setup`. */
   registerTool(def: PluginToolDefinition): void;
+  /** Register the messaging channel this plugin provides: one per plugin, and the manifest must list `channel:<id>` in `provides`. Only possible during `setup`. */
+  registerChannel(def: PluginChannelDefinition): void;
 }
 
 export interface PluginDefinition {
@@ -138,4 +140,74 @@ export interface PluginDefinition {
 
 export function definePlugin(def: PluginDefinition): PluginDefinition {
   return def;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Channels. A channel plugin connects the assistant to a messaging platform. It runs inside the plugin process, and
+// the Gateway's router does everything that matters for safety (who may talk, groups, rate limits, replies), so a
+// channel only translates between the platform and these few calls.
+// ---------------------------------------------------------------------------------------------------------------
+
+export const channelRegistrationSchema = z.strictObject({
+  /** Must match a `channel:<id>` entry in the manifest's `provides`. */
+  id: z.string().regex(/^[a-z][a-z0-9-]{1,30}$/, "channel ids are lowercase letters, digits and dashes"),
+  capabilities: z.strictObject({
+    typing: z.boolean(),
+    groups: z.boolean(),
+    maxTextChars: z.number().int().min(1).max(100_000),
+  }),
+});
+export type ChannelRegistration = z.infer<typeof channelRegistrationSchema>;
+
+export const channelStatusSchema = z.strictObject({
+  state: z.enum(["starting", "connected", "degraded", "auth_required", "stopped"]),
+  detail: z.string().max(200).optional(),
+});
+export type PluginChannelStatus = z.infer<typeof channelStatusSchema>;
+
+/** Where a reply goes. The router fills this in from the message it is answering. */
+export interface ChannelTarget {
+  accountId: string;
+  conversationId: string;
+  /** Platform id of the message being answered, when the platform can thread replies. */
+  replyTo?: string;
+}
+
+/** One inbound message. The channel id is added by the Gateway; a plugin cannot speak for another channel. */
+export interface ChannelInbound {
+  /** Which of your accounts received it (use "default" when there is only one). Letters, digits, dot, dash, underscore. */
+  accountId: string;
+  conversationId: string;
+  senderId: string;
+  senderDisplay?: string;
+  /** The platform's id for this message. Used to ignore duplicates, so make it stable across redelivery. */
+  messageId: string;
+  text: string;
+  replyTo?: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  ts?: number;
+}
+
+export type ChannelOutcome =
+  | { result: "accepted"; sessionId: string; runId: string }
+  | { result: "pairing" | "duplicate" | "limited" | "busy" | "unavailable" }
+  | { result: "ignored" | "invalid"; reason: string };
+
+/** What a channel can call on the Gateway. */
+export interface PluginChannelHost {
+  /** Hand over one inbound message. Resolves with what the Gateway did with it. */
+  deliver(message: ChannelInbound): Promise<ChannelOutcome>;
+  /** Report health. Shown to the owner. Never put secrets in it. */
+  setStatus(status: PluginChannelStatus): void;
+}
+
+export interface PluginChannelDefinition extends ChannelRegistration {
+  /** Connect to the platform and begin delivering messages. Reject to report that it could not start. */
+  start(host: PluginChannelHost): void | Promise<void>;
+  /** Disconnect. Called before the plugin process ends. */
+  stop(): void | Promise<void>;
+  /** Send text to a conversation. The Gateway already splits it to `maxTextChars`; throw to have it retried. */
+  send(target: ChannelTarget, content: { text: string }): { messageId?: string } | void | Promise<{ messageId?: string } | void>;
+  typing?(target: ChannelTarget, on: boolean): void | Promise<void>;
 }
