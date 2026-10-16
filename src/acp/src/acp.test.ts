@@ -5,7 +5,7 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderRequest } from "@clawnexus/sessions";
-import { AcpConnection, AcpError, scrub, type AcpConnectionOptions } from "./client.js";
+import { AcpConnection, AcpError, mcpServerOf, scrub, type AcpConnectionOptions } from "./client.js";
 import { PRESETS, HarnessError, planLaunch, resolveSpec, type HarnessSpec } from "./harnesses.js";
 import { JsonRpcPeer } from "./jsonrpc.js";
 import { AcpProvider, buildPrompt } from "./provider.js";
@@ -206,6 +206,14 @@ describe("AcpProvider with a scripted harness", () => {
 });
 
 describe("helpers", () => {
+  it("mcpServerOf reads the server from vendor metadata or the mcp__server__tool name", () => {
+    expect(mcpServerOf({ _meta: { claudeCode: { mcpServer: { name: "abc" }, toolName: "mcp__zzz__t" } } })).toBe("abc");
+    expect(mcpServerOf({ _meta: { claudeCode: { toolName: "mcp__srv-1__fs_write" } } })).toBe("srv-1");
+    expect(mcpServerOf({ name: "mcp__srv__x" })).toBe("srv");
+    expect(mcpServerOf({ name: "Bash" })).toBeUndefined();
+    expect(mcpServerOf({})).toBeUndefined();
+  });
+
   it("scrub removes token-like strings and shortens", () => {
     expect(scrub(`failed with ${SECRET} twice`)).toBe("failed with [redacted] twice");
     expect(scrub("a".repeat(30) + " ok")).toBe("[redacted] ok");

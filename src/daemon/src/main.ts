@@ -8,6 +8,7 @@ import { CliError, defaultDataDir, parseArgs, reportError, runCli, strFlag, syst
 import { createBackup, restoreBackup } from "./backup.js";
 import { formatChecks, runDoctor } from "./doctor.js";
 import { runGateway } from "./serve.js";
+import { runMcpBridge } from "./mcpbridge.js";
 import { runProviderTest } from "./providertest.js";
 import { runSetup } from "./setup.js";
 
@@ -43,6 +44,8 @@ export async function main(argv: readonly string[], io: Io = systemIo()): Promis
         }
         return 0;
       }
+      case "mcp-bridge":
+        return await runMcpBridge(process.env, process.stdin, process.stdout, (t) => io.err(t));
       case "provider": {
         if (p.positionals[1] !== "test") throw new CliError("USAGE", "unknown provider command", `Use \`${BRAND.cli} provider test\`.`);
         return await runProviderTest({ dataDir, io, json, prompt: strFlag(p, "prompt"), timeoutMs: strFlag(p, "timeout") === undefined ? undefined : Number(strFlag(p, "timeout")) * 1000 });

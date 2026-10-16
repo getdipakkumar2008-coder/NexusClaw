@@ -27,6 +27,7 @@ export class GatewayClient {
   private readonly pending = new Map<string, Pending>();
   private listeners = new Set<(e: EvtFrame) => void>();
   private closeError: CliError | undefined;
+  private closeListeners: Array<() => void> = [];
 
   private constructor(private readonly ws: WebSocket) {
     ws.on("message", (data) => {
@@ -51,6 +52,7 @@ export class GatewayClient {
         p.reject(this.closeError);
         this.pending.delete(id);
       }
+      for (const l of this.closeListeners) l();
     });
     ws.on("error", () => undefined);
   }
@@ -92,6 +94,12 @@ export class GatewayClient {
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       this.ws.send(JSON.stringify({ t: "req", id, method, params }));
     });
+  }
+
+  /** Runs once if the connection ends (the Gateway stopped, or revoked this credential). */
+  onClose(fn: () => void): void {
+    if (this.closeError) fn();
+    else this.closeListeners.push(fn);
   }
 
   onEvent(fn: (e: EvtFrame) => void): () => void {

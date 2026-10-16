@@ -1,5 +1,6 @@
 /* global process, setInterval, clearInterval */
 // A tiny scripted ACP agent for tests. Behaviour is chosen with FAKE_MODE. Not shipped.
+import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
 const mode = process.env.FAKE_MODE ?? "normal";
@@ -54,7 +55,7 @@ rl.on("line", async (line) => {
     case "session/new": {
       if (mode === "auth-error") return send({ id: m.id, error: { code: -32000, message: "Authentication required: please sign in" } });
       const sessionId = `s${nextSession++}`;
-      sessions.set(sessionId, { prompts: 0, cwd: m.params?.cwd });
+      sessions.set(sessionId, { prompts: 0, cwd: m.params?.cwd, mcpServers: m.params?.mcpServers });
       return send({ id: m.id, result: { sessionId } });
     }
     case "session/prompt": {
@@ -103,6 +104,38 @@ rl.on("line", async (line) => {
         chunk(sessionId, `fs result: ${JSON.stringify(r)}`);
         return send({ id: m.id, result: { stopReason: "end_turn" } });
       }
+      if (mode === "mcp") {
+        // Behave like a model that was handed an MCP server: start it, list its tools, call one as the prompt says.
+        try {
+          const bridge = (s.bridge ??= await startBridge(s.mcpServers?.[0]));
+          if (text === "list") {
+            chunk(sessionId, "tools=" + bridge.tools.join(","));
+          } else {
+            const [tool, ...rest] = text.split("|");
+            const args = rest.length ? JSON.parse(rest.join("|")) : {};
+            // Like a real harness, ask the client for permission before using an MCP tool.
+            const claimed = process.env.FAKE_CLAIM || s.mcpServers?.[0]?.name;
+            const perm = await call("session/request_permission", {
+              sessionId,
+              toolCall: { toolCallId: "tc" + Date.now(), name: "mcp__" + claimed + "__" + tool, kind: "other", status: "pending", rawInput: args, _meta: { claudeCode: { toolName: "mcp__" + claimed + "__" + tool, mcpServer: { name: claimed, source: "dynamic" } } } },
+              options: [
+                { optionId: "always", name: "Always", kind: "allow_always" },
+                { optionId: "once", name: "Allow", kind: "allow_once" },
+                { optionId: "no", name: "Reject", kind: "reject_once" },
+              ],
+            });
+            if (perm?.outcome?.outcome !== "selected" || perm.outcome.optionId !== "once") {
+              chunk(sessionId, "harness-blocked=" + JSON.stringify(perm?.outcome));
+              return send({ id: m.id, result: { stopReason: "end_turn" } });
+            }
+            const r = await bridge.call(tool, args);
+            chunk(sessionId, "isError=" + r.isError + ";text=" + r.content.map((c) => c.text).join(""));
+          }
+        } catch (e) {
+          chunk(sessionId, "harness-error=" + e.message);
+        }
+        return send({ id: m.id, result: { stopReason: "end_turn" } });
+      }
       if (mode === "ctx") {
         chunk(sessionId, `n=${s.prompts};cwd=${s.cwd};text=${text}`);
         return send({ id: m.id, result: { stopReason: "end_turn" } });
@@ -131,3 +164,32 @@ rl.emit = (ev, ...args) => {
   }
   return origEmit(ev, ...args);
 };
+
+async function startBridge(spec) {
+  if (!spec) throw new Error("no mcp server was offered");
+  const env = { ...process.env };
+  for (const e of spec.env ?? []) env[e.name] = e.value;
+  if (process.env.FAKE_WAIT_S) env.CLAWNEXUS_BRIDGE_WAIT_S = process.env.FAKE_WAIT_S;
+  const child = spawn(spec.command, spec.args ?? [], { env, stdio: ["pipe", "pipe", "inherit"], windowsHide: true });
+  const answers = new Map();
+  let n = 0;
+  createInterface({ input: child.stdout }).on("line", (line) => {
+    try {
+      const msg = JSON.parse(line);
+      answers.get(msg.id)?.(msg);
+    } catch {
+      /* not a protocol line */
+    }
+  });
+  const rpc = (method, params) =>
+    new Promise((resolve, reject) => {
+      const id = ++n;
+      answers.set(id, (msg) => (msg.error ? reject(new Error(msg.error.message)) : resolve(msg.result)));
+      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      child.once("exit", () => reject(new Error("bridge exited")));
+    });
+  await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake", version: "0" } });
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+  const listed = await rpc("tools/list", {});
+  return { tools: listed.tools.map((t) => t.name), call: (name, args) => rpc("tools/call", { name, arguments: args }) };
+}

@@ -20,7 +20,7 @@ export interface PeerOptions {
   /** A single message longer than this is a protocol violation and closes the connection. */
   maxLineBytes?: number;
   /** Handles a request from the other side. Throw RpcError to answer with a specific error. */
-  onRequest(method: string, params: unknown): Promise<unknown>;
+  onRequest(method: string, params: unknown, id: number | string): Promise<unknown>;
   onNotification(method: string, params: unknown): void;
   /** Called once when the stream ends or the peer is closed. */
   onClose(reason: Error | undefined): void;
@@ -128,7 +128,7 @@ export class JsonRpcPeer {
 
   private async serve(id: number | string, method: string, params: unknown): Promise<void> {
     try {
-      const result = await this.o.onRequest(method, params);
+      const result = await this.o.onRequest(method, params, id);
       this.send({ jsonrpc: "2.0", id, result: result ?? null });
     } catch (e) {
       if (e instanceof RpcError) this.send({ jsonrpc: "2.0", id, error: { code: e.code, message: e.message } });

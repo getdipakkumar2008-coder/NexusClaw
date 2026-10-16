@@ -1,5 +1,10 @@
 import type { Provider, ProviderEvent, ProviderMessage, ProviderRequest } from "@clawnexus/sessions";
-import { AcpConnection, AcpError, type AcpConnectionOptions } from "./client.js";
+import { AcpConnection, AcpError, type AcpConnectionOptions, type McpServerSpec, type PermissionAnswer, type PermissionInfo } from "./client.js";
+
+/** Gives a harness session its tools. `open` is called once per new harness session; `close` when it ends. */
+export interface ToolBridge {
+  open(gatewaySessionId: string): Promise<{ mcpServers: McpServerSpec[]; close(): void } | undefined>;
+}
 
 export interface AcpProviderOptions extends Omit<AcpConnectionOptions, "spec"> {
   spec: AcpConnectionOptions["spec"];
@@ -8,6 +13,8 @@ export interface AcpProviderOptions extends Omit<AcpConnectionOptions, "spec"> {
   /** Largest history preamble sent when a harness session has to be rebuilt. */
   maxContextChars?: number;
   graceMs?: number;
+  /** Offer the Gateway's tools to the model. Without it the harness can only talk. */
+  bridge?: ToolBridge;
   /** For tests: replace how connections are made. */
   connect?: (o: AcpConnectionOptions) => Promise<AcpConnection>;
 }
@@ -39,6 +46,9 @@ export class AcpProvider implements Provider {
   readonly name: string;
   private conn: Promise<AcpConnection> | undefined;
   private readonly sessions = new Map<string, string>();
+  private readonly bridges = new Map<string, () => void>();
+  /** harness session id -> the MCP server names we handed it. */
+  private readonly offered = new Map<string, Set<string>>();
   private closed = false;
 
   constructor(private readonly o: AcpProviderOptions) {
@@ -49,7 +59,7 @@ export class AcpProvider implements Provider {
     if (this.closed) return Promise.reject(new AcpError("HARNESS_EXITED", "the provider was shut down", "Restart the Gateway."));
     if (!this.conn) {
       const make = this.o.connect ?? AcpConnection.start;
-      const p = make(this.o);
+      const p = make({ ...this.o, onPermission: (i) => this.permission(i) });
       this.conn = p;
       p.then(
         (c) => {
@@ -59,7 +69,7 @@ export class AcpProvider implements Provider {
               clearInterval(watch);
               if (this.conn === p) {
                 this.conn = undefined;
-                this.sessions.clear();
+                this.forgetSessions();
               }
             }
           }, 500);
@@ -73,18 +83,38 @@ export class AcpProvider implements Provider {
     return this.conn;
   }
 
+  /**
+   * The harness asks before using any MCP tool, including ours. Ours enforce policy and approvals themselves, so a
+   * request that targets exactly the server we gave THIS harness session (its name is random per session) is let
+   * through once; anything else goes to the configured hook, and by default is rejected.
+   */
+  private permission(i: PermissionInfo): PermissionAnswer {
+    if (i.mcpServer !== undefined && this.offered.get(i.sessionId)?.has(i.mcpServer)) return "allow_once";
+    return this.o.onPermission?.(i) ?? "reject";
+  }
+
   async *run(req: ProviderRequest): AsyncIterable<ProviderEvent> {
     const conn = await this.connection();
     if (!conn.alive) {
       this.conn = undefined;
-      this.sessions.clear();
+      this.forgetSessions();
       return yield* this.run(req);
     }
     let sid = this.sessions.get(req.sessionId);
     const fresh = sid === undefined;
     if (sid === undefined) {
-      sid = await conn.newSession();
+      const bridge = await this.o.bridge?.open(req.sessionId);
+      try {
+        sid = await conn.newSession(bridge?.mcpServers ?? []);
+      } catch (e) {
+        bridge?.close();
+        throw e;
+      }
       this.sessions.set(req.sessionId, sid);
+      if (bridge) {
+        this.bridges.set(req.sessionId, bridge.close);
+        this.offered.set(sid, new Set(bridge.mcpServers.map((m) => m.name)));
+      }
     }
     const text = fresh ? buildPrompt(req.messages, this.o.maxContextChars ?? 24_000) : [...req.messages].reverse().find((m) => m.role === "user")?.content ?? "";
     if (text === "") return;
@@ -149,12 +179,26 @@ export class AcpProvider implements Provider {
     }
   }
 
+  /** The harness session is gone, so its tool credentials must stop working too. */
+  private forgetSessions(): void {
+    this.sessions.clear();
+    this.offered.clear();
+    for (const close of this.bridges.values()) {
+      try {
+        close();
+      } catch {
+        /* revoking twice or after shutdown is fine */
+      }
+    }
+    this.bridges.clear();
+  }
+
   /** Stop the harness. Safe to call more than once. */
   async close(): Promise<void> {
     this.closed = true;
     const c = this.conn;
     this.conn = undefined;
-    this.sessions.clear();
+    this.forgetSessions();
     await (await c?.catch(() => undefined))?.closeAndWait();
   }
 }

@@ -377,3 +377,137 @@ describe("model provider (WP7)", () => {
     expect((await cli(["provider", "nope"])).err).toContain("USAGE");
   });
 });
+
+describe("tool bridge end to end (WP7 slice 2)", () => {
+  const FAKE = fileURLToPath(new URL("../../acp/test/fake-harness.mjs", import.meta.url));
+  const workspaceFile = (name: string): string => join(dir, "workspace", name);
+  const configure = (extra: Record<string, unknown> = {}, security = "standard"): void => {
+    process.env["FAKE_MODE"] = "mcp";
+    process.env["FAKE_WAIT_S"] = "20";
+    writeConfig(dir, {
+      configVersion: 1,
+      security: { profile: security },
+      provider: { harness: "custom", command: process.execPath, args: [FAKE], env: ["FAKE_MODE", "FAKE_WAIT_S"], ...extra },
+    });
+  };
+  afterEach(() => {
+    delete process.env["FAKE_MODE"];
+    delete process.env["FAKE_WAIT_S"];
+  });
+  const pendingApproval = async (): Promise<string> => {
+    for (let i = 0; i < 400; i++) {
+      const a = running?.gateway.approvals.list()[0];
+      if (a) return a.id;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error("no approval was requested");
+  };
+
+  it("the model sees the Gateway's tools through a bridge process it starts itself", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    configure();
+    const port = String(await start(false));
+    const r = await cli(["chat", "list", "--port", port]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("tools=fs_read,fs_list,fs_write,exec_run");
+  }, 30_000);
+
+  it("reads run at once; the model's writes wait for the owner, and the owner's yes lets exactly that write through", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    configure();
+    writeFileSync(workspaceFile("seed.txt"), "seed-content");
+    const port = String(await start(false));
+
+    const read = await cli(["chat", 'fs_read|{"path":"seed.txt"}', "--port", port]);
+    expect(read.out).toContain("isError=false");
+    expect(read.out).toContain("seed-content");
+
+    const writing = cli(["chat", 'fs_write|{"path":"w.txt","content":"from the model"}', "--port", port, "--timeout", "30"]);
+    const id = await pendingApproval();
+    expect(running?.gateway.approvals.get(id)?.requester).toMatch(/^agent:/);
+    expect(existsSync(workspaceFile("w.txt"))).toBe(false); // nothing happens before the owner says so
+    expect((await cli(["approvals", "approve", id, "--port", port])).code).toBe(0);
+    const done = await writing;
+    expect(done.out).toContain("isError=false");
+    expect(done.err).toContain("[approval needed]");
+    expect(done.err).toContain(`approvals approve ${id}`);
+    expect(readFileSync(workspaceFile("w.txt"), "utf8")).toBe("from the model");
+  }, 60_000);
+
+  it("when the owner says no, nothing runs and the model is told not to try again", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    configure();
+    const port = String(await start(false));
+    const writing = cli(["chat", 'fs_write|{"path":"no.txt","content":"x"}', "--port", port, "--timeout", "30"]);
+    const id = await pendingApproval();
+    expect((await cli(["approvals", "deny", id, "--port", port])).code).toBe(0);
+    const done = await writing;
+    expect(done.out).toContain("isError=true");
+    expect(done.out).toMatch(/denied/i);
+    expect(existsSync(workspaceFile("no.txt"))).toBe(false);
+  }, 60_000);
+
+  it("if the owner never answers, the model gets a clear 'still pending' and the request stays open", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    configure();
+    process.env["FAKE_WAIT_S"] = "1";
+    const port = String(await start(false));
+    const r = await cli(["chat", 'fs_write|{"path":"late.txt","content":"x"}', "--port", port, "--timeout", "30"]);
+    expect(r.out).toContain("isError=true");
+    expect(r.out).toContain("has not approved");
+    expect(existsSync(workspaceFile("late.txt"))).toBe(false);
+    expect(running?.gateway.approvals.list()).toHaveLength(1);
+  }, 60_000);
+
+  it("path escapes by the model are refused like anyone else's", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    configure();
+    const port = String(await start(false));
+    const r = await cli(["chat", 'fs_read|{"path":"../gateway.token"}', "--port", port]);
+    expect(r.out).toContain("isError=true");
+    expect(r.out).not.toContain(readFileSync(join(dir, "gateway.token"), "utf8").trim());
+  }, 30_000);
+
+  it("a locked-down profile refuses program execution from the model outright", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    configure({}, "locked-down");
+    const port = String(await start(false));
+    const r = await cli(["chat", `exec_run|${JSON.stringify({ command: process.execPath, args: ["-e", "1"] })}`, "--port", port]);
+    expect(r.out).toContain("isError=true");
+    expect(r.out).toMatch(/sandbox/);
+    expect(running?.gateway.approvals.list()).toHaveLength(0);
+  }, 30_000);
+
+  it("a harness cannot borrow the permission shortcut by naming some other MCP server", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    configure({ env: ["FAKE_MODE", "FAKE_WAIT_S", "FAKE_CLAIM"] });
+    process.env["FAKE_CLAIM"] = "clawnexus"; // a guessable name; the real one is random per session
+    try {
+      const port = String(await start(false));
+      const r = await cli(["chat", 'fs_write|{"path":"spoof.txt","content":"x"}', "--port", port]);
+      expect(r.out).toContain("harness-blocked");
+      expect(r.out).toContain('"outcome":"selected"');
+      expect(r.out).toContain('"optionId":"no"');
+      expect(existsSync(workspaceFile("spoof.txt"))).toBe(false);
+      expect(running?.gateway.approvals.list()).toHaveLength(0);
+    } finally {
+      delete process.env["FAKE_CLAIM"];
+    }
+  }, 30_000);
+
+  it("with tools switched off the model gets no tools at all", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    configure();
+    running = await startFromConfig({ dataDir: dir, io: fakeIo(), port: 0, bridgeTools: false });
+    const port = String(running.port);
+    const r = await cli(["chat", "list", "--port", port]);
+    expect(r.out).toContain("no mcp server was offered");
+  }, 30_000);
+
+  it("the bridge refuses to run by hand without a credential", async () => {
+    const io = fakeIo();
+    const code = await main(["mcp-bridge"], io);
+    expect(code).toBe(2);
+    expect(io.errText).toContain("not meant to be run by hand");
+  });
+});

@@ -141,6 +141,14 @@ const chat: Handler = (c) =>
     const done = new Promise<void>((resolve) => {
       g.onEvent((e) => {
         if (e.session !== session) return;
+        if (e.type === "approval.requested") {
+          // The model is waiting for the owner. Say exactly what it wants and how to answer.
+          const a = (e.data ?? {}) as { id?: string; tool?: string; args?: string; reason?: string };
+          c.io.err(
+            `\n[approval needed] ${a.tool ?? "a tool"} ${(a.args ?? "").slice(0, 300)}\n  why: ${a.reason ?? "policy"}\n  allow: ${BRAND.cli} approvals approve ${a.id}\n  refuse: ${BRAND.cli} approvals deny ${a.id}\n`,
+          );
+          return;
+        }
         const data = (e.data ?? {}) as { runId?: string; text?: string; error?: string };
         if (run.id === undefined) {
           buffered.push({ type: e.type, data });

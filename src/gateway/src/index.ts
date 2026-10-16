@@ -3,6 +3,7 @@ import { CURRENT_CONFIG_VERSION } from "@clawnexus/config";
 import { PROTOCOL_VERSION } from "@clawnexus/protocol";
 import { SDK_VERSION } from "@clawnexus/plugin-sdk";
 
+export { BridgeRegistry, type BridgeGrant, type MintOptions } from "./bridge.js";
 export { Gateway, startGateway, ensureGatewayToken, type GatewayOptions } from "./server.js";
 
 /** Versions this build speaks; used by `status` tooling and tests. */

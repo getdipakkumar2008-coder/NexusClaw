@@ -1,6 +1,6 @@
 import { decide, type ApprovalStore, type PrincipalKind, type Profile, type Risk } from "@clawnexus/policy";
 import type { EventLog } from "@clawnexus/store";
-import type { ZodType } from "zod";
+import { toJSONSchema, type ZodType } from "zod";
 import type { WorkspaceGuard } from "./guard.js";
 
 /** What a tool's implementation receives. */
@@ -57,6 +57,9 @@ export interface ExecutorOptions {
   maxOutputBytes?: number;
 }
 
+/** Most approvals one caller may have waiting at once. */
+const MAX_PENDING_PER_REQUESTER = 5;
+
 const SECRET_KEY = /(token|secret|passw(or)?d|api[_-]?key|authorization|credential|private[_-]?key)/i;
 
 /** Compact, secret-free rendering of arguments for the audit log. */
@@ -92,8 +95,23 @@ export class ToolExecutor {
     this.o = { defaultTimeoutMs: 30_000, abortGraceMs: 3_000, maxOutputBytes: 256 * 1024, ...opts };
   }
 
-  list(): Array<{ name: string; description: string; risk: Risk }> {
-    return [...this.tools.values()].map((t) => ({ name: t.name, description: t.description, risk: t.risk }));
+  list(): Array<{ name: string; description: string; risk: Risk; inputSchema: Record<string, unknown> }> {
+    return [...this.tools.values()].map((t) => ({ name: t.name, description: t.description, risk: t.risk, inputSchema: this.jsonSchema(t) }));
+  }
+
+  private readonly schemas = new Map<string, Record<string, unknown>>();
+  private jsonSchema(t: ToolDef<any>): Record<string, unknown> { // eslint-disable-line @typescript-eslint/no-explicit-any
+    let s = this.schemas.get(t.name);
+    if (!s) {
+      try {
+        s = { ...(toJSONSchema(t.schema) as Record<string, unknown>) };
+        delete s["$schema"];
+      } catch {
+        s = { type: "object" };
+      }
+      this.schemas.set(t.name, s);
+    }
+    return s;
   }
 
   async call(req: CallRequest): Promise<CallResult> {
@@ -130,6 +148,10 @@ export class ToolExecutor {
   private checkApproval(req: CallRequest, def: ToolDef<any>, args: unknown, reason: string): CallResult | undefined { // eslint-disable-line @typescript-eslint/no-explicit-any
     const { approvals } = this.o;
     if (req.approvalId === undefined) {
+      // A confused or hijacked caller must not be able to bury the owner in requests.
+      if (approvals.list().filter((x) => x.requester === req.principalId).length >= MAX_PENDING_PER_REQUESTER) {
+        return this.finish(req, "denied", { status: "denied", reason: "too many approvals are already waiting for the owner" }, def);
+      }
       const a = approvals.create({ tool: def.name, args, requester: req.principalId });
       this.o.events.append([
         {

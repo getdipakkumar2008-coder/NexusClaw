@@ -17,6 +17,14 @@ export class AcpError extends Error {
   }
 }
 
+/** A stdio MCP server the harness is asked to start (ACP `session/new` field `mcpServers`). */
+export interface McpServerSpec {
+  name: string;
+  command: string;
+  args: string[];
+  env: Array<{ name: string; value: string }>;
+}
+
 export type PermissionAnswer = "allow_once" | "reject";
 
 export interface PermissionInfo {
@@ -24,6 +32,18 @@ export interface PermissionInfo {
   toolCallId?: string;
   title?: string;
   kind?: string;
+  /** The MCP server the call targets, when the harness says so (it names it in the request's metadata). */
+  mcpServer?: string;
+}
+
+/** Which MCP server a permission request is about. Vendor metadata first, then the common `mcp__server__tool` name. */
+export function mcpServerOf(toolCall: Record<string, unknown>): string | undefined {
+  const meta = isObj(toolCall["_meta"]) ? toolCall["_meta"] : {};
+  const claude = isObj(meta["claudeCode"]) ? meta["claudeCode"] : {};
+  const viaMeta = isObj(claude["mcpServer"]) ? str(claude["mcpServer"]["name"]) : undefined;
+  if (viaMeta) return viaMeta;
+  const named = str(claude["toolName"]) ?? str(toolCall["name"]);
+  return named?.match(/^mcp__(.+?)__[^_]/)?.[1];
 }
 
 export interface AcpConnectionOptions {
@@ -175,10 +195,10 @@ export class AcpConnection {
     }
   }
 
-  async newSession(): Promise<string> {
+  async newSession(mcpServers: McpServerSpec[] = []): Promise<string> {
     let r: unknown;
     try {
-      r = await this.peer.request("session/new", { cwd: this.o.cwd, mcpServers: [] }, { timeoutMs: this.o.sessionTimeoutMs ?? 60_000 });
+      r = await this.peer.request("session/new", { cwd: this.o.cwd, mcpServers }, { timeoutMs: this.o.sessionTimeoutMs ?? 60_000 });
     } catch (e) {
       throw await this.explain(e, "session/new");
     }
@@ -263,6 +283,8 @@ export class AcpConnection {
       if (title) info.title = scrub(title, 120);
       const kind = str(toolCall["kind"]);
       if (kind) info.kind = kind;
+      const server = mcpServerOf(toolCall);
+      if (server) info.mcpServer = server;
       const answer: PermissionAnswer = this.o.onPermission ? this.o.onPermission(info) : "reject";
       const pick = (kinds: string[]): string | undefined => {
         for (const k of kinds) {
@@ -273,7 +295,7 @@ export class AcpConnection {
       };
       // Never choose an "always" option on the user's behalf: grants must stay one call at a time.
       const chosen = answer === "allow_once" ? pick(["allow_once"]) : pick(["reject_once", "reject_always"]);
-      if (answer === "reject" || chosen === undefined) this.o.onDeclined?.(`permission request${info.title ? `: ${info.title}` : ""}`);
+      if (answer === "reject" || chosen === undefined) this.o.onDeclined?.(`permission request${info.title ? `: ${info.title}` : ""}${info.mcpServer ? ` (mcp server ${info.mcpServer})` : ""}`);
       return chosen === undefined ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: chosen } };
     }
     this.o.onDeclined?.(`unsupported request ${method.slice(0, 60)}`);

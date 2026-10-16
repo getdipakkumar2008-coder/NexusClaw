@@ -466,3 +466,163 @@ describe("tools over the wire", () => {
     expect((await c.call("tool.call", { tool: "exec.run", args, approvalId: id })).result.code).toBe("BAD_APPROVAL");
   });
 });
+
+describe("tool bridge credentials (model-driven tool calls)", () => {
+  async function agent(session = "sess-A", principal: "owner" | "guest" = "owner"): Promise<{ c: Client; revoke: () => void; token: string }> {
+    const m = gw.mintBridge({ session, principal });
+    const c = await Client.open(port);
+    clients.push(c);
+    const h = await c.hello(m.token);
+    expect(h.ok).toBe(true);
+    expect(h.result.role).toBe("agent");
+    return { c, revoke: m.revoke, token: m.token };
+  }
+
+  it("authenticates as an agent, never as the owner, and the owner token still works", async () => {
+    await boot();
+    const a = await agent();
+    expect(a.token.startsWith("cnb_")).toBe(true);
+    const o = await authed();
+    expect((await o.call("status")).ok).toBe(true);
+    const bad = await Client.open(port);
+    clients.push(bad);
+    expect((await bad.hello("cnb_not-a-real-credential")).error?.code).toBe("AUTH.BAD_TOKEN");
+  });
+
+  it("lists tools with JSON schemas the model can use", async () => {
+    await boot();
+    const { c } = await agent();
+    const tools = (await c.call("tool.list")).result.tools as Array<{ name: string; inputSchema: { type: string; properties: Record<string, unknown> } }>;
+    expect(tools.map((t) => t.name)).toEqual(["fs.read", "fs.list", "fs.write", "exec.run"]);
+    expect(tools.find((t) => t.name === "fs.write")?.inputSchema.properties).toHaveProperty("content");
+    expect(JSON.stringify(tools)).not.toContain("$schema");
+  });
+
+  it("can use nothing but tools: every other method is forbidden", async () => {
+    await boot();
+    const { c } = await agent();
+    for (const m of ["status", "session.list", "session.send", "session.create", "approval.list", "approval.decide", "pairing.list", "pairing.approve", "events.subscribe", "session.export"]) {
+      const r = await c.call(m, { id: "x", approve: true, code: "x", session: "x", text: "x" });
+      expect(r.ok, m).toBe(false);
+      expect(r.error?.code, m).toBe("AUTH.FORBIDDEN");
+    }
+  });
+
+  it("cannot choose its own principal, trust level or session", async () => {
+    await boot();
+    const { c } = await agent();
+    for (const extra of [{ principal: "owner" }, { tainted: false }, { session: "other" }, { profile: "trusted" }]) {
+      const r = await c.call("tool.call", { tool: "fs.read", args: { path: "." }, ...extra });
+      expect(r.error?.code, JSON.stringify(extra)).toBe("UNSUPPORTED.BAD_PARAMS");
+    }
+  });
+
+  it("treats the model as tainted: reads run, writes and exec wait for the owner", async () => {
+    await boot();
+    const o = await authed();
+    expect((await o.call("tool.call", { tool: "fs.write", args: { path: "seed.txt", content: "seed" } })).result.status).toBe("ok");
+    const { c } = await agent("sess-A");
+    expect((await c.call("tool.call", { tool: "fs.read", args: { path: "seed.txt" } })).result.output.content).toBe("seed");
+    const w = await c.call("tool.call", { tool: "fs.write", args: { path: "new.txt", content: "x" } });
+    expect(w.result.status).toBe("approval_required");
+    const x = await c.call("tool.call", { tool: "exec.run", args: { command: process.execPath, args: ["-e", "1"] } });
+    expect(x.result.status).toBe("approval_required");
+    expect(() => readFileSync(join(dir, "workspace", "new.txt"))).toThrow();
+  });
+
+  it("an approval is for one session, one exact call, one use", async () => {
+    await boot();
+    const o = await authed();
+    const a = await agent("sess-A");
+    const b = await agent("sess-B");
+    const args = { path: "n.txt", content: "one" };
+    const first = await a.c.call("tool.call", { tool: "fs.write", args });
+    const id = first.result.approvalId as string;
+
+    // the agent cannot approve itself, and cannot see the owner's list
+    expect((await a.c.call("approval.decide", { id, approve: true })).error?.code).toBe("AUTH.FORBIDDEN");
+    expect((await a.c.call("approval.status", { id })).result.state).toBe("pending");
+    // another session cannot even see it, let alone use it
+    expect((await b.c.call("approval.status", { id })).error?.code).toBe("POLICY.APPROVAL");
+
+    expect((await o.call("approval.decide", { id, approve: true })).ok).toBe(true);
+    expect((await a.c.call("approval.status", { id })).result.state).toBe("approved");
+    expect((await b.c.call("tool.call", { tool: "fs.write", args, approvalId: id })).result.code).toBe("BAD_APPROVAL");
+    // different arguments with the same approval id
+    expect((await a.c.call("tool.call", { tool: "fs.write", args: { path: "n.txt", content: "TWO" }, approvalId: id })).result.code).toBe("BAD_APPROVAL");
+    // the right call works exactly once
+    expect((await a.c.call("tool.call", { tool: "fs.write", args, approvalId: id })).result.status).toBe("ok");
+    expect(readFileSync(join(dir, "workspace", "n.txt"), "utf8")).toBe("one");
+    expect((await a.c.call("tool.call", { tool: "fs.write", args, approvalId: id })).result.code).toBe("BAD_APPROVAL");
+  });
+
+  it("records who asked, for which session, in the audit log", async () => {
+    await boot();
+    const o = await authed();
+    await o.call("events.subscribe");
+    const { c } = await agent("sess-audit");
+    await c.call("tool.call", { tool: "fs.list", args: { path: "." } });
+    await c.call("tool.call", { tool: "fs.write", args: { path: "q.txt", content: "z" } });
+    await o.waitFor(() => o.events.some((e) => e.type === "approval.requested"));
+    const mine = o.events.filter((e) => e.session === "sess-audit");
+    expect(mine.some((e) => e.type === "tool.completed")).toBe(true);
+    const req = mine.find((e) => e.type === "approval.requested");
+    expect((req?.data as { requester: string }).requester).toBe("agent:sess-audit");
+  });
+
+  it("a guest session can read but never write or run programs, even with approval", async () => {
+    await boot();
+    const { c } = await agent("sess-G", "guest");
+    expect((await c.call("tool.call", { tool: "fs.list", args: { path: "." } })).result.status).toBe("ok");
+    expect((await c.call("tool.call", { tool: "fs.write", args: { path: "g.txt", content: "z" } })).result.status).toBe("denied");
+    expect((await c.call("tool.call", { tool: "exec.run", args: { command: process.execPath } })).result.status).toBe("denied");
+  });
+
+  it("follows the configured security profile (locked-down refuses exec without a sandbox)", async () => {
+    await boot({ config: { gateway: { bind: "127.0.0.1", port: 0, tls: { enabled: false }, auth: { required: true }, insecureAcknowledged: false }, security: { profile: "locked-down" } } });
+    const { c } = await agent();
+    const r = await c.call("tool.call", { tool: "exec.run", args: { command: process.execPath, args: ["-e", "1"] } });
+    expect(r.result.status).toBe("denied");
+    expect(r.result.reason).toMatch(/sandbox/);
+  });
+
+  it("limits how many approvals one session can pile up", async () => {
+    await boot();
+    const o = await authed();
+    const { c } = await agent("sess-spam");
+    const results: string[] = [];
+    for (let i = 0; i < 7; i++) results.push((await c.call("tool.call", { tool: "fs.write", args: { path: `s${i}.txt`, content: "x" } })).result.status);
+    expect(results.filter((s) => s === "approval_required")).toHaveLength(5);
+    expect(results.filter((s) => s === "denied")).toHaveLength(2);
+    expect((await o.call("approval.list")).result.approvals).toHaveLength(5);
+  });
+
+  it("revoking a credential closes its connection and it can never log in again", async () => {
+    await boot();
+    const a = await agent("sess-R");
+    expect((await a.c.call("tool.list")).ok).toBe(true);
+    a.revoke();
+    await a.c.waitFor(() => a.c.closed !== undefined);
+    expect(a.c.closed?.code).toBe(4401);
+    const again = await Client.open(port);
+    clients.push(again);
+    expect((await again.hello(a.token)).error?.code).toBe("AUTH.BAD_TOKEN");
+  });
+
+  it("credentials expire", async () => {
+    let now = 1_000_000;
+    await boot({ now: () => now });
+    const m = gw.mintBridge({ session: "s", principal: "owner" });
+    now += 25 * 3600_000;
+    const c = await Client.open(port);
+    clients.push(c);
+    expect((await c.hello(m.token)).error?.code).toBe("AUTH.BAD_TOKEN");
+  });
+
+  it("stopping the Gateway revokes everything", async () => {
+    await boot();
+    const m = gw.mintBridge({ session: "s", principal: "owner" });
+    await gw.stop();
+    expect(gw.bridgeGrants.lookup(m.token)).toBeUndefined();
+  });
+});

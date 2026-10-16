@@ -18,6 +18,7 @@ import { EventLog, CursorExpiredError, openDb, type Db, type StoredEvent } from 
 import { PairingError, PairingService } from "@clawnexus/pairing";
 import { ApprovalError, ApprovalStore } from "@clawnexus/policy";
 import { BUILTIN_TOOLS, ToolExecutor, WorkspaceGuard } from "@clawnexus/tools";
+import { BridgeRegistry, type BridgeGrant, type MintOptions } from "./bridge.js";
 import { SessionError, SessionManager, type Provider, type SessionManagerOptions } from "@clawnexus/sessions";
 
 export interface GatewayOptions {
@@ -26,7 +27,7 @@ export interface GatewayOptions {
   /** Defaults to the config's gateway.bind / gateway.port, else 127.0.0.1:7391. Port 0 picks a free port. */
   host?: string;
   port?: number;
-  config?: Pick<Config, "gateway">;
+  config?: Pick<Config, "gateway"> & Partial<Pick<Config, "security">>;
   /** Model runtime for session runs. Without one, `session.send` fails with PROVIDER.NOT_CONFIGURED. */
   provider?: Provider;
   /** Directory tools may read and write. Default: `<dataDir>/workspace` (created if missing). */
@@ -67,6 +68,8 @@ interface Conn {
   ws: WebSocket;
   remote: string;
   authed: boolean;
+  /** Set when the connection authenticated with a tool-bridge credential instead of the owner token. */
+  grant?: BridgeGrant;
   unsubscribe?: () => void;
   /** Runs right after the current request's response is sent (used to start event replay after the ack). */
   postReply?: () => void;
@@ -88,6 +91,8 @@ export class Gateway {
   readonly sessions: SessionManager | undefined;
   readonly tools: ToolExecutor;
   readonly approvals: ApprovalStore;
+  readonly bridgeGrants: BridgeRegistry;
+  private readonly profile: "standard" | "locked-down" | "trusted";
   readonly tokenPath: string;
 
   private readonly db: Db;
@@ -133,6 +138,10 @@ export class Gateway {
     this.events = new EventLog(this.db, this.o.now);
     this.pairing = new PairingService(this.db, { now: this.o.now, audit: this.events });
     this.approvals = new ApprovalStore(this.o.now);
+    this.profile = opts.config?.security?.profile ?? "standard";
+    this.bridgeGrants = new BridgeRegistry(this.o.now, (g) => {
+      for (const c of this.conns) if (c.grant === g) c.ws.close(4401, "credential revoked");
+    });
     const workspace = opts.workspace ?? join(opts.dataDir, "workspace");
     mkdirSync(workspace, { recursive: true, mode: 0o700 });
     this.tools = new ToolExecutor({ events: this.events, approvals: this.approvals, guard: new WorkspaceGuard([workspace]), tools: BUILTIN_TOOLS });
@@ -168,6 +177,7 @@ export class Gateway {
     } catch {
       /* database may already be closed */
     }
+    this.bridgeGrants.revokeAll();
     for (const c of this.conns) {
       c.ws.close(1001, "gateway shutting down");
     }
@@ -180,6 +190,17 @@ export class Gateway {
 
   get port(): number {
     return this.boundPort;
+  }
+
+  /** Where a tool bridge connects. */
+  get url(): string {
+    return `ws://${this.host.includes(":") ? `[${this.host}]` : this.host}:${this.boundPort}/v1/ws`;
+  }
+
+  /** Issue a credential for one session's tool bridge. Revoke it when that session's harness goes away. */
+  mintBridge(o: MintOptions): { token: string; url: string; revoke(): void } {
+    const m = this.bridgeGrants.mint(o);
+    return { token: m.token, url: this.url, revoke: m.revoke };
   }
 
   // ---------------- HTTP ----------------
@@ -318,13 +339,16 @@ export class Gateway {
       throw new MethodError(err("UNSUPPORTED.PROTOCOL", `protocol ${p.protocol.major}.x is not supported`, `This Gateway speaks ${PROTOCOL_VERSION.major}.${PROTOCOL_VERSION.minor}.`));
     }
     const supplied = p.auth?.token;
-    if (supplied === undefined || !timingSafeEqual(sha(supplied), sha(this.token))) {
+    const isOwner = supplied !== undefined && timingSafeEqual(sha(supplied), sha(this.token));
+    const grant = !isOwner && supplied !== undefined ? this.bridgeGrants.lookup(supplied) : undefined;
+    if (!isOwner && !grant) {
       this.recordAuthFailure(c.remote);
       throw new MethodError(err("AUTH.BAD_TOKEN", "invalid or missing token", `Use the token from ${TOKEN_FILE} in the Gateway data directory.`));
     }
     c.authed = true;
+    if (grant) c.grant = grant;
     clearTimeout(c.helloTimer);
-    return { protocol: PROTOCOL_VERSION, server: `${BRAND.name} ${VERSION}`, role: "owner", latestSeq: this.events.latestSeq() };
+    return { protocol: PROTOCOL_VERSION, server: `${BRAND.name} ${VERSION}`, role: grant ? "agent" : "owner", latestSeq: this.events.latestSeq() };
   }
 
   private isLockedOut(remote: string): boolean {
@@ -341,7 +365,53 @@ export class Gateway {
 
   // ---------------- methods (all require the owner role in this slice) ----------------
 
+  /**
+   * What a model's tool bridge may do: list tools, call tools as ITS session's principal, and ask about its own
+   * approvals. Nothing else (no sessions, pairing, events, other people's approvals) and no way to name a
+   * different principal, session or trust level.
+   */
+  private async agentDispatch(c: Conn, g: BridgeGrant, method: string, params: unknown): Promise<unknown> {
+    if (!this.bridgeGrants.live(g)) {
+      c.ws.close(4401, "credential revoked");
+      throw new MethodError(err("AUTH.REVOKED", "this tool bridge credential is no longer valid", "The session ended; start a new chat."));
+    }
+    switch (method) {
+      case "tool.list":
+        return { tools: this.tools.list() };
+      case "tool.call": {
+        const p = z
+          .strictObject({
+            tool: z.string().min(1).max(128),
+            args: z.unknown().default({}),
+            approvalId: z.string().min(1).max(64).optional(),
+          })
+          .parse(params);
+        return this.tools.call({
+          tool: p.tool,
+          args: p.args,
+          principal: g.principal,
+          principalId: g.principalId,
+          profile: this.profile,
+          // The model has read things we cannot see (files, pages, earlier tool output) and may be steered by them.
+          tainted: true,
+          session: g.session,
+          ...(g.elevation === undefined ? {} : { elevation: g.elevation }),
+          ...(p.approvalId === undefined ? {} : { approvalId: p.approvalId }),
+        });
+      }
+      case "approval.status": {
+        const p = z.strictObject({ id: z.string().min(1).max(64) }).parse(params);
+        const a = this.approvals.get(p.id);
+        if (!a || a.requester !== g.principalId) throw new MethodError(err("POLICY.APPROVAL", "unknown approval", "Ask for the tool call again."));
+        return { state: a.state };
+      }
+      default:
+        throw new MethodError(err("AUTH.FORBIDDEN", `method ${method} is not available to a tool bridge`, "A tool bridge may only list and call tools."));
+    }
+  }
+
   private async dispatch(c: Conn, method: string, params: unknown): Promise<unknown> {
+    if (c.grant) return this.agentDispatch(c, c.grant, method, params);
     switch (method) {
       case "status":
         return {
@@ -412,7 +482,7 @@ export class Gateway {
           args: p.args,
           principal: "owner",
           principalId: "owner",
-          profile: "standard",
+          profile: this.profile,
           tainted: p.tainted,
           ...(p.approvalId === undefined ? {} : { approvalId: p.approvalId }),
           ...(p.session === undefined ? {} : { session: p.session }),

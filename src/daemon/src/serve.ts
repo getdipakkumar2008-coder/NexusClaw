@@ -1,11 +1,14 @@
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { AcpProvider, resolveSpec } from "@clawnexus/acp";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { AcpProvider, resolveSpec, type ToolBridge } from "@clawnexus/acp";
 import { BRAND } from "@clawnexus/brand";
 import { CliError, type Io } from "@clawnexus/cli";
 import { Gateway, startGateway } from "@clawnexus/gateway";
 import { FakeProvider } from "@clawnexus/sessions";
 import { loadConfig } from "./configfile.js";
+import { BRIDGE_ENV } from "./mcpbridge.js";
 
 const LOCK_FILE = "gateway.lock";
 /** Locks held by this process (a pid check cannot tell two Gateways in one process apart). */
@@ -51,6 +54,8 @@ export interface ServeOptions {
   port?: number;
   /** Use the built-in echo provider so the full path can be tried without a model. For testing only. */
   fakeProvider?: boolean;
+  /** Offer the Gateway's tools to the model (default true). Off = the model can only talk. */
+  bridgeTools?: boolean;
 }
 
 export interface Running {
@@ -59,6 +64,13 @@ export interface Running {
   host: string;
   port: number;
   stop(): Promise<void>;
+}
+
+/** The program the model's harness runs to reach our tools: this same binary with `mcp-bridge`. */
+function bridgeEntry(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  for (const c of [join(here, "main.js"), join(here, "..", "dist", "main.js")]) if (existsSync(c)) return c;
+  throw new CliError("INTERNAL", "cannot find the clawnexus program to start the tool bridge", "Run `pnpm build`, or set provider.tools to false.");
 }
 
 /** Start the Gateway from the on-disk config. Refuses to start on a config it cannot trust. */
@@ -76,7 +88,35 @@ export async function startFromConfig(o: ServeOptions): Promise<Running> {
     const config = loaded.config;
     const workspace = join(o.dataDir, "workspace");
     mkdirSync(workspace, { recursive: true, mode: 0o700 });
-    const acp = !o.fakeProvider && config.provider ? new AcpProvider({ spec: resolveSpec(config.provider), cwd: workspace }) : undefined;
+    const live: { gateway?: Gateway } = {}; // set once the Gateway is listening; bridges are only opened during chats, after that
+    const bridge: ToolBridge | undefined =
+      config.provider && o.bridgeTools !== false
+        ? {
+            async open(session) {
+              if (!live.gateway) return undefined;
+              const m = live.gateway.mintBridge({ session, principal: "owner" });
+              return {
+                mcpServers: [
+                  {
+                    // unguessable, so only THIS session's bridge can match the harness permission shortcut
+                    name: `clawnexus-${randomBytes(6).toString("hex")}`,
+                    command: process.execPath,
+                    args: [bridgeEntry(), "mcp-bridge"],
+                    env: [
+                      { name: BRIDGE_ENV.url, value: m.url },
+                      { name: BRIDGE_ENV.token, value: m.token },
+                    ],
+                  },
+                ],
+                close: m.revoke,
+              };
+            },
+          }
+        : undefined;
+    const acp = !o.fakeProvider && config.provider ? new AcpProvider({ spec: resolveSpec(config.provider), cwd: workspace,
+          onDeclined: (what) => live.gateway?.events.append([{ type: "provider.declined", data: { what: what.slice(0, 700) } }]),
+          ...(bridge ? { bridge } : {}),
+        }) : undefined;
     const provider = o.fakeProvider ? new FakeProvider({ chunkSize: 6 }) : acp;
     const started = await startGateway({
       dataDir: o.dataDir,
@@ -87,6 +127,7 @@ export async function startFromConfig(o: ServeOptions): Promise<Running> {
       await acp?.close();
       throw e;
     });
+    live.gateway = started.gateway;
     let stopped = false;
     return {
       gateway: started.gateway,
