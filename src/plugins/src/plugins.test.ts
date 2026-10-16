@@ -453,3 +453,27 @@ describe("trust survives restarts", () => {
     expect(tools.list().filter((t) => t.name.startsWith("swapped."))).toHaveLength(0);
   });
 });
+
+describe("folders reached through links", () => {
+  it("work: Node is given real paths (on macOS the temp folder /var is a link to /private/var)", async () => {
+    const real = join(base, "real-data");
+    mkdirSync(real);
+    const link = join(base, "linked-data");
+    try {
+      symlinkSync(real, link, "junction");
+    } catch {
+      return; // links cannot be created in this environment
+    }
+    const h2 = new PluginHost(options({ dataDir: link }));
+    try {
+      const m = makePlugin({ id: "linked", permissions: { fs: ["data"] }, body: HOSTILE });
+      await h2.install(m.dir);
+      await h2.enable(m.id, h2.info(m.id).approvalToken!);
+      expect(h2.info("linked").status).toBe("running");
+      expect(output(await callTool("linked.data", { arg: "via link" }, { tainted: false }))).toBe("via link");
+      expect(existsSync(join(real, "plugin-data", "linked", "note.txt"))).toBe(true);
+    } finally {
+      await h2.stop();
+    }
+  });
+});

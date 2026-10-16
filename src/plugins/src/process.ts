@@ -1,4 +1,5 @@
 import { fork, type ChildProcess } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { z } from "zod";
 import { LIMITS, toolRegistrationSchema, type ToolRegistration } from "@clawnexus/plugin-sdk";
 import { killTree } from "@clawnexus/tools";
@@ -107,7 +108,11 @@ export class PluginProcess {
     return this.fatal ?? scrub(this.stderrTail);
   }
 
-  static async start(o: ProcessOptions): Promise<PluginProcess> {
+  static async start(opts: ProcessOptions): Promise<PluginProcess> {
+    // Node checks permissions against real paths, so grant real paths. (On macOS the temp folder /var is a link to
+    // /private/var; granting the linked name would deny the plugin access to its own folder.)
+    const real = (p: string): string => realpathSync.native(p);
+    const o: ProcessOptions = { ...opts, dir: real(opts.dir), entry: real(opts.entry), childFile: real(opts.childFile), dataDir: opts.dataDir ? real(opts.dataDir) : undefined };
     const args = ["--permission", `--allow-fs-read=${o.childFile}`, `--allow-fs-read=${o.dir}`, `--max-old-space-size=${o.memoryMb ?? 128}`];
     if (o.dataDir) args.push(`--allow-fs-read=${o.dataDir}`, `--allow-fs-write=${o.dataDir}`);
     if (o.exec) args.push("--allow-child-process");
@@ -146,6 +151,7 @@ export class PluginProcess {
     } catch (e) {
       p.stopping = true;
       p.kill();
+      await p.exitedWithin(3000); // do not report failure while the process still holds its folder
       throw e;
     } finally {
       clearTimeout(timer);
@@ -242,6 +248,16 @@ export class PluginProcess {
     }
     this.pending.clear();
     this.o.onExit({ expected: this.stopping, code, signal, detail: detail || this.diagnostics() });
+  }
+
+  /** Resolves once the process is gone, or after `ms` if it is not. */
+  exitedWithin(ms: number): Promise<void> {
+    if (this.exited) return Promise.resolve();
+    return new Promise((resolve) => {
+      const t = setTimeout(resolve, ms);
+      t.unref();
+      this.child.once("exit", () => (clearTimeout(t), resolve()));
+    });
   }
 
   kill(): void {
