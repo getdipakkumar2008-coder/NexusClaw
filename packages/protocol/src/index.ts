@@ -18,6 +18,7 @@ export const ERROR_CODE_FAMILIES = [
   "INTERNAL",
   "SLOW_CONSUMER",
   "BAD_FRAME",
+  "SYNC",
 ] as const;
 
 export const errorCodeSchema = z
@@ -42,7 +43,7 @@ const idSchema = z.string().min(1).max(128);
 export const reqFrameSchema = z.strictObject({
   t: z.literal("req"),
   id: idSchema,
-  method: z.string().regex(/^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)+$/, "method must be dotted lowercase, e.g. session.send"),
+  method: z.string().regex(/^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)*$/, "method must be lowercase, optionally dotted, e.g. status or session.send"),
   params: z.unknown().optional(),
 });
 
@@ -108,6 +109,7 @@ export const helloParamsSchema = z.strictObject({
   protocol: z.strictObject({ major: z.number().int(), minor: z.number().int().nonnegative() }),
   client: z.strictObject({ kind: z.string().min(1), version: z.string().min(1) }),
   capabilities: z.array(z.string()).default([]),
+  auth: z.strictObject({ token: z.string().min(1).max(512) }).optional(),
 });
 export type HelloParams = z.infer<typeof helloParamsSchema>;
 

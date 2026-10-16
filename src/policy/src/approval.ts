@@ -91,6 +91,12 @@ export class ApprovalStore {
     return true;
   }
 
+  /** Approvals in the given state (default: pending), oldest first. Expired entries are updated first. */
+  list(state: ApprovalState = "pending"): Approval[] {
+    for (const id of [...this.items.keys()]) this.live(id);
+    return [...this.items.values()].filter((a) => a.state === state).sort((a, b) => a.createdAt - b.createdAt).map((a) => ({ ...a }));
+  }
+
   get(id: string): Approval | undefined {
     const a = this.items.get(id);
     if (!a) return undefined;

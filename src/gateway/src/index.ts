@@ -3,11 +3,9 @@ import { CURRENT_CONFIG_VERSION } from "@clawnexus/config";
 import { PROTOCOL_VERSION } from "@clawnexus/protocol";
 import { SDK_VERSION } from "@clawnexus/plugin-sdk";
 
-/**
- * Phase 0 placeholder for the Gateway control plane. It exists to prove the workspace wiring and the
- * dependency direction (gateway may depend on protocol, config and plugin-sdk; never the reverse).
- * No server is started here; the real implementation begins in Phase 1.
- */
+export { Gateway, startGateway, type GatewayOptions } from "./server.js";
+
+/** Versions this build speaks; used by `status` tooling and tests. */
 export function gatewayInfo(): {
   name: string;
   protocol: string;
