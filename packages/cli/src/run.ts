@@ -44,7 +44,9 @@ Talk to a running Gateway
   status                          show Gateway health
   chat <text>                     send a message and stream the reply  [--session ID]
   sessions list|show|export|delete [ID]  [--format jsonl|markdown]
-  pairing list|approve|deny [CODE]
+  pairing list|approve|deny [CODE]  |  pairing owner <channel> <your-id>
+  webchat link                    one-time link that makes a browser the owner (opens the chat page)
+  channels                        show channels and their health
   approvals list|approve|deny [ID]
   tool list | tool call <name> --args '<json>' [--approval ID]
   plugins list|info|install|enable|disable|remove [ID | PATH]  [--yes] [--replace] [--purge-data]
@@ -227,7 +229,37 @@ const pairing: Handler = (c) =>
     } else if (sub === "approve" || sub === "deny") {
       const r = await g.call<{ sender: { channel: string; externalId: string; status: string } }>(`pairing.${sub}`, { code: need(c.p, 2, "pairing code") });
       show(c, r, () => `${sub === "approve" ? "Approved" : "Denied"} ${r.sender.channel}:${r.sender.externalId} (${r.sender.status}).\n`);
-    } else throw new CliError("USAGE", `unknown pairing command ${sub}`, "Use list, approve or deny.");
+    } else if (sub === "owner") {
+      // Register one of YOUR OWN identities on a channel (e.g. your Telegram user id). Only this local command can do it.
+      const channel = need(c.p, 2, "channel");
+      const id = need(c.p, 3, "your id on that channel");
+      const account = strFlag(c.p, "account");
+      const r = await g.call<{ sender: { channel: string; externalId: string } }>("pairing.owner", { channel, id, ...(account ? { accountId: account } : {}) });
+      show(c, r, () => `Registered ${r.sender.channel}:${r.sender.externalId} as an owner identity. Messages from it are served with your full authority.\n`);
+    } else throw new CliError("USAGE", `unknown pairing command ${sub}`, "Use list, approve, deny or owner.");
+    return 0;
+  });
+
+const channels: Handler = (c) =>
+  withClient(c, async (g) => {
+    const r = await g.call<{ channels: Array<{ id: string; status: { state: string; detail?: string } }> }>("channel.list", {});
+    show(c, r, () => (r.channels.length ? `${r.channels.map((x) => `${x.id.padEnd(14)} ${x.status.state.padEnd(14)} ${x.status.detail ?? ""}`).join("\n")}\n` : "No channels.\n"));
+    return 0;
+  });
+
+const webchat: Handler = (c) =>
+  withClient(c, async (g) => {
+    const sub = c.p.positionals[1] ?? "link";
+    if (sub !== "link") throw new CliError("USAGE", `unknown webchat command ${sub}`, "Use `webchat link`.");
+    const r = await g.call<{ url: string; expiresAt: number }>("channel.webchat.link", {});
+    show(
+      c,
+      r,
+      () =>
+        `Open this link in the browser you want to use as the owner:\n\n  ${r.url}\n\n` +
+        `It works once and expires at ${new Date(r.expiresAt).toLocaleTimeString()}. Whoever opens it first becomes the owner, so do not share it.\n` +
+        `Other people who open ${r.url.split("#")[0]} get a pairing code that you approve with \`${BRAND.cli} pairing approve <code>\`.\n`,
+    );
     return 0;
   });
 
@@ -356,7 +388,7 @@ const plugins: Handler = (c) =>
     return 0;
   });
 
-const HANDLERS: Record<string, Handler> = { status, chat, sessions, pairing, approvals, tool, plugins };
+const HANDLERS: Record<string, Handler> = { status, chat, sessions, pairing, approvals, tool, plugins, channels, webchat };
 export const CLIENT_COMMANDS = Object.keys(HANDLERS);
 
 /** Print an error the way users should see it: code, cause, fix. No stack traces. */

@@ -78,6 +78,16 @@ const SCHEMA: readonly string[] = [
      approval     TEXT NOT NULL,
      approved_at  INTEGER NOT NULL
    );`,
+  // v5: who a session is talking to (drives what the model may do for it), and channel message de-duplication.
+  `ALTER TABLE sessions ADD COLUMN principal TEXT NOT NULL DEFAULT 'owner' CHECK (principal IN ('owner','guest'));
+   CREATE TABLE channel_seen (
+     channel    TEXT NOT NULL,
+     account_id TEXT NOT NULL,
+     message_id TEXT NOT NULL,
+     ts         INTEGER NOT NULL,
+     PRIMARY KEY (channel, account_id, message_id)
+   ) WITHOUT ROWID;
+   CREATE INDEX channel_seen_ts ON channel_seen(ts);`,
 ];
 
 export const SCHEMA_VERSION = SCHEMA.length;

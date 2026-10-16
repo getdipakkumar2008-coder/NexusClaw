@@ -13,6 +13,7 @@
     { "path": "src/tools" },
     { "path": "src/acp" },
     { "path": "src/plugins" },
+    { "path": "src/channels" },
     { "path": "src/vault" },
     { "path": "src/gateway" },
     { "path": "src/daemon" }

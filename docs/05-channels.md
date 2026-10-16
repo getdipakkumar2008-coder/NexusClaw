@@ -68,3 +68,8 @@ The exact 20+ list is **[Proposed]**; only 8 were named in `req.odt` — see Q-4
 
 ## 6. Acceptance per channel
 Adapter conformance suite 100% pass · E2E test using sandbox account/mocks · documented setup < 5 min · failure modes documented.
+
+## 7. Implementation status (WP10 slice 1, 2026-10-16)
+- Built: the adapter contract (`ChannelAdapter` with a host-injected `deliver`), the router that enforces section 2 items 1-4 and 7 centrally, a shared conformance suite that every adapter runs (`defineConformance`), and the built-in WebChat. Telegram, Discord and Slack come next as plugins, which needs plugin config and secrets first.
+- Conformance items covered today: untrusted inbound and pairing (1, 2), groups (3), de-duplication (4), reconnect/status reporting (5, adapter-side), outbound limits and splitting (7), no credential leakage in logs (8). Attachments (6) are noted and dropped.
+- Not built: attachments, the persistent outbox, per-channel allow/deny lists beyond pairing and group allow-lists.

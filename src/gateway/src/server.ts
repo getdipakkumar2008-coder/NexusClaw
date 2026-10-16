@@ -19,6 +19,7 @@ import { PairingError, PairingService } from "@clawnexus/pairing";
 import { ApprovalError, ApprovalStore } from "@clawnexus/policy";
 import { BUILTIN_TOOLS, ToolExecutor, WorkspaceGuard } from "@clawnexus/tools";
 import { BridgeRegistry, type BridgeGrant, type MintOptions } from "./bridge.js";
+import { ChannelManager, WEBCHAT_ID, WebChatAdapter } from "@clawnexus/channels";
 import { PluginError, PluginHost, type HostOptions } from "@clawnexus/plugins";
 import { SessionError, SessionManager, type Provider, type SessionManagerOptions } from "@clawnexus/sessions";
 
@@ -96,6 +97,8 @@ export class Gateway {
   readonly approvals: ApprovalStore;
   readonly bridgeGrants: BridgeRegistry;
   readonly plugins: PluginHost;
+  readonly channels: ChannelManager;
+  private readonly webchat: WebChatAdapter;
   private readonly profile: "standard" | "locked-down" | "trusted";
   readonly tokenPath: string;
 
@@ -152,6 +155,14 @@ export class Gateway {
     this.plugins = new PluginHost({ dataDir: opts.dataDir, db: this.db, events: this.events, tools: this.tools, now: this.o.now, ...opts.plugins });
     this.sessions = opts.provider ? new SessionManager(this.db, this.events, opts.provider, { now: this.o.now, ...opts.sessions }) : undefined;
 
+    this.webchat = new WebChatAdapter({
+      registerOwner: (externalId, display) => void this.pairing.registerOwner({ channel: WEBCHAT_ID, accountId: "default", externalId, display }),
+      principalOf: (externalId) => this.pairing.principalOf({ channel: WEBCHAT_ID, accountId: "default", externalId }),
+      now: this.o.now,
+    });
+    this.channels = new ChannelManager({ db: this.db, events: this.events, pairing: this.pairing, sessions: this.sessions, now: this.o.now });
+    this.channels.register(this.webchat);
+
     this.http = createServer((req, res) => this.handleHttp(req, res));
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
     this.http.on("upgrade", (req, socket) => this.handleUpgrade(req, socket as Duplex));
@@ -170,6 +181,7 @@ export class Gateway {
     this.boundPort = typeof addr === "object" && addr ? addr.port : this.requestedPort;
     // Enabled plugins start now. A plugin that cannot start is contained and reported; it never blocks the Gateway.
     await this.plugins.startEnabled().catch(() => undefined);
+    await this.channels.start();
     this.ready = true;
     this.events.append([{ type: "gateway.started", data: { version: VERSION } }]);
     return { host: this.host, port: this.boundPort };
@@ -185,6 +197,7 @@ export class Gateway {
       /* database may already be closed */
     }
     this.bridgeGrants.revokeAll();
+    await this.channels.stop();
     for (const c of this.conns) {
       c.ws.close(1001, "gateway shutting down");
     }
@@ -223,6 +236,7 @@ export class Gateway {
       res.writeHead(405, headers).end(JSON.stringify({ ok: false }));
       return;
     }
+    if (this.webchat.handleHttp(req, res)) return;
     if (req.url === "/healthz") res.writeHead(200, headers).end(JSON.stringify({ ok: true }));
     else if (req.url === "/readyz") res.writeHead(this.ready ? 200 : 503, headers).end(JSON.stringify({ ok: this.ready }));
     else res.writeHead(404, headers).end(JSON.stringify({ ok: false }));
@@ -243,6 +257,11 @@ export class Gateway {
     };
     if (!this.ready) return reject("503 Service Unavailable");
     if (!this.hostAllowed(req)) return reject("403 Forbidden");
+    // The browser chat has its own rules (same-origin only, identity by secret), checked by the adapter.
+    if (req.url === "/v1/webchat") {
+      if (!this.webchat.handleUpgrade(req, socket)) reject("404 Not Found");
+      return;
+    }
     // Cross-site WebSocket hijacking defence: a browser always sends Origin; refuse unless allow-listed.
     const origin = req.headers.origin;
     if (origin !== undefined && !this.o.allowedOrigins.includes(origin)) return reject("403 Forbidden");
@@ -397,7 +416,7 @@ export class Gateway {
         return this.tools.call({
           tool: p.tool,
           args: p.args,
-          principal: g.principal,
+          principal: this.effectivePrincipal(g),
           principalId: g.principalId,
           profile: this.profile,
           // The model has read things we cannot see (files, pages, earlier tool output) and may be steered by them.
@@ -415,6 +434,20 @@ export class Gateway {
       }
       default:
         throw new MethodError(err("AUTH.FORBIDDEN", `method ${method} is not available to a tool bridge`, "A tool bridge may only list and call tools."));
+    }
+  }
+
+  /**
+   * Who the model is acting for RIGHT NOW. The session row is the truth (a sender may have been demoted since the
+   * bridge was opened); a bridge minted as guest can never rise above guest; a session that no longer exists is guest.
+   */
+  private effectivePrincipal(g: BridgeGrant): "owner" | "guest" {
+    if (g.principal === "guest") return "guest";
+    if (!this.sessions) return g.principal;
+    try {
+      return this.sessions.get(g.session).principal;
+    } catch {
+      return "guest";
     }
   }
 
@@ -495,6 +528,22 @@ export class Gateway {
           ...(p.approvalId === undefined ? {} : { approvalId: p.approvalId }),
           ...(p.session === undefined ? {} : { session: p.session }),
         });
+      }
+
+      case "channel.list":
+        return { channels: this.channels.list() };
+      case "channel.webchat.link": {
+        const host = this.host.includes(":") ? `[${this.host}]` : this.host;
+        return this.webchat.createOwnerLink(`http://${host}:${this.boundPort}`);
+      }
+      case "pairing.owner": {
+        const p = z.strictObject({ channel: z.string().min(1).max(64), accountId: z.string().min(1).max(64).default("default"), id: z.string().min(1).max(256), display: z.string().max(64).optional() }).parse(params);
+        try {
+          return { sender: this.pairing.registerOwner({ channel: p.channel, accountId: p.accountId, externalId: p.id, ...(p.display ? { display: p.display } : {}) }) };
+        } catch (e) {
+          if (e instanceof PairingError) throw new MethodError(err(`POLICY.PAIRING_${e.code}`, e.message, "Check the channel and id."));
+          throw e;
+        }
       }
 
       case "plugin.list":

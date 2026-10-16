@@ -558,3 +558,49 @@ describe("plugins from the command line", () => {
     expect((await cli(["plugins", "frobnicate", "--port", port])).err).toContain("USAGE");
   });
 });
+
+describe("WebChat from the command line", () => {
+  it("webchat link prints a one-time link; opening it makes that browser the owner and it can chat", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    const port = String(await start(true));
+    const p = (...a: string[]) => cli([...a, "--port", port]);
+
+    const ch = await p("channels");
+    expect(ch.out).toMatch(/webchat\s+connected/);
+
+    const link = await p("webchat", "link");
+    expect(link.code).toBe(0);
+    const url = /http:\/\/127\.0\.0\.1:\d+\/webchat#owner=(cno_[A-Za-z0-9_-]+)/.exec(link.out);
+    expect(url).toBeTruthy();
+    expect(link.out).toContain("do not share it");
+
+    const { default: WebSocket } = await import("ws");
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/webchat`);
+    const frames: Array<Record<string, unknown>> = [];
+    ws.on("message", (d) => frames.push(JSON.parse(d.toString()) as Record<string, unknown>));
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    ws.send(JSON.stringify({ t: "hello", secret: null, redeem: url![1] }));
+    const waitFor = async (pred: () => boolean): Promise<void> => {
+      for (let i = 0; i < 400 && !pred(); i++) await new Promise((r) => setTimeout(r, 10));
+      expect(pred()).toBe(true);
+    };
+    await waitFor(() => frames.some((f) => f.t === "ready"));
+    expect(frames[0]).toMatchObject({ role: "owner", redeemed: true });
+    ws.send(JSON.stringify({ t: "message", id: "cli-test-0001", text: "hello from the browser" }));
+    await waitFor(() => frames.some((f) => f.t === "message" && String(f.text).includes("echo: hello from the browser")));
+    ws.close();
+
+    const listed = await p("pairing", "list", "--json");
+    expect(JSON.parse(listed.out).senders[0]).toMatchObject({ channel: "webchat", role: "owner", status: "paired" });
+  }, 30_000);
+
+  it("pairing owner registers your own identity on another channel", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    const port = String(await start(true));
+    const r = await cli(["pairing", "owner", "telegram", "424242", "--port", port]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("telegram:424242");
+    expect((await cli(["pairing", "owner", "telegram", "--port", port])).err).toContain("USAGE");
+    expect((await cli(["webchat", "nope", "--port", port])).err).toContain("USAGE");
+  });
+});

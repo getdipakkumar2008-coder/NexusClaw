@@ -20,6 +20,7 @@
     "@clawnexus/protocol": "workspace:*",
     "@clawnexus/config": "workspace:*",
     "@clawnexus/plugin-sdk": "workspace:*",
+    "@clawnexus/channels": "workspace:*",
     "@clawnexus/plugins": "workspace:*",
     "@clawnexus/store": "workspace:*",
     "@clawnexus/policy": "workspace:*",

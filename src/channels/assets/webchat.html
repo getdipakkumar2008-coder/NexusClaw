@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Chat</title>
+  <link rel="stylesheet" href="/webchat/app.css">
+  <script src="/webchat/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Chat</h1>
+      <p id="status" role="status">Connecting…</p>
+    </header>
+    <div id="notice" class="notice" role="alert" hidden></div>
+    <div id="log" role="log" aria-live="polite" aria-label="Conversation"></div>
+    <p id="typing" class="typing" hidden>The assistant is typing…</p>
+    <form id="form" autocomplete="off">
+      <label for="input" class="sr-only">Your message</label>
+      <textarea id="input" rows="2" maxlength="8000" placeholder="Type a message. Enter sends, Shift+Enter adds a line." disabled></textarea>
+      <button type="submit" id="send" disabled>Send</button>
+    </form>
+  </main>
+</body>
+</html>

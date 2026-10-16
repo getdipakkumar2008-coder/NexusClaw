@@ -725,3 +725,132 @@ describe("plugins over the wire", () => {
     expect((await c.call("plugin.list")).result.plugins).toEqual([]);
   }, 30_000);
 });
+
+describe("WebChat through the Gateway", () => {
+  interface WF {
+    t: string;
+    [k: string]: unknown;
+  }
+  async function visitor(headers: Record<string, string> = {}): Promise<{ ws: WebSocket; frames: WF[]; secret: string; send(f: object): void; wait(pred: (f: WF[]) => boolean): Promise<void> }> {
+    const secret = `cnw_${Buffer.from(Array.from({ length: 32 }, () => Math.floor(Math.random() * 256))).toString("base64url")}`;
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/webchat`, { headers });
+    const frames: WF[] = [];
+    ws.on("message", (d) => frames.push(JSON.parse(d.toString()) as WF));
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+      ws.once("unexpected-response", (_r, res) => reject(new Error(`HTTP ${res.statusCode}`)));
+    });
+    const v = {
+      ws,
+      frames,
+      secret,
+      send: (f: object) => ws.send(JSON.stringify(f)),
+      async wait(pred: (f: WF[]) => boolean) {
+        const end = Date.now() + 4000;
+        while (!pred(frames)) {
+          if (Date.now() > end) throw new Error(`timed out; frames: ${JSON.stringify(frames)}`);
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      },
+    };
+    clients.push({ close: () => ws.close() } as unknown as Client);
+    return v;
+  }
+
+  it("serves the page only for loopback hosts, and the socket only for the page's own origin", async () => {
+    await boot({ provider: new FakeProvider() });
+    expect((await httpGet("/webchat")).status).toBe(200);
+    expect((await httpGet("/webchat")).body).toContain("<title>Chat</title>");
+    expect((await httpGet("/webchat", "evil.example")).status).toBe(403);
+    await expect(visitor({ Origin: "http://evil.example" })).rejects.toThrow(/403/);
+    const ok = await visitor({ Origin: `http://127.0.0.1:${port}` });
+    ok.send({ t: "hello", secret: ok.secret });
+    await ok.wait((f) => f.some((x) => x.t === "ready"));
+  });
+
+  it("a stranger is paired by the owner, then chats; the owner socket needs no change", async () => {
+    await boot({ provider: new FakeProvider() });
+    const owner = await authed();
+    const v = await visitor();
+    v.send({ t: "hello", secret: v.secret });
+    await v.wait((f) => f.some((x) => x.t === "ready"));
+    v.send({ t: "message", id: "first-msg-1", text: "hello" });
+    await v.wait((f) => f.some((x) => x.t === "message"));
+    const code = /\b([2-9A-HJ-NP-Z]{8})\b/.exec(String(v.frames.find((x) => x.t === "message")!["text"]))![1]!;
+
+    const pending = (await owner.call("pairing.list", { status: "pending" })).result.senders as Array<{ channel: string }>;
+    expect(pending.map((s) => s.channel)).toEqual(["webchat"]);
+    expect((await owner.call("pairing.approve", { code })).ok).toBe(true);
+
+    v.send({ t: "message", id: "second-msg-1", text: "are you there?" });
+    await v.wait((f) => f.some((x) => x.t === "message" && String(x["text"]).includes("echo: are you there?")));
+    const sessions = (await owner.call("session.list", { channel: "webchat" })).result.sessions as Array<{ principal: string }>;
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]!.principal).toBe("guest");
+  });
+
+  it("the owner link makes a browser the owner; only the owner socket can mint it", async () => {
+    await boot({ provider: new FakeProvider() });
+    const owner = await authed();
+    const link = (await owner.call("channel.webchat.link")).result as { url: string; expiresAt: number };
+    expect(link.url).toMatch(new RegExp(`^http://127\\.0\\.0\\.1:${port}/webchat#owner=cno_`));
+    const code = /#owner=(.+)$/.exec(link.url)![1]!;
+
+    const v = await visitor();
+    v.send({ t: "hello", secret: v.secret, redeem: code });
+    await v.wait((f) => f.some((x) => x.t === "ready"));
+    expect(v.frames[0]).toMatchObject({ role: "owner", redeemed: true });
+    v.send({ t: "message", id: "owner-msg-1", text: "hi" });
+    await v.wait((f) => f.some((x) => x.t === "message" && String(x["text"]).includes("echo: hi")));
+    expect(((await owner.call("session.list", { channel: "webchat" })).result.sessions as Array<{ principal: string }>)[0]!.principal).toBe("owner");
+
+    // the model's tool bridge cannot mint links, list channels or register owners
+    const m = gw.mintBridge({ session: "sess-W", principal: "owner" });
+    const a = await Client.open(port);
+    clients.push(a);
+    await a.hello(m.token);
+    for (const [method, params] of [["channel.webchat.link", {}], ["channel.list", {}], ["pairing.owner", { channel: "webchat", id: "x" }]] as const) {
+      expect((await a.call(method, params)).error?.code, method).toBe("AUTH.FORBIDDEN");
+    }
+  });
+
+  it("a guest on WebChat is held to guest-level tools even if the tool credential was minted with owner authority", async () => {
+    await boot({ provider: new FakeProvider() });
+    const owner = await authed();
+    const v = await visitor();
+    v.send({ t: "hello", secret: v.secret });
+    await v.wait((f) => f.some((x) => x.t === "ready"));
+    v.send({ t: "message", id: "guest-msg-01", text: "hello" });
+    await v.wait((f) => f.some((x) => x.t === "message"));
+    const code = /\b([2-9A-HJ-NP-Z]{8})\b/.exec(String(v.frames.find((x) => x.t === "message")!["text"]))![1]!;
+    await owner.call("pairing.approve", { code });
+    v.send({ t: "message", id: "guest-msg-02", text: "hi again" });
+    await v.wait((f) => f.some((x) => x.t === "message" && String(x["text"]).includes("echo: hi again")));
+    const session = ((await owner.call("session.list", { channel: "webchat" })).result.sessions as Array<{ id: string }>)[0]!;
+
+    const m = gw.mintBridge({ session: session.id, principal: "owner" }); // as the harness bridge would be
+    const a = await Client.open(port);
+    clients.push(a);
+    await a.hello(m.token);
+    expect((await a.call("tool.call", { tool: "fs.list", args: { path: "." } })).result.status).toBe("ok");
+    const w = await a.call("tool.call", { tool: "fs.write", args: { path: "g.txt", content: "x" } });
+    expect(w.result.status).toBe("denied"); // not "approval_required": a guest cannot even ask
+    expect((await a.call("tool.call", { tool: "exec.run", args: { command: process.execPath } })).result.status).toBe("denied");
+
+    // promote the browser to owner and the very same credential gains the owner's rules on its next call
+    gw.pairing.registerOwner({ channel: "webchat", accountId: "default", externalId: (await owner.call("pairing.list", { status: "paired" })).result.senders[0].externalId });
+    v.send({ t: "message", id: "guest-msg-03", text: "now owner" });
+    await v.wait((f) => f.some((x) => x.t === "message" && String(x["text"]).includes("echo: now owner")));
+    expect((await a.call("tool.call", { tool: "fs.write", args: { path: "g.txt", content: "x" } })).result.status).toBe("approval_required");
+  });
+
+  it("registers one's own identity on another channel from the owner socket", async () => {
+    await boot({ provider: new FakeProvider() });
+    const owner = await authed();
+    const r = await owner.call("pairing.owner", { channel: "telegram", id: "12345", display: "Me" });
+    expect(r.result.sender).toMatchObject({ channel: "telegram", externalId: "12345", role: "owner", status: "paired" });
+    expect((await owner.call("pairing.owner", { channel: "telegram", id: "bad\nid" })).ok).toBe(false);
+    expect((await owner.call("channel.list")).result.channels).toMatchObject([{ id: "webchat", status: { state: "connected" } }]);
+  });
+});

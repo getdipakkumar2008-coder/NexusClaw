@@ -11,4 +11,12 @@ export default tseslint.config(
       "no-console": "error",
     },
   },
+  {
+    // Browser scripts shipped to visitors run in a browser, not in Node.
+    files: ["src/channels/assets/**/*.js"],
+    languageOptions: {
+      sourceType: "script",
+      globals: { window: "readonly", document: "readonly", WebSocket: "readonly", Uint8Array: "readonly" },
+    },
+  },
 );

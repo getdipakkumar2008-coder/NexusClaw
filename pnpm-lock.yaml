@@ -72,6 +72,28 @@ importers:
         specifier: workspace:*
         version: link:../tools
 
+  src/channels:
+    dependencies:
+      '@clawnexus/pairing':
+        specifier: workspace:*
+        version: link:../pairing
+      '@clawnexus/sessions':
+        specifier: workspace:*
+        version: link:../sessions
+      '@clawnexus/store':
+        specifier: workspace:*
+        version: link:../store
+      ws:
+        specifier: ^8.18.0
+        version: 8.22.0
+      zod:
+        specifier: ^4.0.0
+        version: 4.6.7
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.5.0
+        version: 8.18.2
+
   src/config:
     dependencies:
       '@clawnexus/brand':
@@ -104,12 +126,22 @@ importers:
       '@clawnexus/store':
         specifier: workspace:*
         version: link:../store
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.5.13
+        version: 8.18.2
+      ws:
+        specifier: ^8.18.0
+        version: 8.22.0
 
   src/gateway:
     dependencies:
       '@clawnexus/brand':
         specifier: workspace:*
         version: link:../../packages/brand
+      '@clawnexus/channels':
+        specifier: workspace:*
+        version: link:../channels
       '@clawnexus/config':
         specifier: workspace:*
         version: link:../config

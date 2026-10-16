@@ -35,6 +35,7 @@ Max frame 1 MiB; larger payloads via `/v1/upload` + blob reference.
 | connect | `hello`, `auth.challenge`, `auth.verify`, `auth.refresh` |
 | sessions | `session.list`, `session.get`, `session.create`, `session.send`, `session.cancel`, `session.export`, `session.delete` |
 | approvals | `approval.list`, `approval.decide` (owner); `approval.status` (tool bridge, own approvals only) |
+| channels (owner only) | `channel.list`, `channel.webchat.link`, `pairing.owner` (register your own identity on a channel) |
 | plugins (owner only) | `plugin.list`, `plugin.info`, `plugin.install` (absolute folder path, `replace`), `plugin.enable` (`id`, `approvalToken`), `plugin.disable`, `plugin.remove` (`purgeData`) |
 | tools | `tool.list`, `tool.call` (owner; a tool bridge may call these as its session's principal) |
 | events | `events.subscribe {sessions?, since:seq}`, `events.unsubscribe` |
@@ -67,3 +68,6 @@ Protocol conformance suite (`packages/protocol/conformance`) must pass for the G
 
 ## Tool-bridge role (WP7 slice 2)
 `connection.hello` answers `role: "agent"` when the presented credential is a bridge credential (prefix `cnb_`) instead of the owner token. An agent connection is bound to one Gateway session and may call only `tool.list`, `tool.call` and `approval.status`; every other method returns `AUTH.FORBIDDEN`. `tool.call` from an agent accepts only `tool`, `args` and `approvalId`: the principal, session and trust level come from the credential, and the call is always treated as tainted. Credentials are random, in memory only, expire after 24 h, and are revoked when the harness session ends or the Gateway stops (the connection is closed with code 4401).
+
+## WebChat socket (`/v1/webchat`)
+A separate, unauthenticated-by-token socket for browsers; it is not the owner protocol. Frames (JSON): client `hello` (`secret`, `redeem`), `message` (`id`, `text`), `ping`; server `ready` (`role`, `secret` only when newly issued, `redeemed`), `history`, `message`, `typing`, `ack` (`status`, `role`). Identity is the secret; the owner role comes only from redeeming a one-time link.

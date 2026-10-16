@@ -21,6 +21,8 @@ export interface SessionKey {
 
 export interface Session extends SessionKey {
   id: string;
+  /** Who this session is talking to. Decides what the model may do on their behalf. Groups are always "guest". */
+  principal: "owner" | "guest";
   createdAt: number;
   state: "active" | "archived";
 }
@@ -74,6 +76,7 @@ interface SessionRow {
   scope: string;
   created_at: number;
   state: "active" | "archived";
+  principal: "owner" | "guest";
 }
 interface MessageRow {
   id: number;
@@ -92,6 +95,7 @@ const toSession = (r: SessionRow): Session => ({
   scope: r.scope,
   createdAt: r.created_at,
   state: r.state,
+  principal: r.principal,
 });
 const toMessage = (r: MessageRow): Message => {
   const m: Message = { id: r.id, sessionId: r.session_id, role: r.role, sender: r.sender, content: r.content, ts: r.ts };
@@ -135,7 +139,7 @@ export class SessionManager {
   // ---------------- sessions ----------------
 
   /** Find the session for this key or create it. The same key always yields the same session. */
-  getOrCreate(key: SessionKey): Session {
+  getOrCreate(key: SessionKey, principal: "owner" | "guest" = "owner"): Session {
     for (const [k, v] of Object.entries(key)) {
       if (typeof v !== "string" || v === "" || v.length > 256) throw new SessionError("INVALID", `session ${k} must be a non-empty string (max 256)`);
     }
@@ -143,13 +147,26 @@ export class SessionManager {
       .prepare("SELECT * FROM sessions WHERE channel = ? AND conversation = ? AND scope = ?")
       .get(key.channel, key.conversation, key.scope) as SessionRow | undefined;
     if (existing) return toSession(existing);
+    if (principal !== "owner" && principal !== "guest") throw new SessionError("INVALID", "principal must be owner or guest");
     const id = newId("s");
     const createdAt = this.o.now();
     inTransaction(this.db, () => {
-      this.db.prepare("INSERT INTO sessions(id, channel, conversation, scope, created_at) VALUES (?, ?, ?, ?, ?)").run(id, key.channel, key.conversation, key.scope, createdAt);
+      this.db.prepare("INSERT INTO sessions(id, channel, conversation, scope, created_at, principal) VALUES (?, ?, ?, ?, ?, ?)").run(id, key.channel, key.conversation, key.scope, createdAt, principal);
       this.events.append([{ type: "session.created", session: id, data: { channel: key.channel, conversation: key.conversation } }]);
     });
-    return { id, channel: key.channel, conversation: key.conversation, scope: key.scope, createdAt, state: "active" };
+    return { id, channel: key.channel, conversation: key.conversation, scope: key.scope, createdAt, state: "active", principal };
+  }
+
+  /** The session for this key, if it exists. Never creates one. */
+  find(key: SessionKey): Session | undefined {
+    const r = this.db.prepare("SELECT * FROM sessions WHERE channel = ? AND conversation = ? AND scope = ?").get(key.channel, key.conversation, key.scope) as SessionRow | undefined;
+    return r ? toSession(r) : undefined;
+  }
+
+  /** Change who the session is talking to (a sender was demoted or promoted). Takes effect on the model's next tool call. */
+  setPrincipal(id: string, principal: "owner" | "guest"): void {
+    this.get(id);
+    this.db.prepare("UPDATE sessions SET principal = ? WHERE id = ?").run(principal, id);
   }
 
   get(id: string): Session {
@@ -365,8 +382,12 @@ export class SessionManager {
           .all(sessionId, job.messageId, this.o.historyLimit) as unknown as ProviderMessage[]
       ).map((m) => ({ role: m.role, content: m.content }));
 
+      const session = this.get(sessionId);
+      const from = this.db.prepare("SELECT sender FROM messages WHERE id = ?").get(job.messageId) as { sender: string } | undefined;
+      const source = { channel: session.channel, sender: from?.sender ?? "", principal: session.principal };
+
       const aborted = new Promise<"aborted">((resolve) => a.abort.signal.addEventListener("abort", () => resolve("aborted"), { once: true }));
-      const it = this.provider.run({ sessionId, runId, messages: history, signal: a.abort.signal })[Symbol.asyncIterator]();
+      const it = this.provider.run({ sessionId, runId, messages: history, signal: a.abort.signal, source })[Symbol.asyncIterator]();
       let stopped = false;
       for (;;) {
         const step = await Promise.race([it.next(), aborted]);

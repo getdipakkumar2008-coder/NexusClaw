@@ -10,6 +10,8 @@ export interface ProviderRequest {
   messages: ProviderMessage[];
   /** Aborted on cancel or timeout; providers must stop promptly (the manager also stops listening). */
   signal: AbortSignal;
+  /** Where the message being answered came from. External senders are untrusted and the model should be told so. */
+  source?: { channel: string; sender: string; principal: "owner" | "guest" };
 }
 
 export type ProviderEvent = { type: "delta"; text: string };
