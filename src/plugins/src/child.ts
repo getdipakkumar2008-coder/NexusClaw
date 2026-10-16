@@ -31,7 +31,7 @@ const fail = (message: string): never => {
   process.exit(1);
 };
 
-async function init(m: { pluginId: string; entry: string; dataDir?: string }): Promise<void> {
+async function init(m: { pluginId: string; entry: string; dataDir?: string; config?: Record<string, string | number | boolean>; secrets?: Record<string, string> }): Promise<void> {
   pluginId = m.pluginId;
   let mod: { default?: PluginModule; plugin?: PluginModule };
   try {
@@ -42,9 +42,12 @@ async function init(m: { pluginId: string; entry: string; dataDir?: string }): P
   const candidate = mod.default ?? mod.plugin;
   if (!candidate || typeof candidate.setup !== "function") return fail("the plugin must export a default object with a setup(ctx) function");
   def = candidate;
+  const secrets = new Map(Object.entries(m.secrets ?? {}));
   const ctx = {
     pluginId,
     dataDir: m.dataDir,
+    config: Object.freeze({ ...(m.config ?? {}) }),
+    secrets: Object.freeze({ get: (name: string): string | undefined => secrets.get(String(name)) }),
     log(level: string, message: string, fields?: unknown): void {
       send({ t: "log", level, message: String(message).slice(0, 2000), fields });
     },

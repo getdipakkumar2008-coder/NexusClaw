@@ -13,6 +13,50 @@ export interface Io {
   env: Record<string, string | undefined>;
   platform: NodeJS.Platform;
   home: string;
+  /** Read one secret without showing it: typed with no echo at a terminal, or the first line of piped input. Never taken from the command line. */
+  readSecret?(prompt: string): Promise<string>;
+}
+
+/** Read a secret from this process's own terminal or pipe. */
+async function readSecretFromStdin(prompt: string): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) {
+    let data = "";
+    stdin.setEncoding("utf8");
+    for await (const chunk of stdin) {
+      data += chunk as string;
+      if (data.includes("\n") || data.length > 20_000) break;
+    }
+    return (data.split(/\r?\n/)[0] ?? "").trim();
+  }
+  process.stderr.write(prompt);
+  return new Promise<string>((resolvePromise, reject) => {
+    let value = "";
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    const done = (): void => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.off("data", onData);
+      process.stderr.write("\n");
+    };
+    const onData = (chunk: string): void => {
+      for (const ch of chunk) {
+        if (ch === "\r" || ch === "\n") {
+          done();
+          return resolvePromise(value.trim());
+        }
+        if (ch === "\u0003") {
+          done();
+          return reject(new CliError("CANCELLED", "cancelled", "Run the command again when you are ready."));
+        }
+        if (ch === "\u007f" || ch === "\b") value = value.slice(0, -1);
+        else if (ch >= " ") value += ch;
+      }
+    };
+    stdin.on("data", onData);
+  });
 }
 
 export function systemIo(): Io {
@@ -22,6 +66,7 @@ export function systemIo(): Io {
     env: process.env,
     platform: process.platform,
     home: homedir(),
+    readSecret: readSecretFromStdin,
   };
 }
 
@@ -50,6 +95,8 @@ Talk to a running Gateway
   approvals list|approve|deny [ID]
   tool list | tool call <name> --args '<json>' [--approval ID]
   plugins list|info|install|enable|disable|remove [ID | PATH]  [--yes] [--replace] [--purge-data]
+  plugins config ID [set KEY=VALUE... | unset KEY...]   a plugin's settings
+  plugins secret ID [set NAME | delete NAME]            a plugin's secrets (the value is asked for, never typed on the command line)
 
 Options
   --json            machine-readable output
@@ -322,6 +369,26 @@ interface PluginView {
   approvalToken?: string;
   tools: string[];
   problems?: string[];
+  missing?: string[];
+}
+
+interface SettingsView {
+  id: string;
+  settings: Array<{ name: string; type: string; description?: string; required: boolean; enum?: string[]; value?: string | number | boolean }>;
+  secrets: Array<{ name: string; set: boolean }>;
+  missing: string[];
+}
+
+function describeSettings(s: SettingsView): string {
+  const lines = [s.id];
+  if (s.settings.length === 0 && s.secrets.length === 0) lines.push("  This plugin has no settings and needs no secrets.");
+  for (const x of s.settings) {
+    const shown = x.value === undefined ? "(not set)" : String(x.value);
+    lines.push("  setting " + x.name.padEnd(18) + " " + shown + (x.required ? "" : "  (optional)") + "   " + x.type + (x.enum ? " one of " + x.enum.join("/") : "") + (x.description ? " - " + x.description : ""));
+  }
+  for (const x of s.secrets) lines.push("  secret  " + x.name.padEnd(18) + " " + (x.set ? "set" : "NOT SET"));
+  if (s.missing.length) lines.push("  still needed: " + s.missing.join(", "));
+  return lines.join("\n") + "\n";
 }
 
 /** What the owner is agreeing to, in plain words, with honesty about what the system can and cannot hold the plugin to. */
@@ -339,7 +406,7 @@ function describePlugin(p: PluginView): string {
       `    files:    ${perm.fs.length ? "read and write its own data folder (enforced)" : "no file access beyond its own code (enforced)"}`,
       `    programs: ${perm.exec ? "start other programs (enforced) - treat as full access to this computer" : "cannot start programs (enforced)"}`,
       `    network:  ${perm.network.length ? `${perm.network.join(", ")} - declared only; NOT enforced, the plugin could reach other hosts` : "none declared (not enforced: a plugin can still try to reach the network)"}`,
-      `    secrets:  ${perm.secrets.length ? `${perm.secrets.join(", ")} - not available yet; none will be given` : "none"}`,
+      `    secrets:  ${perm.secrets.length ? `${perm.secrets.join(", ")} - only these are given to it; its code can read them and, since the network is not enforced, could send them anywhere` : "none"}`,
       `  its tools are never rated below risk class R${p.riskFloor ?? 0}, and their output is treated as untrusted`,
     );
   }
@@ -375,7 +442,7 @@ const plugins: Handler = (c) =>
       }
       const r = await g.call<{ plugin: PluginView }>("plugin.enable", { id, approvalToken: pinned ?? plugin.approvalToken ?? "" });
       show(c, r, () => `Enabled ${id}: ${r.plugin.status}${r.plugin.reason ? ` - ${r.plugin.reason}` : ""}\n${r.plugin.tools.length ? `Tools: ${r.plugin.tools.join(", ")}\n` : ""}`);
-      return r.plugin.status === "running" || r.plugin.status === "enabled" ? 0 : 1;
+      return r.plugin.status === "running" || r.plugin.status === "enabled" || r.plugin.status === "needs_config" ? 0 : 1;
     } else if (sub === "disable") {
       const r = await g.call<{ plugin: PluginView }>("plugin.disable", { id: need(c.p, 2, "plugin id") });
       show(c, r, () => `Disabled ${r.plugin.id}.\n`);
@@ -384,7 +451,57 @@ const plugins: Handler = (c) =>
       const purge = c.p.flags["purge-data"] === true;
       const r = await g.call("plugin.remove", { id, purgeData: purge });
       show(c, r, () => `Removed ${id}.${purge ? "" : " Its data folder was kept; add --purge-data to delete it too."}\n`);
-    } else throw new CliError("USAGE", `unknown plugins command ${sub}`, "Use list, info, install, enable, disable or remove.");
+    } else if (sub === "config") {
+      const id = need(c.p, 2, "plugin id");
+      const action = c.p.positionals[3];
+      const rest = c.p.positionals.slice(4);
+      if (action === undefined) {
+        const r = await g.call<{ settings: SettingsView }>("plugin.settings", { id });
+        show(c, r, () => describeSettings(r.settings));
+      } else if (action === "set" || action === "unset") {
+        if (rest.length === 0) throw new CliError("USAGE", "plugins config " + id + " " + action + " needs " + (action === "set" ? "KEY=VALUE" : "a KEY"), "Run `plugins config ID` to see the settings.");
+        const { settings } = await g.call<{ settings: SettingsView }>("plugin.settings", { id });
+        const values: Record<string, string | number | boolean | null> = {};
+        for (const item of rest) {
+          if (action === "unset") {
+            values[item] = null;
+            continue;
+          }
+          const eq = item.indexOf("=");
+          if (eq < 1) throw new CliError("USAGE", item + " is not KEY=VALUE", "For example: plugins config ID set mode=fast");
+          const key = item.slice(0, eq);
+          const raw = item.slice(eq + 1);
+          const type = settings.settings.find((x) => x.name === key)?.type;
+          if (type === "integer" || type === "number") {
+            if (raw.trim() === "" || Number.isNaN(Number(raw))) throw new CliError("USAGE", key + " must be a number", "Give a number, such as 5.");
+            values[key] = Number(raw);
+          } else if (type === "boolean") {
+            if (raw !== "true" && raw !== "false") throw new CliError("USAGE", key + " must be true or false", "Use true or false.");
+            values[key] = raw === "true";
+          } else values[key] = raw;
+        }
+        const r = await g.call<{ settings: SettingsView }>("plugin.config.set", { id, values });
+        show(c, r, () => "Saved. A running plugin was restarted to use it.\n\n" + describeSettings(r.settings));
+      } else throw new CliError("USAGE", "unknown plugins config command " + action, "Use set or unset.");
+    } else if (sub === "secret") {
+      const id = need(c.p, 2, "plugin id");
+      const action = c.p.positionals[3];
+      if (action === undefined) {
+        const r = await g.call<{ settings: SettingsView }>("plugin.settings", { id });
+        show(c, r, () => (r.settings.secrets.length ? r.settings.secrets.map((x) => x.name.padEnd(20) + " " + (x.set ? "set" : "NOT SET")).join("\n") : "This plugin declares no secrets.") + "\n");
+      } else if (action === "set") {
+        const name = need(c.p, 4, "secret name");
+        if (!c.io.readSecret) throw new CliError("UNSUPPORTED", "this terminal cannot read a secret safely", "Pipe the value in on standard input.");
+        const value = await c.io.readSecret("Value for " + id + " " + name + " (not shown): ");
+        if (!value) throw new CliError("USAGE", "no value was given", "Type or pipe the secret.");
+        const r = await g.call<{ settings: SettingsView }>("plugin.secret.set", { id, name, value });
+        show(c, r, () => "Stored " + name + " for " + id + " in the encrypted vault. It is not shown again.\n" + (r.settings.missing.length ? "Still needed: " + r.settings.missing.join(", ") + "\n" : ""));
+      } else if (action === "delete") {
+        const name = need(c.p, 4, "secret name");
+        const r = await g.call<{ settings: SettingsView }>("plugin.secret.delete", { id, name });
+        show(c, r, () => "Deleted " + name + " for " + id + ".\n");
+      } else throw new CliError("USAGE", "unknown plugins secret command " + action, "Use set or delete.");
+    } else throw new CliError("USAGE", `unknown plugins command ${sub}`, "Use list, info, install, enable, disable, remove, config or secret.");
     return 0;
   });
 

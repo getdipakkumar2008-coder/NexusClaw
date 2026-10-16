@@ -10,7 +10,27 @@ import type { ToolDef } from "@clawnexus/tools";
 import { inspectPluginDir, type Enforcement, type PluginPackage } from "./package.js";
 import { PluginProcess, PluginProcessError } from "./process.js";
 
-export type PluginStatus = "disabled" | "enabled" | "starting" | "running" | "crashed" | "degraded" | "needs_approval" | "invalid";
+export type PluginStatus = "disabled" | "enabled" | "starting" | "running" | "crashed" | "degraded" | "needs_approval" | "needs_config" | "invalid";
+
+/** Where the owner's secrets live. Values go in and out of the plugin process only; they are never listed or logged. */
+export interface SecretStore {
+  get(name: string): string | undefined;
+  set(name: string, value: string): void;
+  delete(name: string): boolean;
+  list(): string[];
+  redact: { redact(text: string): string; redactDeep<T>(value: T): T };
+}
+
+export type SettingValue = string | number | boolean;
+
+/** What the owner can set for a plugin, and what is still missing. Secret values are never included. */
+export interface PluginSettings {
+  id: string;
+  settings: Array<{ name: string; type: string; description?: string; required: boolean; enum?: string[]; value?: SettingValue }>;
+  secrets: Array<{ name: string; set: boolean }>;
+  /** Human-readable list of what must still be provided before the plugin can start. */
+  missing: string[];
+}
 
 export interface PluginInfo {
   id: string;
@@ -31,11 +51,13 @@ export interface PluginInfo {
   approvalToken?: string;
   tools: string[];
   problems?: string[];
+  /** Settings or secrets the owner still has to provide. */
+  missing?: string[];
 }
 
 export class PluginError extends Error {
   constructor(
-    readonly code: "BAD_ID" | "NOT_FOUND" | "INVALID" | "EXISTS" | "CHANGED" | "BUSY",
+    readonly code: "BAD_ID" | "NOT_FOUND" | "INVALID" | "EXISTS" | "CHANGED" | "BUSY" | "BAD_VALUE" | "NO_SECRET_STORE",
     message: string,
     readonly remediation: string,
   ) {
@@ -54,6 +76,8 @@ export interface HostOptions {
   db: Db;
   events: EventLog;
   tools: ToolRegistry;
+  /** Without it, plugins that declare secrets cannot start. */
+  secrets?: SecretStore;
   now?: () => number;
   /** Compiled child shim. Defaults to the one next to this module. */
   childFile?: string;
@@ -69,7 +93,7 @@ const ID = /^[a-z][a-z0-9-]{1,62}$/;
 const DEFAULT_TOOL_TIMEOUT = 30_000;
 
 interface Runtime {
-  state: "starting" | "running" | "crashed" | "degraded" | "needs_approval";
+  state: "starting" | "running" | "crashed" | "degraded" | "needs_approval" | "needs_config";
   reason?: string;
   proc?: PluginProcess;
   crashes: number[];
@@ -196,6 +220,8 @@ export class PluginHost {
       return { ...base, status: "needs_approval", reason: "the plugin's code or permissions changed since it was approved; review it and enable it again" };
     }
     if (pkg.manifest.kind === "bundle") return { ...base, status: "enabled", reason: "declarative bundle; nothing runs" };
+    const missing = this.missingFor(pkg);
+    if (missing.length > 0) return { ...base, status: "needs_config", reason: `still needs: ${missing.join(", ")}`, missing };
     const rt = this.runtime.get(id);
     if (!rt) return { ...base, status: "starting", reason: "waiting to start" };
     return { ...base, status: rt.state, ...(rt.reason ? { reason: rt.reason } : {}), tools: rt.toolNames };
@@ -271,6 +297,9 @@ export class PluginHost {
     rmSync(join(this.pluginsDir, id), { recursive: true, force: true });
     if (o.purgeData) rmSync(join(this.dataRoot, id), { recursive: true, force: true });
     this.o.db.prepare("DELETE FROM plugins WHERE id = ?").run(id);
+    this.o.db.prepare("DELETE FROM plugin_config WHERE id = ?").run(id);
+    // Credentials are not left behind for a plugin that is gone.
+    for (const n of this.o.secrets?.list() ?? []) if (n.startsWith(`plugin.${id}.`)) this.o.secrets?.delete(n);
     this.runtime.delete(id);
     this.audit("plugin.removed", { id, purgedData: o.purgeData === true });
   }
@@ -297,6 +326,135 @@ export class PluginHost {
     await Promise.allSettled([...this.runtime.keys()].map((id) => this.stopOne(id)));
   }
 
+  // ---------------- settings and secrets ----------------
+
+  private secretName(id: string, name: string): string {
+    return `plugin.${id}.${name}`;
+  }
+
+  private hide(text: string): string {
+    return this.o.secrets ? this.o.secrets.redact.redact(text) : text;
+  }
+
+  private storedConfig(id: string): Record<string, SettingValue> {
+    const row = this.o.db.prepare("SELECT json FROM plugin_config WHERE id = ?").get(id) as { json: string } | undefined;
+    if (!row) return {};
+    try {
+      const v: unknown = JSON.parse(row.json);
+      return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, SettingValue>) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** What is still needed before the plugin can start: required settings and every declared secret. */
+  private missingFor(pkg: PluginPackage): string[] {
+    const out: string[] = [];
+    const have = this.storedConfig(pkg.manifest.id);
+    for (const [name, spec] of Object.entries(pkg.manifest.configSchema ?? {})) {
+      if (!spec.optional && have[name] === undefined) out.push(`setting ${name}`);
+    }
+    for (const name of pkg.manifest.permissions.secrets) {
+      if (this.o.secrets?.get(this.secretName(pkg.manifest.id, name)) === undefined) out.push(`secret ${name}`);
+    }
+    return out;
+  }
+
+  /** The values handed to the plugin: only declared settings that validate, only declared secrets. */
+  private inputsFor(pkg: PluginPackage): { config: Record<string, SettingValue>; secrets: Record<string, string> } {
+    const id = pkg.manifest.id;
+    const have = this.storedConfig(id);
+    const config: Record<string, SettingValue> = {};
+    for (const name of Object.keys(pkg.manifest.configSchema ?? {})) if (have[name] !== undefined) config[name] = have[name];
+    const secrets: Record<string, string> = {};
+    for (const name of pkg.manifest.permissions.secrets) {
+      const v = this.o.secrets?.get(this.secretName(id, name));
+      if (v !== undefined) secrets[name] = v;
+    }
+    return { config, secrets };
+  }
+
+  /** The plugin's settings (with current values) and which secrets are set. Never returns a secret value. */
+  settings(id: string): PluginSettings {
+    this.checkId(id);
+    const pkg = this.load(id);
+    const have = this.storedConfig(id);
+    const settings = Object.entries(pkg.manifest.configSchema ?? {}).map(([name, spec]) => ({
+      name,
+      type: spec.type,
+      ...(spec.description ? { description: tidy(spec.description, 200) } : {}),
+      required: !spec.optional,
+      ...(spec.type === "string" && spec.enum ? { enum: spec.enum } : {}),
+      ...(have[name] !== undefined ? { value: have[name] } : {}),
+    }));
+    const secrets = pkg.manifest.permissions.secrets.map((name) => ({ name, set: this.o.secrets?.get(this.secretName(id, name)) !== undefined }));
+    return { id, settings, secrets, missing: this.missingFor(pkg) };
+  }
+
+  /** Change settings. A `null` value removes one. Everything is checked against the plugin's declaration first. */
+  async setConfig(id: string, values: Record<string, SettingValue | null>): Promise<PluginSettings> {
+    this.checkId(id);
+    const pkg = this.load(id);
+    const declared = pkg.manifest.configSchema ?? {};
+    const next = { ...this.storedConfig(id) };
+    for (const [name, v] of Object.entries(values)) {
+      const spec = declared[name];
+      if (!spec) throw new PluginError("BAD_VALUE", `plugin ${id} has no setting named ${name}`, "Run `plugins config <id>` to see the settings it declares.");
+      if (v === null) {
+        delete next[name];
+        continue;
+      }
+      const ok = argsSchema({ [name]: { ...spec, optional: true } }).safeParse({ [name]: v });
+      if (!ok.success) throw new PluginError("BAD_VALUE", `${name}: ${ok.error.issues[0]?.message ?? "not a valid value"}`, "Check the type and limits the plugin declares for this setting.");
+      next[name] = v;
+    }
+    this.o.db.prepare("INSERT INTO plugin_config (id, json, updated_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at").run(id, JSON.stringify(next), this.now());
+    // Names only: a setting can be a user name or an address.
+    this.audit("plugin.config_changed", { id, keys: Object.keys(values).sort() });
+    await this.restartIfEnabled(id);
+    return this.settings(id);
+  }
+
+  /** Store a secret the plugin declared. The value goes into the vault and is never returned, logged or audited. */
+  async setSecret(id: string, name: string, value: string): Promise<PluginSettings> {
+    this.checkId(id);
+    const pkg = this.load(id);
+    if (!this.o.secrets) throw new PluginError("NO_SECRET_STORE", "the secret store is not available", "Restart the Gateway; if this persists run the doctor command.");
+    if (!pkg.manifest.permissions.secrets.includes(name)) throw new PluginError("BAD_VALUE", `plugin ${id} does not declare a secret named ${name}`, "Only secrets listed in the plugin's permissions can be stored for it.");
+    // eslint-disable-next-line no-control-regex
+    if (value.length === 0 || value.length > 8192 || /[\u0000-\u001f\u007f]/.test(value)) throw new PluginError("BAD_VALUE", "a secret must be 1 to 8192 characters on one line", "Check what you pasted; trailing newlines are removed for you.");
+    try {
+      this.o.secrets.set(this.secretName(id, name), value);
+    } catch {
+      throw new PluginError("NO_SECRET_STORE", "the secret store could not be opened, so nothing was saved", "Check the Gateway log for `vault.unavailable`, then restart it.");
+    }
+    this.audit("plugin.secret_set", { id, name });
+    await this.restartIfEnabled(id);
+    return this.settings(id);
+  }
+
+  async deleteSecret(id: string, name: string): Promise<PluginSettings> {
+    this.checkId(id);
+    const pkg = this.load(id);
+    if (!pkg.manifest.permissions.secrets.includes(name)) throw new PluginError("BAD_VALUE", `plugin ${id} does not declare a secret named ${name}`, "Only secrets listed in the plugin's permissions can be removed.");
+    this.o.secrets?.delete(this.secretName(id, name));
+    this.audit("plugin.secret_deleted", { id, name });
+    await this.restartIfEnabled(id);
+    return this.settings(id);
+  }
+
+  /** A plugin only reads its settings at start, so a change takes effect by starting it again. */
+  private async restartIfEnabled(id: string): Promise<void> {
+    const row = this.row(id);
+    if (!row || row.enabled !== 1) return;
+    const pkg = this.load(id);
+    if (row.approval !== pkg.approvalToken || pkg.manifest.kind !== "code") return;
+    await this.stopOne(id);
+    const rt = this.runtime.get(id);
+    if (rt) rt.crashes = [];
+    await this.startOne(pkg);
+  }
+
   // ---------------- running ----------------
 
   private load(id: string): PluginPackage {
@@ -316,6 +474,15 @@ export class PluginHost {
     this.runtime.set(id, rt);
     const dataDir = pkg.manifest.permissions.fs.length > 0 ? join(this.dataRoot, id) : undefined;
     if (dataDir) mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const missing = this.missingFor(pkg);
+    if (missing.length > 0) {
+      // Not a failure: the plugin simply is not set up yet. It starts as soon as the owner provides the rest.
+      rt.state = "needs_config";
+      rt.reason = `still needs: ${missing.join(", ")}`;
+      this.audit("plugin.needs_config", { id, missing });
+      return;
+    }
+    const inputs = this.inputsFor(pkg);
     try {
       const proc = await PluginProcess.start({
         id,
@@ -323,12 +490,14 @@ export class PluginHost {
         entry: join(pkg.dir, pkg.manifest.entry ?? ""),
         dataDir,
         exec: pkg.manifest.permissions.exec,
+        config: inputs.config,
+        secrets: inputs.secrets,
         childFile: this.childFile(),
         ...(this.o.memoryMb ? { memoryMb: this.o.memoryMb } : {}),
         ...(this.o.startTimeoutMs ? { startTimeoutMs: this.o.startTimeoutMs } : {}),
         ...(this.o.graceMs ? { graceMs: this.o.graceMs } : {}),
         onLog: (l) => {
-          if (l.level === "warn" || l.level === "error") this.audit("plugin.log", { id, level: l.level, message: l.message });
+          if (l.level === "warn" || l.level === "error") this.audit("plugin.log", { id, level: l.level, message: this.hide(l.message) });
         },
         onExit: (info) => this.onExit(id, info),
       });
@@ -369,7 +538,13 @@ export class PluginHost {
       run: async (args, env) => {
         const proc = rt.proc;
         if (!proc || !proc.alive) throw new Error(`plugin ${id} is not running`);
-        return proc.call(reg.name, args, { signal: env.signal, timeoutMs });
+        try {
+          // A plugin holds its own secrets, so a careless one could echo them into the model's context. Hide them.
+          return this.o.secrets ? this.o.secrets.redact.redactDeep(await proc.call(reg.name, args, { signal: env.signal, timeoutMs })) : await proc.call(reg.name, args, { signal: env.signal, timeoutMs });
+        } catch (e) {
+          if (e instanceof Error) e.message = this.hide(e.message);
+          throw e;
+        }
       },
     };
   }

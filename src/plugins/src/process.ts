@@ -28,6 +28,9 @@ export interface ProcessOptions {
   dataDir?: string | undefined;
   /** Whether the manifest asked to start programs. Otherwise the process cannot. */
   exec: boolean;
+  /** The owner's settings and the declared secrets this plugin receives. Nothing else is passed. */
+  config?: Record<string, string | number | boolean>;
+  secrets?: Record<string, string>;
   /** Absolute path of the compiled child shim. */
   childFile: string;
   memoryMb?: number;
@@ -137,7 +140,7 @@ export class PluginProcess {
     });
     const timer = setTimeout(() => p.readyReject?.(new PluginProcessError("TIMEOUT", `the plugin did not finish starting within ${(o.startTimeoutMs ?? 10_000) / 1000} s`)), o.startTimeoutMs ?? 10_000);
     timer.unref();
-    child.send({ t: "init", pluginId: o.id, entry: o.entry, dataDir: o.dataDir });
+    child.send({ t: "init", pluginId: o.id, entry: o.entry, dataDir: o.dataDir, config: o.config ?? {}, secrets: o.secrets ?? {} });
     try {
       const raw = await ready;
       for (const t of raw) {

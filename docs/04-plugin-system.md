@@ -28,8 +28,8 @@ Core "tax budget" is tracked in CI (`doctor --surface`): number of core tools, s
   "entry": "dist/index.js",
   "provides": ["channel:telegram"],
   "permissions": { "network": ["api.telegram.org"], "fs": ["data:plugins/telegram"],
-                   "exec": false, "secrets": ["telegram.botToken"] },
-  "configSchema": { /* JSON Schema */ },
+                   "exec": false, "secrets": ["bot_token"] },
+  "configSchema": { "mode": { "type": "string", "enum": ["polling", "webhook"] } },
   "hub": { "publisher": "clawnexus", "signature": "…", "sbom": "sbom.json" }
 }
 ```
@@ -66,8 +66,9 @@ Plugin conformance kit; crash-isolation test; permission-enforcement tests; sign
 
 ## 10. Implementation status (WP9 slice 1, 2026-10-16)
 What exists today (see docs/15 for the full decision note):
-- **Code plugins with tools only.** `definePlugin`/`ctx.registerTool` with a typed argument spec; channels, providers, hooks, services, `ctx.config`, `ctx.secrets`, `ctx.http` and `ctx.storage` are not built yet. SDK version 0.2.0 (pre-1.0: caret ranges need the same minor).
-- **Manifest rules actually enforced:** `permissions.fs` is only `["data"]`; `permissions.exec` starts programs; `permissions.network` is a declaration only; `permissions.secrets` are accepted but none are given yet. `entry` must be an ES module inside the folder.
+- **Code plugins with tools, settings and secrets.** `definePlugin`/`ctx.registerTool` with a typed argument spec, `ctx.config` and `ctx.secrets`; channels, providers, hooks, services, `ctx.http` and `ctx.storage` are not built yet. SDK version 0.3.0 (pre-1.0: caret ranges need the same minor).
+- **Manifest rules actually enforced:** `permissions.fs` is only `["data"]`; `permissions.exec` starts programs; `permissions.network` is a declaration only; `permissions.secrets` lists the secret names the plugin needs (lowercase, e.g. `bot_token`). `entry` must be an ES module inside the folder.
 - **Enforcement:** file access and program/worker creation are enforced by Node's permission model (`--permission`), measured on Node 24 (Windows) and checked in CI on Node 22. Network is advisory. This closes the open question in the isolation spike for file and exec permissions.
 - **Trust:** installing is a copy plus checks; enabling needs the approval code for the exact code and permissions; any change forces a new approval. There are no signatures, tiers or registry yet, so every plugin is shown as `local-unsigned`.
+- **Settings and secrets (WP9 slice 2):** `configSchema` declares the owner's settings with the same small vocabulary as tool arguments (string/enum, integer, number, boolean; required unless `optional`). The host validates every value before storing it (table `plugin_config`) and hands the plugin only declared settings, frozen, as `ctx.config`. Secrets declared in `permissions.secrets` are stored in the encrypted vault under `plugin.<id>.<name>` and handed over only by name as `ctx.secrets.get(name)`; every declared secret is required. A plugin that is enabled but missing a required setting or secret is `needs_config`, runs nothing, and starts by itself as soon as the owner provides the rest; changing a setting or secret restarts a running plugin. The owner sets secrets with `plugins secret ID set NAME`, which asks for the value without echo (or reads it from a pipe) and never takes it from the command line; values never appear in config, the database, the audit log, `plugin.settings` replies, or `info`. A plugin's tool results and errors are scrubbed of its own secret values before the model sees them. Removing a plugin deletes its settings and secrets. **What this does not do:** the plugin's code can read its secrets, and because the network is not enforced it could send them anywhere, so a secret is only as safe as the plugin is trustworthy; the review screen says so. The vault key is a random file (`vault.key`, owner-only) beside the vault, so a copy of `secrets.vault` alone is useless, but anyone who can read the whole data folder can open it; an OS-keychain key source is the planned upgrade. A backup copies the vault but not the key, so a restore on another machine needs the key kept separately.
 - **Sample:** `extensions/hello-tool`. `hello-channel` and `hello-bundle` come with channels and bundle support.

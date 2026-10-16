@@ -604,3 +604,93 @@ describe("WebChat from the command line", () => {
     expect((await cli(["webchat", "nope", "--port", port])).err).toContain("USAGE");
   });
 });
+
+describe("plugin settings and secrets from the command line", () => {
+  const SECRET = "bot-secret-0123456789";
+
+  function writePlugin(): string {
+    const src = join(base, "needs-token");
+    mkdirSync(src, { recursive: true });
+    writeFileSync(
+      join(src, "clawnexus.plugin.json"),
+      JSON.stringify({
+        id: "needs-token",
+        name: "Needs a token",
+        version: "1.0.0",
+        kind: "code",
+        sdkRange: "^0.3.0",
+        entry: "index.mjs",
+        permissions: { secrets: ["token"] },
+        configSchema: { region: { type: "string", enum: ["eu", "us"], description: "where to run" }, retries: { type: "integer", min: 0, max: 5, optional: true } },
+      }),
+    );
+    writeFileSync(
+      join(src, "index.mjs"),
+      `export default { setup(ctx) { ctx.registerTool({ name: "where", description: "report settings", run: () => ({ region: ctx.config.region, retries: ctx.config.retries ?? null, token: ctx.secrets.get("token") !== undefined }) }); ctx.registerTool({ name: "leak", description: "echo the token", run: () => "token=" + ctx.secrets.get("token") }); } };`,
+    );
+    return src;
+  }
+
+  it("asks for the secret without taking it from the command line, keeps it encrypted, and starts the plugin when everything is set", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    let port = String(await start(true));
+    const asked: string[] = [];
+    const p = async (value: string | undefined, ...a: string[]): Promise<{ code: number; out: string; err: string }> => {
+      const io = fakeIo();
+      if (value !== undefined) io.readSecret = (prompt: string): Promise<string> => (asked.push(prompt), Promise.resolve(value));
+      const code = await main([...a, "--port", port, "--data-dir", dir], io);
+      return { code, out: io.outText, err: io.errText };
+    };
+
+    expect((await p(undefined, "plugins", "install", writePlugin())).code).toBe(0);
+    const enabled = await p(undefined, "plugins", "enable", "needs-token", "--yes");
+    expect(enabled.code).toBe(0);
+    expect(enabled.out).toContain("needs_config");
+    expect(enabled.out).toContain("setting region, secret token");
+
+    const shown = await p(undefined, "plugins", "config", "needs-token");
+    expect(shown.out).toMatch(/setting region\s+\(not set\).*one of eu\/us - where to run/);
+    expect(shown.out).toMatch(/secret\s+token\s+NOT SET/);
+
+    expect((await p(undefined, "plugins", "config", "needs-token", "set", "region=mars")).err).toContain("PLUGIN.BAD_VALUE");
+    expect((await p(undefined, "plugins", "config", "needs-token", "set", "retries=lots")).err).toContain("must be a number");
+    const ok = await p(undefined, "plugins", "config", "needs-token", "set", "region=eu", "retries=2");
+    expect(ok.code).toBe(0);
+    expect(ok.out).toContain("still needed: secret token");
+
+    const set = await p(SECRET, "plugins", "secret", "needs-token", "set", "token");
+    expect(set.code).toBe(0);
+    expect(set.out).toContain("Stored token");
+    expect(set.out + set.err).not.toContain(SECRET);
+    expect(asked[0]).toContain("not shown");
+    expect((await p(undefined, "plugins", "list")).out).toMatch(/needs-token\s+running/);
+
+    // The plugin received both; the model-facing result never carries the raw secret.
+    expect((await p(undefined, "tool", "call", "needs-token.where", "--args", "{}")).out).toMatch(/"region": "eu"[\s\S]*"retries": 2[\s\S]*"token": true/);
+    const leak = await p(undefined, "tool", "call", "needs-token.leak", "--args", "{}", "--approval", "none");
+    expect(leak.out + leak.err).not.toContain(SECRET);
+
+    // At rest: encrypted, with the key in its own file; nothing in the database or the audit log.
+    expect(readFileSync(join(dir, "secrets.vault"), "utf8")).not.toContain(SECRET);
+    expect(existsSync(join(dir, "vault.key"))).toBe(true);
+    const db = openDb(join(dir, "gateway.db"));
+    try {
+      expect(JSON.stringify(new EventLog(db).readSince(0, { limit: 5000 }))).not.toContain(SECRET);
+      expect(JSON.stringify(db.prepare("SELECT * FROM plugin_config").all())).not.toContain(SECRET);
+    } finally {
+      db.close();
+    }
+
+    // The secret survives a restart, and the plugin comes back by itself.
+    await running?.stop();
+    running = undefined;
+    port = String(await start(true));
+    const again = async (...a: string[]): Promise<string> => (await p(undefined, ...a)).out;
+
+    expect(await again("plugins", "list")).toMatch(/needs-token\s+running/);
+
+    expect((await p(undefined, "plugins", "secret", "needs-token", "delete", "token")).out).toContain("Deleted token");
+    expect(await again("plugins", "list")).toMatch(/needs-token\s+needs_config/);
+    expect((await p(SECRET, "plugins", "secret", "needs-token", "set", "nope")).err).toContain("does not declare");
+  }, 90_000);
+});

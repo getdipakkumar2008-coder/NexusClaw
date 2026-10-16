@@ -40,6 +40,9 @@
     },
     {
       "path": "../channels"
+    },
+    {
+      "path": "../vault"
     }
   ]
 }

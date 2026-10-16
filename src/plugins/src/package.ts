@@ -23,7 +23,7 @@ export interface Enforcement {
   fs: "enforced" | "none";
   exec: "enforced" | "none";
   network: "advisory" | "none";
-  secrets: "unavailable" | "none";
+  secrets: "scoped" | "none";
 }
 
 export interface PluginPackage {
@@ -205,7 +205,7 @@ export function inspectPluginDir(dir: string, o: { expectId?: string; hostSdk?: 
         fs: permissions.fs.length > 0 ? "enforced" : "none",
         exec: permissions.exec ? "enforced" : "none",
         network: permissions.network.length > 0 ? "advisory" : "none",
-        secrets: permissions.secrets.length > 0 ? "unavailable" : "none",
+        secrets: permissions.secrets.length > 0 ? "scoped" : "none",
       },
     },
   };

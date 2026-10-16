@@ -21,6 +21,7 @@ import { BUILTIN_TOOLS, ToolExecutor, WorkspaceGuard } from "@clawnexus/tools";
 import { BridgeRegistry, type BridgeGrant, type MintOptions } from "./bridge.js";
 import { ChannelManager, WEBCHAT_ID, WebChatAdapter } from "@clawnexus/channels";
 import { PluginError, PluginHost, type HostOptions } from "@clawnexus/plugins";
+import { LocalVault, VaultError } from "@clawnexus/vault";
 import { SessionError, SessionManager, type Provider, type SessionManagerOptions } from "@clawnexus/sessions";
 
 export interface GatewayOptions {
@@ -97,6 +98,7 @@ export class Gateway {
   readonly approvals: ApprovalStore;
   readonly bridgeGrants: BridgeRegistry;
   readonly plugins: PluginHost;
+  private readonly vault: LocalVault;
   readonly channels: ChannelManager;
   private readonly webchat: WebChatAdapter;
   private readonly profile: "standard" | "locked-down" | "trusted";
@@ -152,7 +154,8 @@ export class Gateway {
     const workspace = opts.workspace ?? join(opts.dataDir, "workspace");
     mkdirSync(workspace, { recursive: true, mode: 0o700 });
     this.tools = new ToolExecutor({ events: this.events, approvals: this.approvals, guard: new WorkspaceGuard([workspace]), tools: BUILTIN_TOOLS });
-    this.plugins = new PluginHost({ dataDir: opts.dataDir, db: this.db, events: this.events, tools: this.tools, now: this.o.now, ...opts.plugins });
+    this.vault = new LocalVault(opts.dataDir);
+    this.plugins = new PluginHost({ dataDir: opts.dataDir, db: this.db, events: this.events, tools: this.tools, secrets: this.vault, now: this.o.now, ...opts.plugins });
     this.sessions = opts.provider ? new SessionManager(this.db, this.events, opts.provider, { now: this.o.now, ...opts.sessions }) : undefined;
 
     this.webchat = new WebChatAdapter({
@@ -179,6 +182,10 @@ export class Gateway {
     });
     const addr = this.http.address();
     this.boundPort = typeof addr === "object" && addr ? addr.port : this.requestedPort;
+    // The secret store opens first: plugins read their secrets at start. If it cannot open, plugins that need secrets wait; nothing else does.
+    await this.vault.open().catch((e: unknown) => {
+      this.events.append([{ type: "vault.unavailable", data: { reason: e instanceof VaultError ? e.message : "could not open the secret store" } }]);
+    });
     // Enabled plugins start now. A plugin that cannot start is contained and reported; it never blocks the Gateway.
     await this.plugins.startEnabled().catch(() => undefined);
     await this.channels.start();
@@ -203,6 +210,7 @@ export class Gateway {
     }
     await this.sessions?.close();
     await this.plugins.stop();
+    this.vault.close();
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     this.http.closeAllConnections();
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
@@ -553,6 +561,10 @@ export class Gateway {
       case "plugin.enable":
       case "plugin.disable":
       case "plugin.remove":
+      case "plugin.settings":
+      case "plugin.config.set":
+      case "plugin.secret.set":
+      case "plugin.secret.delete":
         return this.pluginMethod(method, params);
 
       case "session.list":
@@ -586,6 +598,22 @@ export class Gateway {
         case "plugin.enable": {
           const p = z.strictObject({ id, approvalToken: z.string().min(1).max(128) }).parse(params);
           return { plugin: await this.plugins.enable(p.id, p.approvalToken) };
+        }
+        case "plugin.settings": {
+          const p = z.strictObject({ id }).parse(params);
+          return { settings: this.plugins.settings(p.id) };
+        }
+        case "plugin.config.set": {
+          const p = z.strictObject({ id, values: z.record(z.string().max(64), z.union([z.string().max(65_536), z.number().finite(), z.boolean(), z.null()])) }).parse(params);
+          return { settings: await this.plugins.setConfig(p.id, p.values) };
+        }
+        case "plugin.secret.set": {
+          const p = z.strictObject({ id, name: z.string().min(1).max(64), value: z.string().min(1).max(8192) }).parse(params);
+          return { settings: await this.plugins.setSecret(p.id, p.name, p.value) };
+        }
+        case "plugin.secret.delete": {
+          const p = z.strictObject({ id, name: z.string().min(1).max(64) }).parse(params);
+          return { settings: await this.plugins.deleteSecret(p.id, p.name) };
         }
         case "plugin.disable": {
           const p = z.strictObject({ id }).parse(params);

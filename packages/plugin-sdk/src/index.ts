@@ -1,15 +1,20 @@
 import { z } from "zod";
 
 /** Semver of this SDK. Only symbols exported here are public API (docs/04 section 4). */
-export const SDK_VERSION = "0.2.0";
+export const SDK_VERSION = "0.3.0";
 
 export const pluginKindSchema = z.enum(["code", "bundle"]);
+
+/** Secret names are short and lowercase so they can be stored as `plugin.<id>.<name>` in the vault. */
+export const SECRET_NAME = z.string().regex(/^[a-z][a-z0-9_-]{0,39}$/, "secret names are lowercase letters, digits, underscore and dash");
+const SETTING_NAME = z.string().regex(/^[a-z][A-Za-z0-9_]{0,39}$/, "setting names are letters and digits, starting with a lowercase letter");
 
 export const permissionsSchema = z.strictObject({
   network: z.array(z.string()).default([]),
   fs: z.array(z.string()).default([]),
   exec: z.boolean().default(false),
-  secrets: z.array(z.string()).default([]),
+  /** Secrets this plugin needs. The owner stores them; the plugin reads them with `ctx.secrets.get`. All are required. */
+  secrets: z.array(SECRET_NAME).max(16).default([]),
 });
 
 /** Plugin manifest (docs/04 section 3). Strict: unknown keys are errors, never silently ignored. */
@@ -23,7 +28,11 @@ export const manifestSchema = z
     entry: z.string().min(1).optional(),
     provides: z.array(z.string().regex(/^(channel|tool|provider|skill|mcp|hook):[a-z0-9._-]+$/)).default([]),
     permissions: permissionsSchema.default({ network: [], fs: [], exec: false, secrets: [] }),
-    configSchema: z.record(z.string(), z.unknown()).optional(),
+    /** Settings the owner can change, declared with the same small vocabulary tool arguments use. The host validates them. */
+    configSchema: z
+      .record(SETTING_NAME, z.lazy(() => argSpecSchema))
+      .refine((c) => Object.keys(c).length <= 32, "at most 32 settings")
+      .optional(),
   })
   .superRefine((m, ctx) => {
     if (m.kind === "code" && !m.entry) {
@@ -114,6 +123,10 @@ export interface PluginContext {
   log: (level: "debug" | "info" | "warn" | "error", message: string, fields?: Record<string, unknown>) => void;
   /** Directory this plugin may read and write, present only if the manifest asked for `data` access. */
   readonly dataDir: string | undefined;
+  /** The owner's settings for this plugin, already checked against `configSchema`. Frozen. */
+  readonly config: Readonly<Record<string, string | number | boolean>>;
+  /** Secrets the owner stored for the names in `permissions.secrets`. Any other name reads as undefined. */
+  readonly secrets: { get(name: string): string | undefined };
   /** Register a tool. Only possible during `setup`. */
   registerTool(def: PluginToolDefinition): void;
 }

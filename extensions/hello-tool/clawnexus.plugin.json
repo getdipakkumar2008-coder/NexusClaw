@@ -3,7 +3,7 @@
   "name": "Hello tool (sample)",
   "version": "1.0.0",
   "kind": "code",
-  "sdkRange": "^0.2.0",
+  "sdkRange": "^0.3.0",
   "entry": "index.mjs",
   "provides": ["tool:greet", "tool:add"],
   "permissions": {}

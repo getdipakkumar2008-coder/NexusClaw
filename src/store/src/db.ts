@@ -88,6 +88,12 @@ const SCHEMA: readonly string[] = [
      PRIMARY KEY (channel, account_id, message_id)
    ) WITHOUT ROWID;
    CREATE INDEX channel_seen_ts ON channel_seen(ts);`,
+  // v6: the owner's (non-secret) settings for a plugin. Secrets never go here; they live in the vault.
+  `CREATE TABLE plugin_config (
+     id         TEXT PRIMARY KEY,
+     json       TEXT NOT NULL,
+     updated_at INTEGER NOT NULL
+   );`,
 ];
 
 export const SCHEMA_VERSION = SCHEMA.length;

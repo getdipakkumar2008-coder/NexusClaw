@@ -25,7 +25,7 @@ function makePlugin(o: { id?: string; permissions?: Record<string, unknown>; bod
   const id = o.id ?? `p${++n}`;
   const dir = join(o.where ?? join(base, "src-plugins"), id);
   mkdirSync(dir, { recursive: true });
-  const manifest = { id, name: `Plugin ${id}`, version: "1.0.0", kind: "code", sdkRange: o.sdkRange ?? "^0.2.0", entry: "index.mjs", permissions: o.permissions ?? {}, ...o.extraManifest };
+  const manifest = { id, name: `Plugin ${id}`, version: "1.0.0", kind: "code", sdkRange: o.sdkRange ?? "^0.3.0", entry: "index.mjs", permissions: o.permissions ?? {}, ...o.extraManifest };
   writeFileSync(join(dir, "clawnexus.plugin.json"), JSON.stringify(manifest));
   writeFileSync(join(dir, "index.mjs"), `${o.top ?? ""}\nexport default { async setup(ctx) {\n${o.body ?? ""}\n} };\n`);
   return { dir, id };
@@ -475,5 +475,150 @@ describe("folders reached through links", () => {
     } finally {
       await h2.stop();
     }
+  });
+});
+
+describe("settings and secrets", () => {
+  const SECRET_VALUE = "tok-1234567890-abcdef";
+  const memoryStore = (): NonNullable<HostOptions["secrets"]> & { data: Map<string, string> } => {
+    const data = new Map<string, string>();
+    const hide = (t: string): string => [...data.entries()].reduce((acc, [n, v]) => (v.length >= 6 ? acc.split(v).join(`[REDACTED:${n}]`) : acc), t);
+    return {
+      data,
+      get: (n) => data.get(n),
+      set: (n, v) => void data.set(n, v),
+      delete: (n) => data.delete(n),
+      list: () => [...data.keys()],
+      redact: { redact: hide, redactDeep: <T>(v: T): T => JSON.parse(hide(JSON.stringify(v))) as T },
+    };
+  };
+  const BODY = `
+    ctx.registerTool({ name: "show", description: "show what I was given", run: () => ({ config: ctx.config, hasToken: ctx.secrets.get("token") !== undefined, other: ctx.secrets.get("other") ?? null }) });
+    ctx.registerTool({ name: "leak", description: "echo the secret", run: () => "my token is " + ctx.secrets.get("token") });
+    ctx.registerTool({ name: "boom", description: "fail with the secret", run: () => { throw new Error("bad " + ctx.secrets.get("token")); } });
+  `;
+  const MANIFEST = {
+    permissions: { secrets: ["token"] },
+    extraManifest: { configSchema: { region: { type: "string", enum: ["eu", "us"] }, retries: { type: "integer", min: 0, max: 5, optional: true }, verbose: { type: "boolean", optional: true } } },
+  };
+  let store: ReturnType<typeof memoryStore>;
+  let h: PluginHost;
+  beforeEach(() => {
+    store = memoryStore();
+    h = new PluginHost(options({ secrets: store }));
+  });
+  afterEach(async () => {
+    await h.stop();
+  });
+  const enable = async (m: Made): Promise<void> => {
+    await h.install(m.dir);
+    await h.enable(m.id, h.info(m.id).approvalToken!);
+  };
+
+  it("waits for what it needs, and starts as soon as it has it", async () => {
+    const m = makePlugin({ id: "needy", body: BODY, ...MANIFEST });
+    await enable(m);
+    expect(h.info("needy")).toMatchObject({ status: "needs_config", missing: ["setting region", "secret token"] });
+    expect(tools.list().filter((t) => t.name.startsWith("needy."))).toHaveLength(0);
+
+    await h.setConfig("needy", { region: "eu" });
+    expect(h.info("needy").status).toBe("needs_config");
+    await h.setSecret("needy", "token", SECRET_VALUE);
+    expect(h.info("needy").status).toBe("running");
+    expect(output(await callTool("needy.show"))).toEqual({ config: { region: "eu" }, hasToken: true, other: null });
+  });
+
+  it("applies a change by restarting the plugin, and removing a secret stops it again", async () => {
+    const m = makePlugin({ id: "live", body: BODY, ...MANIFEST });
+    await enable(m);
+    await h.setConfig("live", { region: "eu" });
+    await h.setSecret("live", "token", SECRET_VALUE);
+    await h.setConfig("live", { region: "us", retries: 3, verbose: true });
+    expect(output(await callTool("live.show"))).toMatchObject({ config: { region: "us", retries: 3, verbose: true } });
+    await h.setConfig("live", { retries: null });
+    expect(output(await callTool("live.show"))).toMatchObject({ config: { region: "us", verbose: true } });
+    await h.deleteSecret("live", "token");
+    expect(h.info("live")).toMatchObject({ status: "needs_config", missing: ["secret token"] });
+    expect(tools.list().filter((t) => t.name.startsWith("live."))).toHaveLength(0);
+  });
+
+  it("refuses values the plugin did not declare or that break its limits", async () => {
+    const m = makePlugin({ id: "strict", body: BODY, ...MANIFEST });
+    await enable(m);
+    const bad = async (p: Promise<unknown>): Promise<string> => p.then(() => "accepted", (e: Error) => `${(e as PluginError).code}: ${e.message}`);
+    expect(await bad(h.setConfig("strict", { unknown: "x" }))).toMatch(/BAD_VALUE.*no setting named unknown/);
+    expect(await bad(h.setConfig("strict", { region: "mars" }))).toMatch(/BAD_VALUE/);
+    expect(await bad(h.setConfig("strict", { retries: 99 }))).toMatch(/BAD_VALUE/);
+    expect(await bad(h.setConfig("strict", { retries: "3" as unknown as number }))).toMatch(/BAD_VALUE/);
+    expect(await bad(h.setSecret("strict", "other", SECRET_VALUE))).toMatch(/BAD_VALUE.*does not declare/);
+    expect(await bad(h.setSecret("strict", "token", "two\nlines"))).toMatch(/BAD_VALUE/);
+    expect(await bad(h.setSecret("strict", "token", ""))).toMatch(/BAD_VALUE/);
+    expect(store.data.size).toBe(0);
+  });
+
+  it("gives a plugin only the secrets it declared, even if the vault holds others", async () => {
+    store.data.set("plugin.scoped.other", "somebody-elses-secret");
+    store.data.set("plugin.other-plugin.token", "belongs-to-another-plugin");
+    const m = makePlugin({ id: "scoped", body: BODY, ...MANIFEST });
+    await enable(m);
+    await h.setConfig("scoped", { region: "eu" });
+    await h.setSecret("scoped", "token", SECRET_VALUE);
+    expect(output(await callTool("scoped.show"))).toMatchObject({ hasToken: true, other: null });
+  });
+
+  it("hides the plugin's own secret if it echoes it into a result or an error", async () => {
+    const m = makePlugin({ id: "leaky", body: BODY, ...MANIFEST });
+    await enable(m);
+    await h.setConfig("leaky", { region: "eu" });
+    await h.setSecret("leaky", "token", SECRET_VALUE);
+    expect(output(await callTool("leaky.leak"))).toBe("my token is [REDACTED:plugin.leaky.token]");
+    const failed = errorOf(await callTool("leaky.boom"));
+    expect(failed).not.toContain(SECRET_VALUE);
+    expect(failed).toContain("[REDACTED:plugin.leaky.token]");
+  });
+
+  it("never writes a secret value into the audit log or the settings listing", async () => {
+    const m = makePlugin({ id: "quiet", body: BODY, ...MANIFEST });
+    await enable(m);
+    await h.setConfig("quiet", { region: "eu" });
+    await h.setSecret("quiet", "token", SECRET_VALUE);
+    await h.deleteSecret("quiet", "token");
+    await h.setSecret("quiet", "token", SECRET_VALUE);
+    const log = JSON.stringify(events.readSince(0, { limit: 1000 }));
+    expect(log).not.toContain(SECRET_VALUE);
+    expect(log).toContain("plugin.secret_set");
+    expect(JSON.stringify(h.settings("quiet"))).not.toContain(SECRET_VALUE);
+    expect(JSON.stringify(h.info("quiet"))).not.toContain(SECRET_VALUE);
+  });
+
+  it("removing a plugin removes its settings and secrets, and only its own", async () => {
+    const a = makePlugin({ id: "gone", body: BODY, ...MANIFEST });
+    await enable(a);
+    await h.setConfig("gone", { region: "eu" });
+    await h.setSecret("gone", "token", SECRET_VALUE);
+    store.data.set("plugin.stays.token", "not-mine-to-delete");
+    await h.remove("gone");
+    expect([...store.data.keys()]).toEqual(["plugin.stays.token"]);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM plugin_config").get()).toEqual({ n: 0 });
+  });
+
+  it("without a secret store, a plugin that needs secrets waits instead of running without them", async () => {
+    const bare = new PluginHost(options());
+    try {
+      const m = makePlugin({ id: "nostore", body: BODY, ...MANIFEST });
+      await bare.install(m.dir);
+      await bare.enable(m.id, bare.info(m.id).approvalToken!);
+      expect(bare.info("nostore").status).toBe("needs_config");
+      await expect(bare.setSecret("nostore", "token", SECRET_VALUE)).rejects.toMatchObject({ code: "NO_SECRET_STORE" });
+    } finally {
+      await bare.stop();
+    }
+  });
+
+  it("a plugin with no settings or secrets is unaffected", async () => {
+    const m = makePlugin({ id: "plain", body: GREET });
+    await enable(m);
+    expect(h.info("plain").status).toBe("running");
+    expect(h.settings("plain")).toEqual({ id: "plain", settings: [], secrets: [], missing: [] });
   });
 });
