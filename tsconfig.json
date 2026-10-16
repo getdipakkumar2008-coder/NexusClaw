@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/brand" },
+    { "path": "packages/protocol" },
+    { "path": "packages/plugin-sdk" },
+    { "path": "packages/cli" },
+    { "path": "src/config" },
+    { "path": "src/gateway" }
+  ]
+}

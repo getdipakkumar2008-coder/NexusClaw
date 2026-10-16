@@ -1,0 +1,5 @@
+# TODO(owner): replace with real handles/teams once maintainers exist (an invalid owner makes this file ineffective).
+# Security-sensitive areas should require security-team review (docs/06 section 8):
+# /src/config/        @OWNER-TBD
+# /packages/protocol/ @OWNER-TBD
+# /docs/06-*          @OWNER-TBD

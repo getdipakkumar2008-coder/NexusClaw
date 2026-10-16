@@ -1,0 +1,31 @@
+{
+  "name": "clawnexus-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Self-hostable personal AI assistant platform (working name; see docs/12-clean-room-and-ip-policy.md).",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@9.15.9",
+  "engines": { "node": ">=22" },
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --noEmit false",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "check:boundaries": "depcruise --config .dependency-cruiser.cjs packages src extensions",
+    "check:boundaries:selftest": "node tools/boundaries-selftest.mjs",
+    "check:licenses": "node tools/check-licenses.mjs",
+    "check:all": "pnpm build && pnpm lint && pnpm test && pnpm check:boundaries && pnpm check:boundaries:selftest && pnpm check:licenses",
+    "changeset": "changeset"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.10",
+    "@eslint/js": "^9.17.0",
+    "dependency-cruiser": "^16.8.0",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0",
+    "vitest": "^2.1.8",
+    "@types/node": "^22.10.0"
+  }
+}

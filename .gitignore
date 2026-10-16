@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+.env
+.env.*
+*.log
+.DS_Store
+.claude/
+spikes/**/out/

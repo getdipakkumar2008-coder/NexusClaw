@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "baseUrl": ".",
+    "paths": {
+      "@clawnexus/brand": ["packages/brand/src/index.ts"],
+      "@clawnexus/protocol": ["packages/protocol/src/index.ts"],
+      "@clawnexus/plugin-sdk": ["packages/plugin-sdk/src/index.ts"],
+      "@clawnexus/cli": ["packages/cli/src/index.ts"],
+      "@clawnexus/config": ["src/config/src/index.ts"],
+      "@clawnexus/gateway": ["src/gateway/src/index.ts"]
+    }
+  }
+}

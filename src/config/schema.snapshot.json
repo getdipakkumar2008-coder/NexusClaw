@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "configVersion": {
+      "type": "number",
+      "const": 1
+    },
+    "dataDir": {
+      "type": "string",
+      "minLength": 1
+    },
+    "gateway": {
+      "default": {
+        "bind": "127.0.0.1",
+        "port": 7391,
+        "tls": {
+          "enabled": false
+        },
+        "auth": {
+          "required": true
+        },
+        "insecureAcknowledged": false
+      },
+      "type": "object",
+      "properties": {
+        "bind": {
+          "default": "127.0.0.1",
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "default": 7391,
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "tls": {
+          "default": {
+            "enabled": false
+          },
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "enabled"
+          ],
+          "additionalProperties": false
+        },
+        "auth": {
+          "default": {
+            "required": true
+          },
+          "type": "object",
+          "properties": {
+            "required": {
+              "default": true,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "required"
+          ],
+          "additionalProperties": false
+        },
+        "insecureAcknowledged": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bind",
+        "port",
+        "tls",
+        "auth",
+        "insecureAcknowledged"
+      ],
+      "additionalProperties": false
+    },
+    "security": {
+      "default": {
+        "profile": "standard"
+      },
+      "type": "object",
+      "properties": {
+        "profile": {
+          "default": "standard",
+          "type": "string",
+          "enum": [
+            "standard",
+            "locked-down",
+            "trusted"
+          ]
+        }
+      },
+      "required": [
+        "profile"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "configVersion",
+    "gateway",
+    "security"
+  ],
+  "additionalProperties": false
+}

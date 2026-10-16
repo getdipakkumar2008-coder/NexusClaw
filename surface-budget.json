@@ -1,0 +1,6 @@
+{
+  "_comment": "Core 'tax' budget (docs/04 section 1). Raising a number needs an ADR.",
+  "maxCoreTools": 0,
+  "maxConfigKeys": 12,
+  "maxSystemPromptTokens": 0
+}
