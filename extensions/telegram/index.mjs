@@ -2,7 +2,7 @@
 //
 // What it does: receives text messages sent to your bot and hands them to the Gateway, which decides who may talk to
 // the assistant (pairing), applies group rules and sends replies back through `send`. What it never does: format
-// replies (they are sent as plain text), follow links, download files, or act on anything but ordinary messages.
+// replies (they are sent as plain text), follow links, fetch a file from anywhere but Telegram, or act on anything but ordinary messages.
 //
 // A plugin runs in its own process and can read nothing outside its own folder, so this file imports nothing.
 
@@ -69,12 +69,63 @@ export default {
       return m.reply_to_message?.from?.id === me.id;
     }
 
+    const MAX_FILE = 8 * 1024 * 1024; // the Gateway takes no more than this per file
+    const MAX_FILES = 4;
+
+    /** Download a file from Telegram's file server, at most MAX_FILE bytes. base64, or undefined if it failed or was too big. */
+    async function fetchFile(filePath) {
+      const res = await fetch(`${apiBase}/file/bot${token}/${filePath}`, { signal: AbortSignal.timeout(30_000) });
+      if (!res.ok || !res.body) return undefined;
+      const declared = Number(res.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > MAX_FILE) return undefined;
+      const chunks = [];
+      let n = 0;
+      for await (const c of res.body) {
+        n += c.length;
+        if (n > MAX_FILE) return undefined;
+        chunks.push(c);
+      }
+      return Buffer.concat(chunks).toString("base64");
+    }
+
+    /** The files of a message: pictures, documents, audio and voice notes are downloaded; anything else is only noted. */
+    async function filesOf(m) {
+      const wanted = [];
+      if (Array.isArray(m.photo) && m.photo.length) {
+        // Telegram sends one picture in several sizes; take the biggest that is small enough.
+        const sizes = [...m.photo].sort((a, b) => (b.file_size ?? 0) - (a.file_size ?? 0));
+        const fits = sizes.find((p) => (p.file_size ?? 0) <= MAX_FILE) ?? sizes[0];
+        wanted.push({ id: fits.file_id, name: "photo.jpg", size: fits.file_size });
+      }
+      if (m.document) wanted.push({ id: m.document.file_id, name: m.document.file_name ?? "document", mime: m.document.mime_type, size: m.document.file_size });
+      if (m.audio) wanted.push({ id: m.audio.file_id, name: m.audio.file_name ?? "audio", mime: m.audio.mime_type, size: m.audio.file_size });
+      if (m.voice) wanted.push({ id: m.voice.file_id, name: "voice.ogg", mime: m.voice.mime_type, size: m.voice.file_size });
+      for (const k of ["video", "video_note", "sticker", "animation"]) if (m[k] !== undefined) wanted.push({ name: k });
+      const out = [];
+      for (const w of wanted.slice(0, MAX_FILES)) {
+        const note = { name: w.name, ...(w.mime ? { mimeType: w.mime } : {}), ...(typeof w.size === "number" ? { bytes: w.size } : {}) };
+        if (!w.id || (typeof w.size === "number" && w.size > MAX_FILE)) {
+          out.push(note); // too big, or not a kind we fetch: the Gateway records that it was sent
+          continue;
+        }
+        try {
+          const info = await api("getFile", { file_id: w.id });
+          const data = typeof info?.file_path === "string" ? await fetchFile(info.file_path) : undefined;
+          out.push(data === undefined ? note : { ...note, data });
+        } catch {
+          out.push(note);
+        }
+      }
+      return out;
+    }
+
     /** Telegram message -> what the Gateway expects, or undefined when it is not for us. */
-    function toInbound(m) {
+    async function toInbound(m) {
       if (!m || !m.chat || !m.from || m.from.is_bot) return undefined;
       const text = m.text ?? m.caption ?? "";
       const media = ["photo", "document", "audio", "voice", "video", "video_note", "sticker", "animation"].filter((k) => m[k] !== undefined);
       if (text === "" && media.length === 0) return undefined;
+      const files = media.length ? await filesOf(m) : [];
       const isGroup = m.chat.type !== "private";
       const display = m.from.username ? `@${m.from.username}` : [m.from.first_name, m.from.last_name].filter(Boolean).join(" ");
       return {
@@ -89,7 +140,7 @@ export default {
         isGroup,
         mentionsBot: isGroup ? mentionsMe(m) : true,
         ...(typeof m.date === "number" ? { ts: m.date * 1000 } : {}),
-        ...(media.length ? { attachments: media.slice(0, 32).map((k) => ({ name: k })) } : {}),
+        ...(files.length ? { attachments: files } : {}),
       };
     }
 
@@ -100,7 +151,7 @@ export default {
           const updates = await api("getUpdates", { offset, timeout: pollSeconds, allowed_updates: ["message"] }, { signal, timeoutMs: pollSeconds * 1000 + 10_000 });
           failures = 0;
           for (const u of updates) {
-            const inbound = toInbound(u.message);
+            const inbound = await toInbound(u.message);
             if (inbound) await host.deliver(inbound);
             // Move on only after the Gateway has taken the message. A repeat after a restart is ignored by its message id.
             offset = Math.max(offset, u.update_id + 1);

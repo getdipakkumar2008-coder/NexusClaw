@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -253,7 +253,9 @@ describe("backup and restore", () => {
     const db = openDb(join(dir, "gateway.db"));
     expect(new EventLog(db).readSince(0).some((e) => e.type === "marker")).toBe(true);
     db.close();
-    expect(readFileSync(join(dir, "secrets.vault"), "utf8")).toBe("encrypted-bytes");
+    // a vault without its key cannot be opened here, so it is set aside intact rather than left to block a new one
+    const aside = readdirSync(dir).find((f) => f.startsWith("secrets.vault.unreadable-"));
+    expect(readFileSync(join(dir, aside ?? "missing"), "utf8")).toBe("encrypted-bytes");
   });
 
   it("refuses to clobber existing data unless forced, and keeps the old database aside", async () => {

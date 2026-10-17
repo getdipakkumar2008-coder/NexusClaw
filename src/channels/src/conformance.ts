@@ -241,14 +241,21 @@ export function defineConformance(t: TestApi, name: string, make: (s?: Conforman
       expect(c.bed.sessions?.list() ?? []).toHaveLength(0);
     });
 
-    run("attachments are noted and dropped, never passed on", async (c) => {
+    run("a file that is not accepted is noted, never passed on as a file", async (c) => {
       if (!c.deliverRaw) return;
       const a = await pair(c, "alice");
       const out = await c.deliverRaw({ accountId: "default", conversationId: a.conversationId, senderId: a.senderId, messageId: "att-1", text: "see file", isGroup: false, mentionsBot: true, attachments: [{ name: "x.exe", mimeType: "application/x-msdownload", bytes: 5 }] });
       expect(out.result).toBe("accepted");
       expect(c.bed.events.readSince(0, { limit: 5000 }).some((e) => e.type === "channel.attachments_dropped")).toBe(true);
       await eventually(() => (c.bed.provider?.calls.length ?? 0) === 1, "the run");
-      expect(JSON.stringify(c.bed.provider!.calls[0]!.messages)).not.toContain("x.exe");
+      const call = c.bed.provider!.calls[0]!;
+      // The model is told that a file was sent and refused, but is given no file, and no claim about its type.
+      expect(call.attachments?.some((x) => x.id !== undefined) ?? false).toBe(false);
+      const refs = call.messages.at(-1)?.attachments ?? [];
+      expect(refs).toHaveLength(1);
+      expect(refs[0]?.name).toBe("x.exe");
+      expect(typeof refs[0]?.dropped).toBe("string");
+      expect(JSON.stringify(call.messages)).not.toContain("application/x-msdownload");
     });
   });
 }

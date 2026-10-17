@@ -96,9 +96,11 @@ Talk to a running Gateway
   status                          show Gateway health
   chat <text>                     send a message and stream the reply  [--session ID]
   sessions list|show|export|delete [ID]  [--format jsonl|markdown]
+  attachment get ID --out FILE    save a file that came with a message (ids are shown by "sessions show")
   pairing list|approve|deny [CODE]  |  pairing owner <channel> <your-id>
   webchat link                    one-time link that makes a browser the owner (opens the chat page)
   channels                        show channels and their health
+  channels outbox [retry | purge [--all]]   replies waiting to be delivered, or that gave up
   approvals list|approve|deny [ID]
   tool list | tool call <name> --args '<json>' [--approval ID]
   memory list|contacts|show|write|delete|export|erase|path   your saved notes (plain Markdown files)
@@ -346,8 +348,11 @@ const sessions: Handler = (c) =>
       const r = await g.call<{ sessions: Array<{ id: string; channel: string; conversation: string; scope: string; createdAt: number }> }>("session.list", {});
       show(c, r, () => (r.sessions.length ? r.sessions.map((s) => `${s.id}  ${s.channel}/${s.conversation}/${s.scope}  ${new Date(s.createdAt).toISOString()}`).join("\n") + "\n" : "No sessions yet.\n"));
     } else if (sub === "show") {
-      const r = await g.call<{ messages: Array<{ role: string; sender: string; content: string }> }>("session.get", { session: need(c.p, 2, "session id") });
-      show(c, r, () => r.messages.map((m) => `[${m.role}${m.sender ? ` ${m.sender}` : ""}] ${m.content}`).join("\n") + "\n");
+      type Msg = { role: string; sender: string; content: string; attachments?: Array<{ id?: string; name: string; mime?: string; bytes?: number; dropped?: string }> };
+      const r = await g.call<{ messages: Msg[] }>("session.get", { session: need(c.p, 2, "session id") });
+      const files = (m: Msg): string =>
+        (m.attachments ?? []).map((a) => `\n    file: ${a.name}${a.dropped ? ` (not accepted: ${a.dropped})` : ` (${a.mime ?? "?"}${a.bytes ? `, ${a.bytes} bytes` : ""})  get it with: ${BRAND.cli} attachment get ${a.id ?? ""} --out FILE`}`).join("");
+      show(c, r, () => r.messages.map((m) => `[${m.role}${m.sender ? ` ${m.sender}` : ""}] ${m.content}${files(m)}`).join("\n") + "\n");
     } else if (sub === "export") {
       const format = strFlag(c.p, "format") ?? "jsonl";
       const r = await g.call<{ content: string }>("session.export", { session: need(c.p, 2, "session id"), format });
@@ -382,6 +387,28 @@ const pairing: Handler = (c) =>
 
 const channels: Handler = (c) =>
   withClient(c, async (g) => {
+    const sub = c.p.positionals[1];
+    if (sub === "outbox") {
+      // Replies the Gateway has written down to deliver. `retry` and `purge` act on the ones that gave up.
+      const act = c.p.positionals[2];
+      if (act === "retry" || act === "purge") {
+        const r = await g.call<{ count: number }>(act === "retry" ? "channel.outbox.retry" : "channel.outbox.purge", act === "purge" && c.p.flags["all"] === true ? { all: true } : {});
+        show(c, r, () => (act === "retry" ? `Put ${r.count} failed message(s) back in the queue.\n` : `Deleted ${r.count} message(s) from the outbox.\n`));
+        return 0;
+      }
+      if (act !== undefined) throw new CliError("USAGE", `unknown channels outbox command ${act}`, "Use `channels outbox`, `channels outbox retry` or `channels outbox purge [--all]`.");
+      const r = await g.call<{ pending: number; failed: number; byChannel: Array<{ channel: string; pending: number; failed: number }>; failedRows: Array<{ id: number; channel: string; createdAt: number; attempts: number; error: string }> }>("channel.outbox", {});
+      show(
+        c,
+        r,
+        () =>
+          r.pending + r.failed === 0
+            ? "The outbox is empty: every reply has been delivered.\n"
+            : `${r.byChannel.map((x) => `${x.channel.padEnd(14)} ${x.pending} waiting, ${x.failed} gave up`).join("\n")}\n${r.failedRows.map((f) => `  #${f.id} ${f.channel} ${new Date(f.createdAt).toISOString().slice(0, 16).replace("T", " ")} after ${f.attempts} tries: ${f.error}`).join("\n")}${r.failed ? `\nRetry the ones that gave up with \`${BRAND.cli} channels outbox retry\`, or delete them with \`channels outbox purge\`.\n` : "\n"}`,
+      );
+      return 0;
+    }
+    if (sub !== undefined) throw new CliError("USAGE", `unknown channels command ${sub}`, "Use `channels` or `channels outbox`.");
     const r = await g.call<{ channels: Array<{ id: string; status: { state: string; detail?: string } }> }>("channel.list", {});
     show(c, r, () => (r.channels.length ? `${r.channels.map((x) => `${x.id.padEnd(14)} ${x.status.state.padEnd(14)} ${x.status.detail ?? ""}`).join("\n")}\n` : "No channels.\n"));
     return 0;
@@ -700,6 +727,20 @@ const memory: Handler = async (c) => {
   });
 };
 
+/** `attachment get ID --out FILE`: save a file that came with a message. */
+const attachment: Handler = (c) =>
+  withClient(c, async (g) => {
+    const sub = c.p.positionals[1];
+    if (sub !== "get") throw new CliError("USAGE", `unknown attachment command ${sub ?? ""}`.trim(), "Use `attachment get ID --out FILE`; ids are shown by `sessions show`.");
+    const out = strFlag(c.p, "out");
+    if (!out) throw new CliError("USAGE", "say where to save it with --out FILE", "Files can be pictures, audio or PDFs, so they are not printed to the terminal.");
+    if (existsSync(resolve(out)) && c.p.flags["force"] !== true) throw new CliError("EXISTS", `${resolve(out)} already exists`, "Choose another name, or pass --force.");
+    const r = await g.call<{ id: string; mime: string; bytes: number; data: string }>("blob.get", { id: need(c.p, 2, "attachment id") });
+    writeFileSync(resolve(out), Buffer.from(r.data, "base64"), { mode: 0o600 });
+    show(c, { id: r.id, mime: r.mime, bytes: r.bytes, saved: resolve(out) }, () => `Saved ${r.bytes} bytes (${r.mime}) to ${resolve(out)}.\nIt came from a message sender: open it with care.\n`);
+    return 0;
+  });
+
 /** `devices`: phones, tablets and other computers that sign in with their own key instead of the owner token. */
 const devices: Handler = async (c) => {
   const sub = c.p.positionals[1] ?? "list";
@@ -765,7 +806,7 @@ const devices: Handler = async (c) => {
   });
 };
 
-const HANDLERS: Record<string, Handler> = { status, chat, sessions, pairing, approvals, tool, plugins, channels, webchat, memory, devices };
+const HANDLERS: Record<string, Handler> = { status, chat, sessions, pairing, approvals, tool, plugins, channels, webchat, memory, devices, attachment };
 export const CLIENT_COMMANDS = Object.keys(HANDLERS);
 
 /** Print an error the way users should see it: code, cause, fix. No stack traces. */

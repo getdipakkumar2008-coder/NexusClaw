@@ -104,6 +104,32 @@ const SCHEMA: readonly string[] = [
      last_seen_at INTEGER,
      revoked_at   INTEGER
    );`,
+  // v8: replies waiting to be delivered to a channel, one row per piece of text, so a restart or a platform outage
+  // does not lose an answer. A row is deleted when it has been sent; "failed" rows stay for the owner to see.
+  `CREATE TABLE outbox (
+     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+     grp             TEXT NOT NULL,
+     channel         TEXT NOT NULL,
+     account_id      TEXT NOT NULL,
+     conversation_id TEXT NOT NULL,
+     reply_to        TEXT,
+     text            TEXT NOT NULL,
+     created_at      INTEGER NOT NULL,
+     attempts        INTEGER NOT NULL DEFAULT 0,
+     next_at         INTEGER NOT NULL,
+     state           TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','failed')),
+     last_error      TEXT
+   );
+   CREATE INDEX outbox_conv ON outbox(channel, account_id, conversation_id, state, id);`,
+  // v9: attachments. Files live in <data>/blobs under the SHA-256 of their content; this table records them so the
+  // total can be limited and unused ones cleaned up. A message lists the attachments it carries (names and ids, no bytes).
+  `CREATE TABLE blobs (
+     id         TEXT PRIMARY KEY,
+     bytes      INTEGER NOT NULL,
+     mime       TEXT NOT NULL,
+     created_at INTEGER NOT NULL
+   ) WITHOUT ROWID;
+   ALTER TABLE messages ADD COLUMN attachments TEXT;`,
 ];
 
 export const SCHEMA_VERSION = SCHEMA.length;

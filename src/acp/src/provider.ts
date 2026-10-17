@@ -1,4 +1,5 @@
 import type { Provider, ProviderEvent, ProviderMessage, ProviderRequest } from "@clawnexus/sessions";
+import { buildBlocks, describeRef } from "./attachments.js";
 import { AcpConnection, AcpError, type AcpConnectionOptions, type McpServerSpec, type PermissionAnswer, type PermissionInfo } from "./client.js";
 
 /** Gives a harness session its tools. `open` is called once per new harness session; `close` when it ends. */
@@ -40,7 +41,8 @@ export function buildPrompt(messages: readonly ProviderMessage[], maxChars: numb
   let used = lastUser.m.content.length;
   for (let i = earlier.length - 1; i >= 0; i--) {
     const m = earlier[i]!;
-    const line = `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`;
+    const files = m.attachments?.length ? ` [${m.attachments.map(describeRef).join("; ")}]` : "";
+    const line = `${m.role === "user" ? "User" : "Assistant"}: ${m.content}${files}`;
     if (used + line.length > maxChars) break;
     used += line.length;
     lines.unshift(line);
@@ -131,8 +133,10 @@ export class AcpProvider implements Provider {
       }
     }
     const body = fresh ? buildPrompt(req.messages, this.o.maxContextChars ?? 24_000) : [...req.messages].reverse().find((m) => m.role === "user")?.content ?? "";
-    if (body === "") return;
+    if (body === "" && !req.attachments?.length) return;
     const text = this.notesFor(req) + externalHeader(req.source) + body;
+    // Files go as their own content blocks where the harness accepts them; otherwise the model is told they exist.
+    const prompt = buildBlocks(text, req.attachments, conn.promptCaps);
 
     // Bridge the callback into an async iterator.
     const queue: string[] = [];
@@ -147,7 +151,7 @@ export class AcpProvider implements Provider {
     if (req.signal.aborted) stop.abort();
 
     const turn = conn
-      .prompt(sid, text, {
+      .prompt(sid, prompt, {
         signal: stop.signal,
         graceMs: this.o.graceMs ?? 3000,
         onText: (t) => {

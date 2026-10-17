@@ -4,3 +4,4 @@ export { HARNESS_NAMES, PRESETS, HarnessError, planLaunch, resolveSpec, type Har
 export { runMcpServer, MCP_VERSIONS, type McpBackend, type McpServerOptions, type McpTool } from "./mcp.js";
 export { GatewayToolBackend, mcpName, type GatewayCaller, type ToolBridgeOptions } from "./toolbridge.js";
 export { JsonRpcPeer, RpcError, RPC } from "./jsonrpc.js";
+export { buildBlocks, describeRef, MAX_INLINE_TEXT, type PromptBlock, type PromptCaps } from "./attachments.js";

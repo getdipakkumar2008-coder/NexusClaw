@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BlobStore } from "@clawnexus/blobs";
 import { PairingService } from "@clawnexus/pairing";
 import { FakeProvider, SessionManager, type Provider } from "@clawnexus/sessions";
 import { EventLog, openDb, type Db } from "@clawnexus/store";
@@ -15,6 +16,7 @@ export interface Bed {
   pairing: PairingService;
   sessions: SessionManager | undefined;
   manager: ChannelManager;
+  blobs: BlobStore;
   provider: FakeProvider | undefined;
   /** The fake clock the router and pairing use, so tests can move time. */
   clock: { now: number };
@@ -37,8 +39,9 @@ export async function createBed(o: BedOptions): Promise<Bed> {
   const events = new EventLog(db, now);
   const pairing = new PairingService(db, { now, audit: events });
   const fake = o.provider === null ? undefined : ((o.provider as FakeProvider | undefined) ?? new FakeProvider({ chunkSize: 1000, reply: (m) => `echo: ${[...m].reverse().find((x) => x.role === "user")?.content ?? ""}` }));
-  const sessions = fake ? new SessionManager(db, events, fake, { now, deltaFlushMs: 0 }) : undefined;
-  const manager = new ChannelManager({ db, events, pairing, sessions, now, sendRetry: { attempts: 3, baseMs: 5 }, noticeCooldownMs: 1000, ...o.manager });
+  const blobs = new BlobStore(join(dir, "blobs"), db, { now });
+  const sessions = fake ? new SessionManager(db, events, fake, { now, deltaFlushMs: 0, blobReader: (id) => blobs.read(id) }) : undefined;
+  const manager = new ChannelManager({ db, events, pairing, sessions, blobs, now, sendRetry: { attempts: 3, baseMs: 5 }, noticeCooldownMs: 1000, ...o.manager });
   for (const a of o.adapters) manager.register(a, o.group ?? {});
   await manager.start();
   return {
@@ -48,6 +51,7 @@ export async function createBed(o: BedOptions): Promise<Bed> {
     pairing,
     sessions,
     manager,
+    blobs,
     provider: fake instanceof FakeProvider ? fake : undefined,
     clock,
     async teardown() {

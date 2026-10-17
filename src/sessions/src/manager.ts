@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { inTransaction, type Db, type EventLog } from "@clawnexus/store";
-import type { Provider, ProviderMessage } from "./provider.js";
+import type { AttachmentRef } from "@clawnexus/blobs";
+import type { Provider, ProviderAttachment, ProviderMessage } from "./provider.js";
 import { fromJsonl, toJsonl, toMarkdown, type Transcript } from "./transcript.js";
 
 export class SessionError extends Error {
@@ -35,6 +36,7 @@ export interface Message {
   sender: string;
   content: string;
   ts: number;
+  attachments?: AttachmentRef[];
 }
 
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -53,6 +55,8 @@ export interface SessionManagerOptions {
   deltaFlushMs?: number;
   /** Extra context for the model about who it is talking to (memory). A failure here never stops a run. */
   context?: (session: Session) => string | undefined;
+  /** Reads an attached file by id, so the provider can be handed its bytes. */
+  blobReader?: (id: string) => Buffer | undefined;
   now?: () => number;
 }
 
@@ -88,6 +92,20 @@ interface MessageRow {
   sender: string;
   content: string;
   ts: number;
+  attachments: string | null;
+}
+
+/** Attachment refs from a stored message; anything that does not look right is ignored, never trusted. */
+function parseRefs(text: string | null): AttachmentRef[] | undefined {
+  if (text === null) return undefined;
+  try {
+    const v = JSON.parse(text) as unknown;
+    if (!Array.isArray(v)) return undefined;
+    const refs = v.filter((x): x is AttachmentRef => typeof x === "object" && x !== null && typeof (x as AttachmentRef).name === "string").slice(0, 32);
+    return refs.length ? refs : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 const toSession = (r: SessionRow): Session => ({
@@ -102,6 +120,8 @@ const toSession = (r: SessionRow): Session => ({
 const toMessage = (r: MessageRow): Message => {
   const m: Message = { id: r.id, sessionId: r.session_id, role: r.role, sender: r.sender, content: r.content, ts: r.ts };
   if (r.run_id !== null) m.runId = r.run_id;
+  const a = parseRefs(r.attachments);
+  if (a) m.attachments = a;
   return m;
 };
 
@@ -117,7 +137,8 @@ export class SessionManager {
   private running = 0;
   private closed = false;
   private idleWaiters: Array<() => void> = [];
-  private readonly o: Required<Omit<SessionManagerOptions, "context">>;
+  private readonly o: Required<Omit<SessionManagerOptions, "context" | "blobReader">>;
+  private readonly blobReader: SessionManagerOptions["blobReader"];
   private readonly context: SessionManagerOptions["context"];
 
   constructor(
@@ -137,6 +158,7 @@ export class SessionManager {
       now: opts.now ?? Date.now,
     };
     this.context = opts.context;
+    this.blobReader = opts.blobReader;
     this.recover();
   }
 
@@ -211,10 +233,12 @@ export class SessionManager {
   // ---------------- runs ----------------
 
   /** Record the user's message and queue a run. Returns immediately; progress arrives as events. */
-  send(sessionId: string, text: string, from: { sender: string } = { sender: "" }): { messageId: number; runId: string; queued: number } {
+  send(sessionId: string, text: string, from: { sender: string; attachments?: AttachmentRef[] } = { sender: "" }): { messageId: number; runId: string; queued: number } {
     if (this.closed) throw new SessionError("CLOSED", "session manager is shut down");
     this.get(sessionId);
-    if (typeof text !== "string" || text.trim() === "") throw new SessionError("INVALID", "message text is empty");
+    const refs = (from.attachments ?? []).slice(0, 32);
+    // A picture with no caption is a message; nothing at all is not.
+    if (typeof text !== "string" || (text.trim() === "" && !refs.some((a) => a.id !== undefined))) throw new SessionError("INVALID", "message text is empty");
     if (Buffer.byteLength(text, "utf8") > this.o.maxMessageBytes) throw new SessionError("TOO_LARGE", `message exceeds ${this.o.maxMessageBytes} bytes`);
     const queue = this.queues.get(sessionId) ?? [];
     if (queue.length >= this.o.maxQueue) throw new SessionError("QUEUE_FULL", "too many pending messages for this session");
@@ -223,10 +247,10 @@ export class SessionManager {
     const ts = this.o.now();
     const messageId = inTransaction(this.db, () => {
       const row = this.db
-        .prepare("INSERT INTO messages(session_id, run_id, role, sender, content, ts) VALUES (?, ?, 'user', ?, ?, ?) RETURNING id")
-        .get(sessionId, runId, from.sender, text, ts) as { id: number };
+        .prepare("INSERT INTO messages(session_id, run_id, role, sender, content, ts, attachments) VALUES (?, ?, 'user', ?, ?, ?, ?) RETURNING id")
+        .get(sessionId, runId, from.sender, text, ts, refs.length ? JSON.stringify(refs) : null) as { id: number };
       this.db.prepare("INSERT INTO runs(id, session_id, provider, status, created_at) VALUES (?, ?, ?, 'queued', ?)").run(runId, sessionId, this.provider.name, ts);
-      this.events.append([{ type: "message.inbound", session: sessionId, data: { messageId: row.id, runId, sender: from.sender, text } }]);
+      this.events.append([{ type: "message.inbound", session: sessionId, data: { messageId: row.id, runId, sender: from.sender, text, ...(refs.length ? { attachments: refs } : {}) } }]);
       return row.id;
     });
     const waitingBehind = queue.length + (this.active.has(sessionId) ? 1 : 0);
@@ -380,11 +404,17 @@ export class SessionManager {
       this.db.prepare("UPDATE runs SET status = 'running', started_at = ? WHERE id = ?").run(this.o.now(), runId);
       this.events.append([{ type: "run.started", session: sessionId, data: { runId, provider: this.provider.name } }]);
 
-      const history = (
-        this.db
-          .prepare("SELECT role, content FROM (SELECT id, role, content FROM messages WHERE session_id = ? AND id <= ? ORDER BY id DESC LIMIT ?) ORDER BY id")
-          .all(sessionId, job.messageId, this.o.historyLimit) as unknown as ProviderMessage[]
-      ).map((m) => ({ role: m.role, content: m.content }));
+      const rows = this.db
+        .prepare("SELECT role, content, attachments FROM (SELECT id, role, content, attachments FROM messages WHERE session_id = ? AND id <= ? ORDER BY id DESC LIMIT ?) ORDER BY id")
+        .all(sessionId, job.messageId, this.o.historyLimit) as unknown as Array<{ role: ProviderMessage["role"]; content: string; attachments: string | null }>;
+      const history: ProviderMessage[] = rows.map((m) => {
+        const refs = parseRefs(m.attachments);
+        return { role: m.role, content: m.content, ...(refs ? { attachments: refs } : {}) };
+      });
+      // Only the file(s) of the message being answered come with their bytes; earlier ones are described in the history.
+      const latest = [...history].reverse().find((m) => m.role === "user")?.attachments;
+      const reader = this.blobReader;
+      const attachments: ProviderAttachment[] | undefined = latest?.map((a) => ({ ...a, read: () => (a.id !== undefined && reader ? reader(a.id) : undefined) }));
 
       const session = this.get(sessionId);
       const from = this.db.prepare("SELECT sender FROM messages WHERE id = ?").get(job.messageId) as { sender: string } | undefined;
@@ -398,7 +428,7 @@ export class SessionManager {
       }
 
       const aborted = new Promise<"aborted">((resolve) => a.abort.signal.addEventListener("abort", () => resolve("aborted"), { once: true }));
-      const it = this.provider.run({ sessionId, runId, messages: history, signal: a.abort.signal, source, ...(system === undefined ? {} : { system }) })[Symbol.asyncIterator]();
+      const it = this.provider.run({ sessionId, runId, messages: history, signal: a.abort.signal, source, ...(system === undefined ? {} : { system }), ...(attachments?.length ? { attachments } : {}) })[Symbol.asyncIterator]();
       let stopped = false;
       for (;;) {
         const step = await Promise.race([it.next(), aborted]);

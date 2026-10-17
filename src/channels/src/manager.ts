@@ -1,4 +1,6 @@
 import { PairingError, type PairingService } from "@clawnexus/pairing";
+import { ingestAttachments, safeName, DEFAULT_INGEST, type AttachmentRef, type BlobStore, type IngestLimits } from "@clawnexus/blobs";
+import { Outbox } from "./outbox.js";
 import { SessionError, type SessionManager } from "@clawnexus/sessions";
 import type { Db, EventLog, StoredEvent } from "@clawnexus/store";
 import {
@@ -17,6 +19,10 @@ import {
 
 export interface ChannelManagerOptions {
   db: Db;
+  /** Where accepted attachments are kept. Without it, files are noted and dropped. */
+  blobs?: BlobStore;
+  /** Limits on the files taken from one message. */
+  ingest?: Partial<IngestLimits>;
   events: EventLog;
   pairing: PairingService;
   /** Absent when no model provider is configured; paired senders then get a "not ready" notice. */
@@ -73,6 +79,7 @@ const NOTICE = {
   busy: "I am still working on your earlier messages. Please try again in a moment.",
   tooLong: "That message is too long for me to handle.",
   failed: "Sorry, I could not answer that. Please try again.",
+  interrupted: "I was restarted while answering you, so that answer was lost. Please send your message again.",
   limited: "You are sending messages too quickly. Please slow down.",
 } as const;
 
@@ -133,6 +140,9 @@ export class ChannelManager {
   private readonly senderBuckets = new Map<string, Bucket>();
   private readonly noticeAt = new Map<string, number>();
   private readonly sendChains = new Map<string, Promise<void>>();
+  readonly outbox: Outbox;
+  private readonly pumping = new Set<string>();
+  private readonly wakeups = new Map<string, NodeJS.Timeout>();
   private unsubscribe: (() => void) | undefined;
   private inserts = 0;
   private stopped = false;
@@ -143,6 +153,7 @@ export class ChannelManager {
 
   constructor(private readonly c: ChannelManagerOptions) {
     this.now = c.now ?? Date.now;
+    this.outbox = new Outbox(c.db); // real time: delivery delays are real delays, whatever clock the router is given
     this.o = {
       senderPerMinute: c.senderPerMinute ?? 20,
       senderBurst: c.senderBurst ?? 8,
@@ -181,6 +192,14 @@ export class ChannelManager {
     this.stopped = false;
     this.unsubscribe = this.c.events.subscribe((evs) => this.onEvents(evs));
     await Promise.allSettled([...this.entries.values()].map((e) => this.startEntry(e)));
+    try {
+      this.outbox.sweep();
+      this.notifyInterrupted();
+    } catch {
+      /* housekeeping must not stop the router */
+    }
+    // Replies that were waiting when the Gateway last stopped are delivered now.
+    this.resume();
   }
 
   private async startEntry(e: Entry): Promise<void> {
@@ -201,6 +220,8 @@ export class ChannelManager {
     if (this.unsubscribe) {
       const e = this.entries.get(adapter.id);
       if (e) await this.startEntry(e);
+      // a plugin that came back up gets the replies that were waiting for it
+      this.resume(adapter.id);
     }
   }
 
@@ -222,6 +243,8 @@ export class ChannelManager {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    for (const t of this.wakeups.values()) clearTimeout(t);
+    this.wakeups.clear();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     await Promise.allSettled(
@@ -277,7 +300,7 @@ export class ChannelManager {
     if (!this.take(entry.bucket, this.o.adapterPerSecond, this.o.adapterBurst, 1000)) return { result: "limited" };
 
     const text = normalizeText(msg.text);
-    if (text === "") return { result: "ignored", reason: "empty" };
+    if (text === "" && !msg.attachments?.some((a) => a.data !== undefined)) return { result: "ignored", reason: "empty" };
     const target: SendTarget = { channel: msg.channel, accountId: msg.accountId, conversationId: msg.conversationId, replyTo: msg.messageId };
 
     // 1. Who is this? Unknown senders never get past here.
@@ -319,6 +342,19 @@ export class ChannelManager {
       return { result: "unavailable" };
     }
 
+    // 5. Files, only now: someone who is not paired, was rate-limited or repeated a message never gets a byte stored.
+    let refs: AttachmentRef[] = [];
+    if (msg.attachments && msg.attachments.length > 0) {
+      const blobs = this.c.blobs;
+      refs = blobs
+        ? ingestAttachments(msg.attachments, blobs, { ...DEFAULT_INGEST, ...this.c.ingest })
+        : msg.attachments.map((a, i) => ({ name: safeName(a.name, i), dropped: "this Gateway does not take attachments" }));
+      const kept = refs.filter((r) => r.id !== undefined).length;
+      if (kept < refs.length) this.audit("channel.attachments_dropped", { channel: msg.channel, count: refs.length - kept, reasons: [...new Set(refs.flatMap((r) => (r.dropped ? [r.dropped] : [])))].slice(0, 5) });
+      if (kept > 0) this.audit("channel.attachments_stored", { channel: msg.channel, count: kept });
+    }
+    if (text === "" && !refs.some((r) => r.id !== undefined)) return { result: "ignored", reason: "empty" };
+
     const principal = msg.isGroup ? "guest" : decision.principal;
     let sessionId: string;
     let sent;
@@ -329,7 +365,7 @@ export class ChannelManager {
       );
       if (session.principal !== principal) sessions.setPrincipal(session.id, principal);
       sessionId = session.id;
-      sent = sessions.send(session.id, text, { sender: msg.senderId });
+      sent = sessions.send(session.id, text, { sender: msg.senderId, ...(refs.length ? { attachments: refs } : {}) });
     } catch (e) {
       if (e instanceof SessionError) {
         if (e.code === "QUEUE_FULL") {
@@ -345,7 +381,6 @@ export class ChannelManager {
       throw e;
     }
 
-    if (msg.attachments && msg.attachments.length > 0) this.audit("channel.attachments_dropped", { channel: msg.channel, count: msg.attachments.length });
     this.track(sent.runId, { entry, target, sessionId });
     void this.safe(() => entry.adapter.typing?.(target, true));
     return { result: "accepted", sessionId, runId: sent.runId };
@@ -408,18 +443,35 @@ export class ChannelManager {
       if (!t) continue; // not ours: a run started from the CLI is never sent out to a channel
       if (e.type === "message.outbound") {
         const text = (e.data as { text?: string }).text ?? "";
-        if (text.trim() !== "") this.queueSend(t.entry, t.target, text);
+        if (text.trim() !== "") this.queueSend(t.entry, t.target, text, true);
       } else if (e.type === "run.completed" || e.type === "run.failed" || e.type === "run.cancelled") {
         this.runs.delete(runId);
         void this.safe(() => t.entry.adapter.typing?.(t.target, false));
-        if (e.type === "run.failed") this.queueSend(t.entry, t.target, NOTICE.failed);
+        if (e.type === "run.failed") this.queueSend(t.entry, t.target, NOTICE.failed, true);
       }
     }
   }
 
-  /** Same-conversation sends happen one after another, in order. */
-  private queueSend(entry: Entry, target: SendTarget, text: string): void {
+  /**
+   * Same-conversation sends happen one after another, in order. Answers (`persist`) go through the outbox and survive a
+   * restart. Everything else (pairing prompts, "busy", "slow down") is sent once, best effort: a pairing code must not
+   * be written down in plain text, and the others are worthless by the time they could be retried.
+   */
+  private queueSend(entry: Entry, target: SendTarget, text: string, persist = false): void {
     if (this.stopped || entry.detached) return;
+    if (persist) {
+      try {
+        const pieces = chunkText(text, entry.adapter.capabilities.maxTextChars);
+        if (!this.outbox.enqueue(target, pieces)) {
+          this.audit("channel.outbox_full", { channel: target.channel, accountId: target.accountId });
+          return;
+        }
+        void this.pump(target.channel, target.accountId, target.conversationId);
+      } catch {
+        /* the database may be closing */
+      }
+      return;
+    }
     const key = `${target.channel}|${target.accountId}|${target.conversationId}`;
     const prev = this.sendChains.get(key) ?? Promise.resolve();
     const next = prev.then(() => this.deliver(entry, target, text)).catch(() => undefined);
@@ -448,6 +500,102 @@ export class ChannelManager {
         return; // later pieces would arrive out of order
       }
     }
+  }
+
+  // ---------------- outbox ----------------
+
+  /** Put the replies that gave up back in the queue and try again. */
+  retryOutbox(): number {
+    const n = this.outbox.retryFailed();
+    this.resume();
+    return n;
+  }
+
+  /** Start delivering whatever is waiting, for one channel or all of them. */
+  private resume(channel?: string): void {
+    try {
+      for (const w of this.outbox.waiting(channel)) void this.pump(w.channel, w.accountId, w.conversationId);
+    } catch {
+      /* the database may be closing */
+    }
+  }
+
+  private wakeLater(key: string, delayMs: number, w: { channel: string; accountId: string; conversationId: string }): void {
+    clearTimeout(this.wakeups.get(key));
+    const t = setTimeout(() => {
+      this.wakeups.delete(key);
+      void this.pump(w.channel, w.accountId, w.conversationId);
+    }, Math.max(0, delayMs));
+    t.unref();
+    this.wakeups.set(key, t);
+  }
+
+  /** Deliver one conversation's waiting pieces, oldest first, one at a time. Gives up on a reply after the configured attempts. */
+  private async pump(channel: string, accountId: string, conversationId: string): Promise<void> {
+    const key = `${channel}|${accountId}|${conversationId}`;
+    if (this.pumping.has(key)) return; // the running loop will see anything added meanwhile
+    this.pumping.add(key);
+    clearTimeout(this.wakeups.get(key));
+    this.wakeups.delete(key);
+    try {
+      while (!this.stopped) {
+        const entry = this.entries.get(channel);
+        if (!entry || entry.detached || !entry.started) return; // delivered when the channel is (back) up
+        const row = this.outbox.head(channel, accountId, conversationId);
+        if (!row) return;
+        const wait = row.nextAt - Date.now();
+        if (wait > 0) {
+          this.wakeLater(key, wait, { channel, accountId, conversationId });
+          return;
+        }
+        this.outbox.begin(row.id);
+        try {
+          await withTimeout(entry.adapter.send(row.target, { text: row.text }), this.o.adapterTimeoutMs, `sending on ${channel}`);
+          this.outbox.done(row.id);
+        } catch (e) {
+          if (this.stopped) return;
+          const error = scrub(e instanceof Error ? e.message : "send failed");
+          if (row.attempts + 1 >= this.o.sendRetry.attempts) {
+            this.outbox.failGroup(row.group, error);
+            this.audit("channel.send_failed", { channel, accountId, error });
+          } else {
+            const delay = this.o.sendRetry.baseMs * 2 ** row.attempts;
+            this.outbox.retryLater(row.id, Date.now() + delay, error);
+            this.wakeLater(key, delay, { channel, accountId, conversationId });
+            return;
+          }
+        }
+      }
+    } catch {
+      /* the database may be closing */
+    } finally {
+      this.pumping.delete(key);
+    }
+  }
+
+  /** Runs that a restart cut short: tell the people who were waiting for an answer, once. */
+  private notifyInterrupted(): void {
+    const db = this.c.db;
+    const KEY = "channels_interrupted_seq";
+    const latest = this.c.events.latestSeq();
+    const seen = db.prepare("SELECT value FROM meta WHERE key = ?").get(KEY) as { value: string } | undefined;
+    if (seen !== undefined) {
+      const rows = db.prepare("SELECT session, data FROM events WHERE type = 'run.failed' AND seq > ? ORDER BY seq").all(Number(seen.value)) as unknown as Array<{ session: string | null; data: string | null }>;
+      for (const r of rows) {
+        let error: unknown;
+        try {
+          error = (JSON.parse(r.data ?? "{}") as { error?: unknown }).error;
+        } catch {
+          continue;
+        }
+        if (error !== "interrupted by restart" || r.session === null) continue;
+        const s = db.prepare("SELECT channel, conversation FROM sessions WHERE id = ?").get(r.session) as { channel: string; conversation: string } | undefined;
+        const bar = s?.conversation.indexOf("|") ?? -1;
+        if (!s || bar < 1 || !this.entries.has(s.channel)) continue; // not a channel conversation (a CLI session, say)
+        this.outbox.enqueue({ channel: s.channel, accountId: s.conversation.slice(0, bar), conversationId: s.conversation.slice(bar + 1) }, [NOTICE.interrupted]);
+      }
+    }
+    db.prepare("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(KEY, String(latest));
   }
 
   /** Tell a sender something, but not the same thing over and over. */

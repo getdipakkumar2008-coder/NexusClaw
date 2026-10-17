@@ -50,6 +50,8 @@ Max frame 1 MiB; larger payloads via `/v1/upload` + blob reference.
 | approvals | `approval.list`, `approval.decide` (owner); `approval.status` (tool bridge, own approvals only) |
 | channels (owner only) | `channel.list`, `channel.webchat.link`, `pairing.owner` (register your own identity on a channel) |
 | plugins (owner only) | `plugin.list`, `plugin.info`, `plugin.install` (absolute folder path, `replace`), `plugin.enable` (`id`, `approvalToken`), `plugin.disable`, `plugin.remove` (`purgeData`), `plugin.settings` (`id`), `plugin.config.set` (`id`, `values`; `null` removes a setting), `plugin.secret.set` (`id`, `name`, `value`), `plugin.secret.delete` (`id`, `name`). Secret values are accepted but never returned or logged |
+| attachments | `blob.get {id}` → `{id, mime, bytes, data (base64)}` (owner, or a device with `read`); ids are on a message's `attachments` |
+| outbox (owner only) | `channel.outbox`, `channel.outbox.retry`, `channel.outbox.purge {all?}` |
 | tools | `tool.list`, `tool.call` (owner; a tool bridge may call these as its session's principal) |
 | events | `events.subscribe {sessions?, since:seq}`, `events.unsubscribe` |
 | channels | `channel.list`, `channel.status`, `channel.enable/disable`, `pairing.list`, `pairing.approve`, `pairing.deny` |

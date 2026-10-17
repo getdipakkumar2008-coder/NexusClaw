@@ -2,5 +2,5 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": { "rootDir": "src", "outDir": "dist" },
   "include": ["src"],
-  "references": [{"path":"../pairing"},{"path":"../sessions"},{"path":"../store"}]
+  "references": [{"path":"../pairing"},{"path":"../sessions"},{"path":"../store"},{"path":"../blobs"}]
 }

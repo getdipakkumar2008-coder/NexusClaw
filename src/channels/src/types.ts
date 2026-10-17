@@ -55,9 +55,22 @@ export const inboundSchema = z.strictObject({
   isGroup: z.boolean(),
   mentionsBot: z.boolean(),
   ts: z.number().int().nonnegative().optional(),
-  /** Attachments are not processed yet; their presence is noted and they are dropped. */
-  attachments: z.array(z.strictObject({ name: z.string().max(256).optional(), mimeType: z.string().max(128).optional(), bytes: z.number().int().nonnegative().optional() })).max(32).optional(),
-});
+  /**
+   * Files that came with the message. `data` is the file itself, base64; without it the file is only noted. The router
+   * decides what is accepted from the content (never from `mimeType`), and only for senders it has already let through.
+   */
+  attachments: z
+    .array(
+      z.strictObject({
+        name: z.string().max(256).optional(),
+        mimeType: z.string().max(128).optional(),
+        bytes: z.number().int().nonnegative().optional(),
+        data: z.string().max(12_000_000).optional(),
+      }),
+    )
+    .max(32)
+    .optional(),
+}).refine((m) => (m.attachments ?? []).reduce((n, a) => n + (a.data?.length ?? 0), 0) <= 24_000_000, "attachments are too large together");
 export type InboundMessage = z.infer<typeof inboundSchema> & { channel: string };
 
 export type InboundOutcome =

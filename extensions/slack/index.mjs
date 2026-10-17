@@ -3,7 +3,7 @@
 //
 // What it does: receives direct messages, and channel messages that mention the bot, and hands them to the Gateway,
 // which decides who may talk to the assistant (pairing), applies group rules and sends replies back through `send`.
-// What it never does: let a reply ping anyone or create links, download files, or act on anything but ordinary
+// What it never does: let a reply ping anyone or create links, fetch a file from anywhere but Slack, or act on anything but ordinary
 // messages.
 //
 // Only two kinds of event are used, `message.im` and `app_mention`, so a message that mentions the bot in a channel
@@ -95,8 +95,56 @@ export default {
     /** What we send is escaped so that nothing the model writes can mention @channel, a person or a link. */
     const escapeOut = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+    const MAX_FILE = 8 * 1024 * 1024; // the Gateway takes no more than this per file
+    const MAX_FILES = 4;
+
+    /**
+     * Download a file the platform pointed us at: only from the platform's own file hosts, never following a name the
+     * sender chose, and sending the token only to those hosts. At most MAX_FILE bytes; base64, or undefined on any problem.
+     */
+    async function fetchFile(url) {
+      let u;
+      try {
+        u = new URL(String(url));
+      } catch {
+        return undefined;
+      }
+      const hosts = new Set(["files.slack.com", new URL(apiBase).host]);
+      if (!hosts.has(u.host) || (u.protocol !== "https:" && !isLocal(`${u.protocol}//${u.host}`))) return undefined;
+      const res = await fetch(u, { headers: { authorization: `Bearer ${botToken}` }, signal: AbortSignal.timeout(30_000) });
+      if (!res.ok || !res.body) return undefined;
+      const declared = Number(res.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > MAX_FILE) return undefined;
+      const chunks = [];
+      let n = 0;
+      for await (const c of res.body) {
+        n += c.length;
+        if (n > MAX_FILE) return undefined;
+        chunks.push(c);
+      }
+      return Buffer.concat(chunks).toString("base64");
+    }
+
+    async function filesOf(e) {
+      const out = [];
+      for (const f of (e.files ?? []).slice(0, MAX_FILES)) {
+        const note = { name: String(f.name ?? "file").slice(0, 200), ...(typeof f.mimetype === "string" ? { mimeType: f.mimetype.slice(0, 100) } : {}), ...(typeof f.size === "number" ? { bytes: f.size } : {}) };
+        if (typeof f.size === "number" && f.size > MAX_FILE) {
+          out.push(note);
+          continue;
+        }
+        try {
+          const data = await fetchFile(f.url_private_download ?? f.url_private);
+          out.push(data === undefined ? note : { ...note, data });
+        } catch {
+          out.push(note);
+        }
+      }
+      return out;
+    }
+
     /** Slack event -> what the Gateway expects, or undefined when it is not for us. */
-    function toInbound(e) {
+    async function toInbound(e) {
       if (!e || (e.type !== "message" && e.type !== "app_mention")) return undefined;
       const direct = e.channel_type === "im";
       // Channel messages only arrive as mentions; the plain message events for channels are never used.
@@ -105,7 +153,7 @@ export default {
       if (e.bot_id || !e.user || e.user === me.id) return undefined;
       if (e.subtype !== undefined && e.subtype !== "file_share" && e.subtype !== "thread_broadcast") return undefined;
       const text = plain(typeof e.text === "string" ? e.text : "");
-      const files = (e.files ?? []).slice(0, 32).map((f) => ({ name: String(f.name ?? "file").slice(0, 200) }));
+      const files = await filesOf(e);
       if (text === "" && files.length === 0) return undefined;
       const messageId = `${e.channel}:${e.ts}`;
       if (!direct) {
@@ -136,7 +184,7 @@ export default {
       queued++;
       queue = queue
         .then(async () => {
-          const inbound = toInbound(e);
+          const inbound = await toInbound(e);
           if (inbound) await host.deliver(inbound);
         })
         .catch((err) => ctx.log("warn", `slack: could not hand over a message: ${clean(err)}`))

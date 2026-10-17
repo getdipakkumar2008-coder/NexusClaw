@@ -3,7 +3,7 @@
 //
 // What it does: receives direct messages, and server messages that mention the bot or reply to it, and hands them to
 // the Gateway, which decides who may talk to the assistant (pairing), applies group rules and sends replies back
-// through `send`. What it never does: let a reply ping anyone, download attachments, follow links, or act on anything
+// through `send`. What it never does: let a reply ping anyone, follow links, fetch a file from anywhere but Discord, or act on anything
 // but ordinary messages.
 //
 // It asks only for the "server messages" and "direct messages" intents. Discord still includes the text of messages
@@ -96,8 +96,56 @@ export default {
       return text.replace(new RegExp(`<@!?${me.id}>`, "g"), "").replace(/\s{2,}/g, " ").trim();
     }
 
+    const MAX_FILE = 8 * 1024 * 1024; // the Gateway takes no more than this per file
+    const MAX_FILES = 4;
+
+    /**
+     * Download a file the platform pointed us at: only from the platform's own file hosts, never following a name the
+     * sender chose. At most MAX_FILE bytes; base64, or undefined on any problem.
+     */
+    async function fetchFile(url) {
+      let u;
+      try {
+        u = new URL(String(url));
+      } catch {
+        return undefined;
+      }
+      const hosts = new Set(["cdn.discordapp.com", "media.discordapp.net", new URL(apiBase).host]);
+      if (!hosts.has(u.host) || (u.protocol !== "https:" && !isLocal(`${u.protocol}//${u.host}`))) return undefined;
+      const res = await fetch(u, { signal: AbortSignal.timeout(30_000) });
+      if (!res.ok || !res.body) return undefined;
+      const declared = Number(res.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > MAX_FILE) return undefined;
+      const chunks = [];
+      let n = 0;
+      for await (const c of res.body) {
+        n += c.length;
+        if (n > MAX_FILE) return undefined;
+        chunks.push(c);
+      }
+      return Buffer.concat(chunks).toString("base64");
+    }
+
+    async function filesOf(m) {
+      const out = [];
+      for (const a of (m.attachments ?? []).slice(0, MAX_FILES)) {
+        const note = { name: String(a.filename ?? "file").slice(0, 200), ...(typeof a.content_type === "string" ? { mimeType: a.content_type.slice(0, 100) } : {}), ...(typeof a.size === "number" ? { bytes: a.size } : {}) };
+        if (typeof a.size === "number" && a.size > MAX_FILE) {
+          out.push(note);
+          continue;
+        }
+        try {
+          const data = await fetchFile(a.url);
+          out.push(data === undefined ? note : { ...note, data });
+        } catch {
+          out.push(note);
+        }
+      }
+      return out;
+    }
+
     /** Discord message -> what the Gateway expects, or undefined when it is not for us. */
-    function toInbound(m) {
+    async function toInbound(m) {
       if (!m || !m.author || m.author.bot || m.webhook_id) return undefined;
       // 0 is an ordinary message, 19 a reply, 20 a slash command; everything else is a service message.
       if (m.type !== undefined && m.type !== 0 && m.type !== 19 && m.type !== 20) return undefined;
@@ -108,7 +156,7 @@ export default {
       }
       const mentioned = (m.mentions ?? []).some((u) => u.id === me.id) || m.referenced_message?.author?.id === me.id;
       const text = stripOwnMention(typeof m.content === "string" ? m.content : "");
-      const files = (m.attachments ?? []).slice(0, 32).map((a) => ({ name: String(a.filename ?? "file").slice(0, 200) }));
+      const files = await filesOf(m);
       if (text === "" && files.length === 0) return undefined;
       const display = m.member?.nick ?? m.author.global_name ?? m.author.username;
       return {
@@ -135,7 +183,7 @@ export default {
       queued++;
       queue = queue
         .then(async () => {
-          const inbound = toInbound(m);
+          const inbound = await toInbound(m);
           if (inbound) await host.deliver(inbound);
         })
         .catch((e) => ctx.log("warn", `discord: could not hand over a message: ${clean(e)}`))

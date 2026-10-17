@@ -15,7 +15,7 @@ export default tseslint.config(
     // Plugins run in Node 22+ and use its built-in web APIs.
     files: ["extensions/**/*.mjs"],
     languageOptions: {
-      globals: { fetch: "readonly", AbortSignal: "readonly", AbortController: "readonly", setTimeout: "readonly", clearTimeout: "readonly", setInterval: "readonly", clearInterval: "readonly", WebSocket: "readonly", process: "readonly" },
+      globals: { fetch: "readonly", AbortSignal: "readonly", AbortController: "readonly", setTimeout: "readonly", clearTimeout: "readonly", setInterval: "readonly", clearInterval: "readonly", WebSocket: "readonly", process: "readonly", Buffer: "readonly", URL: "readonly" },
     },
   },
   {

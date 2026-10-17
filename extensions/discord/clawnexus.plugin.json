@@ -1,13 +1,13 @@
 {
   "id": "discord",
   "name": "Discord channel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "kind": "code",
   "sdkRange": "^0.3.0",
   "entry": "index.mjs",
   "provides": ["channel:discord"],
   "permissions": {
-    "network": ["discord.com", "gateway.discord.gg"],
+    "network": ["discord.com", "gateway.discord.gg", "cdn.discordapp.com", "media.discordapp.net"],
     "secrets": ["bot_token"]
   },
   "configSchema": {

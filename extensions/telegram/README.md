@@ -28,7 +28,7 @@ a domain or a certificate.
   messages. Group messages are always served at guest level, even from the owner. Add the bot to a group and, if
   you want it to see ordinary messages, turn off privacy mode with @BotFather (`/setprivacy`).
 - Replies are plain text, split at 4096 characters. In groups a reply points at the message it answers.
-- Photos, files, voice messages and stickers are noted and dropped. The plugin never downloads them.
+- Pictures, documents, audio and voice notes (up to 8 MB each, four per message) are downloaded from Telegram and given to the assistant, which accepts only images, PDF, audio and text, judged by their content. Videos, stickers and bigger files are noted but not taken.
 - Edited messages, channel posts, and messages from other bots are ignored.
 
 ## Settings

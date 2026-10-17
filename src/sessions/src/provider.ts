@@ -1,6 +1,16 @@
+import type { AttachmentRef } from "@clawnexus/blobs";
+
 export interface ProviderMessage {
   role: "user" | "assistant" | "system";
   content: string;
+  /** Files that came with this message (earlier ones are described, not resent). */
+  attachments?: AttachmentRef[];
+}
+
+/** A file attached to the message being answered, with a way to read it. */
+export interface ProviderAttachment extends AttachmentRef {
+  /** The file's bytes, or undefined if it is no longer available. */
+  read(): Buffer | undefined;
 }
 
 export interface ProviderRequest {
@@ -12,6 +22,8 @@ export interface ProviderRequest {
   signal: AbortSignal;
   /** Where the message being answered came from. External senders are untrusted and the model should be told so. */
   source?: { channel: string; sender: string; principal: "owner" | "guest" };
+  /** Files attached to the message being answered. Untrusted content from whoever sent them. */
+  attachments?: ProviderAttachment[];
   /** Notes to show the model this turn (memory). Recomputed every turn, so a provider that keeps its own conversation should resend it only when it changes. Absent when there is nothing to show. */
   system?: string;
 }

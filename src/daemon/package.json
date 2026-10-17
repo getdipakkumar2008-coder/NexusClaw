@@ -25,7 +25,8 @@
     "@clawnexus/config": "workspace:*",
     "@clawnexus/gateway": "workspace:*",
     "@clawnexus/sessions": "workspace:*",
-    "@clawnexus/store": "workspace:*"
+    "@clawnexus/store": "workspace:*",
+    "@clawnexus/vault": "workspace:*"
   },
   "devDependencies": {
     "ws": "^8.18.0",

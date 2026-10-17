@@ -1,4 +1,4 @@
-/* global process, setInterval, clearInterval */
+/* global process, setInterval, clearInterval, Buffer */
 // A tiny scripted ACP agent for tests. Behaviour is chosen with FAKE_MODE. Not shipped.
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -45,7 +45,7 @@ rl.on("line", async (line) => {
         result: {
           protocolVersion: 1,
           agentInfo: { name: "fake-harness", title: "Fake", version: "0" },
-          agentCapabilities: { loadSession: false },
+          agentCapabilities: { loadSession: false, promptCapabilities: Object.fromEntries((process.env.FAKE_CAPS ?? "").split(",").filter(Boolean).map((k) => [k, true])) },
           authMethods: mode === "needs-auth" ? [{ id: "fake_login", name: "Fake login" }] : [],
           _seenClientCaps: m.params?.clientCapabilities,
         },
@@ -64,6 +64,11 @@ rl.on("line", async (line) => {
       const s = sessions.get(sessionId);
       s.prompts++;
       if (mode === "crash") process.exit(7);
+      if (mode === "blocks") {
+        const kinds = m.params.prompt.map((b) => (b.type === "text" ? "text" : `${b.type}:${b.mimeType ?? b.resource?.mimeType}:${Buffer.from(b.data ?? b.resource?.blob, "base64").length}`));
+        chunk(sessionId, `blocks=${kinds.join(",")}|${m.params.prompt[0].text}`);
+        return send({ id: m.id, result: { stopReason: "end_turn" } });
+      }
       if (mode === "hang") {
         // waits for cancel
         await new Promise((r) => {

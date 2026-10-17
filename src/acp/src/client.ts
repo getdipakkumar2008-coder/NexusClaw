@@ -85,6 +85,8 @@ export class AcpConnection {
   private readonly exitSeen: Promise<void>;
   readonly peer: JsonRpcPeer;
   agentName = "unknown";
+  /** What the harness can be sent besides text. Nothing until it says so. */
+  promptCaps: { image: boolean; audio: boolean; embeddedContext: boolean } = { image: false, audio: false, embeddedContext: false };
   authMethods: Array<{ id: string; name: string }> = [];
 
   private constructor(
@@ -182,6 +184,8 @@ export class AcpConnection {
       );
     }
     if (isObj(r["agentInfo"])) this.agentName = str(r["agentInfo"]["name"]) ?? this.agentName;
+    const caps = isObj(r["agentCapabilities"]) && isObj(r["agentCapabilities"]["promptCapabilities"]) ? r["agentCapabilities"]["promptCapabilities"] : {};
+    this.promptCaps = { image: caps["image"] === true, audio: caps["audio"] === true, embeddedContext: caps["embeddedContext"] === true };
     if (Array.isArray(r["authMethods"])) {
       this.authMethods = r["authMethods"].filter(isObj).flatMap((m) => (str(m["id"]) ? [{ id: str(m["id"])!, name: str(m["name"]) ?? str(m["id"])! }] : []));
     }
@@ -211,7 +215,7 @@ export class AcpConnection {
    * Send one prompt and stream the reply text. Resolves with the stop reason.
    * On abort we ask the harness to cancel and, if it does not stop within `graceMs`, we end the process.
    */
-  async prompt(sessionId: string, text: string, o: { onText(t: string): void; signal?: AbortSignal; graceMs?: number }): Promise<string> {
+  async prompt(sessionId: string, input: string | Array<Record<string, unknown>>, o: { onText(t: string): void; signal?: AbortSignal; graceMs?: number }): Promise<string> {
     this.listeners.set(sessionId, (u) => {
       if (u["sessionUpdate"] === "agent_message_chunk" && isObj(u["content"]) && u["content"]["type"] === "text") {
         const t = str(u["content"]["text"]);
@@ -228,7 +232,7 @@ export class AcpConnection {
     if (o.signal?.aborted) onAbort();
     else o.signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      const r = await this.peer.request("session/prompt", { sessionId, prompt: [{ type: "text", text }] });
+      const r = await this.peer.request("session/prompt", { sessionId, prompt: typeof input === "string" ? [{ type: "text", text: input }] : input });
       const reason = isObj(r) ? str(r["stopReason"]) : undefined;
       if (!reason) throw new AcpError("HARNESS_PROTOCOL", "the harness ended a turn without a stop reason", "Report this with the harness name and version.");
       return reason;

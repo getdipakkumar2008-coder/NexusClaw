@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /** Semver of this SDK. Only symbols exported here are public API (docs/04 section 4). */
-export const SDK_VERSION = "0.3.0";
+export const SDK_VERSION = "0.3.1";
 
 export const pluginKindSchema = z.enum(["code", "bundle"]);
 
@@ -187,6 +187,13 @@ export interface ChannelInbound {
   isGroup: boolean;
   mentionsBot: boolean;
   ts?: number;
+  /**
+   * Files that came with the message. Put the file itself in `data` (base64, at most 8 MB; larger files are better
+   * left out, with just `name` and `bytes`). The Gateway decides what to accept from the file's CONTENT; `mimeType` is
+   * only a hint and is never believed. Only download from addresses the platform itself gave you, and send your token
+   * only to the platform's own hosts.
+   */
+  attachments?: Array<{ name?: string; mimeType?: string; bytes?: number; data?: string }>;
 }
 
 export type ChannelOutcome =

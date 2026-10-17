@@ -20,6 +20,7 @@ import {
   type ErrorBody,
 } from "@clawnexus/protocol";
 import { DeviceError, DeviceRegistry } from "@clawnexus/devices";
+import { BlobStore, isBlobId } from "@clawnexus/blobs";
 import { isLoopback, type Config } from "@clawnexus/config";
 import { EventLog, CursorExpiredError, openDb, type Db, type StoredEvent } from "@clawnexus/store";
 import { PairingError, PairingService } from "@clawnexus/pairing";
@@ -117,6 +118,7 @@ const DEVICE_METHODS: Record<string, DeviceScope> = {
   "session.create": "chat",
   "session.send": "chat",
   "session.cancel": "chat",
+  "blob.get": "read",
   "approval.decide": "approve",
 };
 
@@ -151,6 +153,7 @@ export class Gateway {
   private readonly vault: LocalVault;
   readonly memory: MemoryStore;
   readonly devices: DeviceRegistry;
+  readonly blobs: BlobStore;
   private readonly tls: { cert: string | Buffer; key: string | Buffer } | undefined;
   /** Host names the certificate is valid for, lower-case. Browsers only reach us under one of these. */
   private readonly certHosts: string[] = [];
@@ -228,7 +231,8 @@ export class Gateway {
     });
     this.vault = new LocalVault(opts.dataDir);
     this.plugins = new PluginHost({ dataDir: opts.dataDir, db: this.db, events: this.events, tools: this.tools, secrets: this.vault, channels: { attach: (a) => this.channels.attach(a), detach: (id) => this.channels.detach(id) }, now: this.o.now, ...opts.plugins });
-    this.sessions = opts.provider ? new SessionManager(this.db, this.events, opts.provider, { now: this.o.now, context: (s) => this.memoryContext(s), ...opts.sessions }) : undefined;
+    this.blobs = new BlobStore(join(opts.dataDir, "blobs"), this.db, { now: this.o.now });
+    this.sessions = opts.provider ? new SessionManager(this.db, this.events, opts.provider, { now: this.o.now, context: (s) => this.memoryContext(s), blobReader: (id) => this.blobs.read(id), ...opts.sessions }) : undefined;
 
     this.devices = new DeviceRegistry(this.db, { now: this.o.now, events: this.events });
     this.webchat = new WebChatAdapter({
@@ -237,7 +241,7 @@ export class Gateway {
       principalOf: (externalId) => this.pairing.principalOf({ channel: WEBCHAT_ID, accountId: "default", externalId }),
       now: this.o.now,
     });
-    this.channels = new ChannelManager({ db: this.db, events: this.events, pairing: this.pairing, sessions: this.sessions, now: this.o.now });
+    this.channels = new ChannelManager({ db: this.db, events: this.events, pairing: this.pairing, sessions: this.sessions, blobs: this.blobs, now: this.o.now });
     this.channels.register(this.webchat);
 
     const handler = (req: IncomingMessage, res: import("node:http").ServerResponse): void => this.handleHttp(req, res);
@@ -265,6 +269,7 @@ export class Gateway {
     await this.plugins.startEnabled().catch(() => undefined);
     await this.channels.start();
     this.ready = true;
+    this.gcBlobs();
     try {
       writeFileSync(
         join(dirname(this.tokenPath), ENDPOINT_FILE),
@@ -514,6 +519,23 @@ export class Gateway {
     if (grant) c.grant = grant;
     clearTimeout(c.helloTimer);
     return { protocol: PROTOCOL_VERSION, server: `${BRAND.name} ${VERSION}`, role: grant ? "agent" : "owner", latestSeq: this.events.latestSeq() };
+  }
+
+  /** Remove stored files that no message refers to any more (a session was deleted, a message never got written). */
+  gcBlobs(): { removed: number; freed: number } {
+    try {
+      const referenced = new Set<string>();
+      for (const r of this.db.prepare("SELECT attachments FROM messages WHERE attachments IS NOT NULL").all() as unknown as Array<{ attachments: string }>) {
+        try {
+          for (const a of JSON.parse(r.attachments) as Array<{ id?: unknown }>) if (typeof a.id === "string") referenced.add(a.id);
+        } catch {
+          /* a damaged row refers to nothing */
+        }
+      }
+      return this.blobs.gc(referenced);
+    } catch {
+      return { removed: 0, freed: 0 };
+    }
   }
 
   // ---------------- device sign-in (docs/03 section 3, ADR 0010) ----------------
@@ -859,8 +881,23 @@ export class Gateway {
       case "memory.erase":
         return this.memoryMethod(method, params);
 
+      case "blob.get": {
+        const p = z.strictObject({ id: z.string().min(1).max(100) }).parse(params);
+        const info = isBlobId(p.id) ? this.blobs.info(p.id) : undefined;
+        const bytes = info ? this.blobs.read(p.id) : undefined;
+        if (!info || !bytes) throw new MethodError(err("SESSION.NOT_FOUND", "no such attachment", "Attachments are listed on the messages of a session."));
+        return { id: info.id, mime: info.mime, bytes: bytes.length, data: bytes.toString("base64") };
+      }
       case "channel.list":
         return { channels: this.channels.list() };
+      case "channel.outbox":
+        return this.channels.outbox.summary();
+      case "channel.outbox.retry":
+        return { count: this.channels.retryOutbox() };
+      case "channel.outbox.purge": {
+        const p = z.strictObject({ all: z.boolean().default(false) }).parse(params ?? {});
+        return { count: this.channels.outbox.purge(p.all) };
+      }
       case "channel.webchat.link": {
         return this.webchat.createOwnerLink(this.origin);
       }
@@ -995,6 +1032,7 @@ export class Gateway {
         default: {
           const p = z.strictObject({ session: id }).parse(params);
           mgr.delete(p.session);
+          this.gcBlobs();
           return {};
         }
       }

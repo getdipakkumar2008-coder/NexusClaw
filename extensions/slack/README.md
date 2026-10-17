@@ -8,7 +8,7 @@ the plugin connects out to Slack, so you do not need a public address, a domain 
 1. Go to api.slack.com/apps and create an app (from scratch) in your workspace.
 2. **Socket Mode**: turn it on. Slack asks you to create an app-level token with the `connections:write` scope; copy it
    (it starts with `xapp-`).
-3. **OAuth & Permissions**: add the bot scopes `chat:write`, `im:history` and `app_mentions:read`. Install the app to
+3. **OAuth & Permissions**: add the bot scopes `chat:write`, `im:history`, `app_mentions:read` and `files:read`. Install the app to
    the workspace and copy the **Bot User OAuth Token** (it starts with `xoxb-`).
 4. **Event Subscriptions**: turn them on and subscribe the bot to the events `message.im` and `app_mention`. Nothing
    else is needed.
@@ -37,7 +37,7 @@ the plugin connects out to Slack, so you do not need a public address, a domain 
   chatter is never seen, because the plugin does not subscribe to it.
 - Replies are plain text, split at 3000 characters. Anything the model writes that looks like a mention (`@channel`,
   `@here`, a person) or a link is escaped, so a reply can never ping anyone.
-- Files are noted and dropped. The plugin never downloads them.
+- Files (up to 8 MB each, four per message) are downloaded from files.slack.com only, with the bot token, and given to the assistant, which accepts only images, PDF, audio and text, judged by their content. This needs the bot scope `files:read`. Anything else is noted but not taken.
 - Other bots, edits, deletions and the app's own messages are ignored.
 - Slack reconnects the socket from time to time; the plugin follows, and a message it had not acknowledged is resent by
   Slack and processed once.

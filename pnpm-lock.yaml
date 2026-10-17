@@ -75,8 +75,17 @@ importers:
         specifier: workspace:*
         version: link:../tools
 
+  src/blobs:
+    dependencies:
+      '@clawnexus/store':
+        specifier: workspace:*
+        version: link:../store
+
   src/channels:
     dependencies:
+      '@clawnexus/blobs':
+        specifier: workspace:*
+        version: link:../blobs
       '@clawnexus/pairing':
         specifier: workspace:*
         version: link:../pairing
@@ -129,6 +138,9 @@ importers:
       '@clawnexus/store':
         specifier: workspace:*
         version: link:../store
+      '@clawnexus/vault':
+        specifier: workspace:*
+        version: link:../vault
     devDependencies:
       '@types/ws':
         specifier: ^8.5.13
@@ -148,6 +160,9 @@ importers:
 
   src/gateway:
     dependencies:
+      '@clawnexus/blobs':
+        specifier: workspace:*
+        version: link:../blobs
       '@clawnexus/brand':
         specifier: workspace:*
         version: link:../../packages/brand
@@ -255,6 +270,9 @@ importers:
 
   src/sessions:
     dependencies:
+      '@clawnexus/blobs':
+        specifier: workspace:*
+        version: link:../blobs
       '@clawnexus/store':
         specifier: workspace:*
         version: link:../store

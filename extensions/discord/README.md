@@ -35,7 +35,7 @@ Discord, so you do not need a public address, a domain or a certificate.
   served at guest level, even from the owner. The bot's own mention is removed from the text the assistant sees.
 - Replies are plain text, split at 2000 characters. In servers a reply points at the message it answers. A reply can
   never ping anyone (`@everyone`, roles or people), whatever the model writes.
-- Attachments are noted and dropped. The plugin never downloads them.
+- Attachments (up to 8 MB each, four per message) are downloaded from Discord's own file hosts only and given to the assistant, which accepts only images, PDF, audio and text, judged by their content. Anything else is noted but not taken.
 - Other bots, webhooks and service messages are ignored.
 - If the connection drops it reconnects and resumes, so messages sent in the gap arrive once.
 

@@ -170,6 +170,11 @@ export async function runDoctor(o: DoctorOptions): Promise<Check[]> {
     }
   }
 
+  // Secrets: a vault with no key can never be opened, and plugins that need a secret would wait for ever.
+  if (existsSync(join(o.dataDir, "secrets.vault")) && !existsSync(join(o.dataDir, "vault.key"))) {
+    add({ id: "vault", status: "fail", message: "secrets.vault exists but vault.key is missing, so the secrets cannot be read", fix: `Put vault.key back from where you kept it, or move secrets.vault away and enter the secrets again with \`${BRAND.cli} plugins secret\`.` });
+  }
+
   // TLS: the certificate the Gateway would serve with
   if (g.tls.enabled) {
     const problems = tlsProblems(o.dataDir, Date.now(), platform);

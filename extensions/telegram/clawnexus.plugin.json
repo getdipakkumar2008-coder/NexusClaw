@@ -1,7 +1,7 @@
 {
   "id": "telegram",
   "name": "Telegram channel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "kind": "code",
   "sdkRange": "^0.3.0",
   "entry": "index.mjs",

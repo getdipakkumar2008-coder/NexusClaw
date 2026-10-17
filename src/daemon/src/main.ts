@@ -88,15 +88,22 @@ export async function main(argv: readonly string[], io: Io = systemIo()): Promis
       }
       case "backup": {
         const out = strFlag(p, "out") ?? join(dataDir, "backups", `backup-${new Date().toISOString().replace(/[:.]/g, "-")}`);
-        const m = createBackup(dataDir, out, { includeWorkspace: p.flags["include-workspace"] === true });
-        io.out(json ? `${JSON.stringify({ out, ...m }, null, 2)}\n` : `Backup written and verified: ${out}\n  ${m.files.length} file(s); the Gateway token is not included.\n`);
+        const m = createBackup(dataDir, out, { includeWorkspace: p.flags["include-workspace"] === true, includeKey: p.flags["include-key"] === true });
+        const note = m.files.some((f) => f.name === "vault.key")
+          ? "  WARNING: the vault key IS included, so this backup can open your secrets. Keep it as safe as the key itself.\n"
+          : m.files.some((f) => f.name === "secrets.vault")
+            ? "  The secrets are included encrypted but their key is not; after a restore, enter them again (or make the backup with --include-key).\n"
+            : "";
+        io.out(json ? `${JSON.stringify({ out, ...m }, null, 2)}\n` : `Backup written and verified: ${out}\n  ${m.files.length} file(s); the Gateway token is not included.\n${note}`);
         return 0;
       }
       case "restore": {
         const dir = p.positionals[1];
         if (!dir) throw new CliError("USAGE", "missing backup directory", `Usage: ${BRAND.cli} restore <DIR> [--force]`);
         const r = await restoreBackup(dir, dataDir, { force: p.flags.force === true, ...(port === undefined ? {} : { port }) });
-        io.out(`Restored from ${dir}.${r.movedAside ? ` The previous database was kept as ${r.movedAside}.` : ""}\nStart the Gateway again and run \`${BRAND.cli} doctor\`.\n`);
+        const kept = r.setAside.length ? `\nFolders that were here were kept beside the restored ones: ${r.setAside.join(", ")}.` : "";
+        const vault = r.vault === "set-aside" ? `\nThe backed-up secrets cannot be opened here (their key is not in the backup), so they were set aside. Plugins that need a secret will say so; enter it again with \`${BRAND.cli} plugins secret\`.` : "";
+        io.out(`Restored from ${dir}.${r.movedAside ? ` The previous database was kept as ${r.movedAside}.` : ""}${kept}${vault}\nStart the Gateway again and run \`${BRAND.cli} doctor\`.\n`);
         return 0;
       }
       default:

@@ -18,3 +18,4 @@ export {
   type SendTarget,
 } from "./types.js";
 export { WebChatAdapter, WEBCHAT_ID, senderIdOf, type WebChatOptions } from "./webchat.js";
+export { Outbox, type OutboxRow, type OutboxOptions } from "./outbox.js";

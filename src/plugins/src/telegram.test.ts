@@ -28,6 +28,9 @@ class FakeTelegram {
   private waiters: Array<() => void> = [];
   private nextUpdate = 1;
   private nextMessage = 5000;
+  /** Files a person has sent, by Telegram file id. */
+  readonly files = new Map<string, Buffer>();
+  readonly fileGets: string[] = [];
   validToken = TOKEN;
   failSends = 0;
   rateLimitOnce = false;
@@ -65,6 +68,13 @@ class FakeTelegram {
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     let raw = "";
     for await (const c of req) raw += c as string;
+    const fileUrl = /^\/file\/bot([^/]+)\/dl\/(.+)$/.exec(req.url ?? "");
+    if (fileUrl) {
+      this.fileGets.push(`${fileUrl[1]}:${fileUrl[2]}`);
+      const bytes = fileUrl[1] === this.validToken ? this.files.get(fileUrl[2]!) : undefined;
+      res.writeHead(bytes ? 200 : 404, { "content-type": "application/octet-stream" });
+      return void res.end(bytes ?? "not found");
+    }
     const m = /^\/bot([^/]+)\/(\w+)$/.exec(req.url ?? "");
     const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
     if (!m) return this.reply(res, 404, { ok: false, error_code: 404, description: "Not Found" });
@@ -103,6 +113,10 @@ class FakeTelegram {
         this.sent.push({ chat_id: body["chat_id"] as number, text: body["text"] as string, ...(body["reply_parameters"] ? { reply_parameters: body["reply_parameters"] as { message_id: number } } : {}) });
         return this.reply(res, 200, { ok: true, result: { message_id: this.nextMessage++ } });
       }
+      case "getFile":
+        return this.files.has(String(body["file_id"]))
+          ? this.reply(res, 200, { ok: true, result: { file_id: body["file_id"], file_path: `dl/${String(body["file_id"])}` } })
+          : this.reply(res, 400, { ok: false, error_code: 400, description: "Bad Request: wrong file_id" });
       case "sendChatAction":
         this.actions.push(body["chat_id"] as number);
         return this.reply(res, 200, { ok: true, result: true });
@@ -288,7 +302,85 @@ describe("the Telegram plugin", () => {
     await waitFor(() => fake.sent.some((s) => s.text.includes("echo: what is this?")));
     expect(fake.sent.some((s) => s.chat_id === 55)).toBe(false);
     expect(r.bed.provider?.calls).toHaveLength(1);
-    expect(fake.calls.some((c) => c.method === "getFile")).toBe(false);
+    // the pictures could not be fetched (Telegram does not know them), which is noted, and the question is still answered
+    expect(r.bed.provider?.calls[0]?.messages.at(-1)?.attachments?.[0]).toMatchObject({ name: "photo.jpg", dropped: expect.stringMatching(/not downloaded/) });
+  });
+
+  describe("files", () => {
+    const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("....IHDR telegram picture")]);
+    const OGG = Buffer.concat([Buffer.from("OggS"), Buffer.from([0, 2, 0, 0]), Buffer.from("OpusHead voice")]);
+    const from = { id: 20, is_bot: false, first_name: "Fay" };
+    const dm = { from, chat: { id: 20, type: "private" } };
+    async function ready(): Promise<Awaited<ReturnType<typeof rig>>> {
+      const r = await rig();
+      await waitFor(() => channelState(r.bed) === "connected", 10_000);
+      r.bed.pairing.registerOwner({ channel: "telegram", accountId: "default", externalId: "20" });
+      return r;
+    }
+
+    it("downloads the biggest picture that fits, and the assistant gets it as an image", async () => {
+      const r = await ready();
+      fake.files.set("small", Buffer.from("tiny"));
+      fake.files.set("big", PNG);
+      fake.push({ ...dm, photo: [{ file_id: "small", file_size: 4 }, { file_id: "big", file_size: PNG.length }], caption: "what is this?" });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      const att = r.bed.provider!.calls[0]!.attachments!;
+      expect(att).toHaveLength(1);
+      expect(att[0]).toMatchObject({ name: "photo.jpg", mime: "image/png" }); // what it is, not what Telegram calls it
+      expect(att[0]!.read()).toEqual(PNG);
+      expect(fake.fileGets).toEqual([`${TOKEN}:big`]);
+    });
+
+    it("downloads a voice note and a document, and refuses a program sent as a document", async () => {
+      const r = await ready();
+      fake.files.set("v1", OGG);
+      fake.files.set("d1", Buffer.concat([Buffer.from("MZ"), Buffer.from([0x90, 0, 3, 0])]));
+      fake.push({ ...dm, voice: { file_id: "v1", mime_type: "audio/ogg", file_size: OGG.length }, document: { file_id: "d1", file_name: "invoice.pdf", mime_type: "application/pdf", file_size: 6 }, caption: "listen" });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      const refs = r.bed.provider!.calls[0]!.messages.at(-1)!.attachments!;
+      expect(refs.find((x) => x.name === "voice.ogg")).toMatchObject({ mime: "audio/ogg" });
+      expect(refs.find((x) => x.name === "invoice.pdf")?.dropped).toMatch(/not accepted/);
+    });
+
+    it("notes videos and stickers without fetching them, and does not fetch what is too big", async () => {
+      const r = await ready();
+      fake.files.set("huge", Buffer.from("x"));
+      fake.push({ ...dm, video: { file_id: "vid", file_size: 100 }, sticker: { file_id: "stk" }, document: { file_id: "huge", file_name: "big.bin", file_size: 50 * 1024 * 1024 }, caption: "look" });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      expect(fake.fileGets).toEqual([]);
+      expect(fake.calls.some((c) => c.method === "getFile")).toBe(false);
+      const refs = r.bed.provider!.calls[0]!.messages.at(-1)!.attachments!;
+      expect(refs.map((x) => x.name).sort()).toEqual(["big.bin", "sticker", "video"]);
+      expect(refs.every((x) => x.id === undefined && x.dropped)).toBe(true);
+    });
+
+    it("still answers when a download fails, and says the file was not available", async () => {
+      const r = await ready();
+      fake.files.set("gone", PNG);
+      const original = fake.files.get.bind(fake.files);
+      fake.files.get = (k: string) => (k === "gone" ? undefined : original(k)); // listed by getFile, missing from the file server
+      fake.files.set("ok", PNG);
+      fake.push({ ...dm, photo: [{ file_id: "gone", file_size: 30 }], caption: "first" });
+      await waitFor(() => fake.sent.some((s) => s.text.includes("echo: first")));
+      expect(r.bed.provider!.calls[0]!.messages.at(-1)!.attachments![0]!.dropped).toMatch(/not downloaded/);
+    });
+
+    it("takes a picture with no caption as a question of its own", async () => {
+      const r = await ready();
+      fake.files.set("only", PNG);
+      fake.push({ ...dm, photo: [{ file_id: "only", file_size: PNG.length }] });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      expect(r.bed.provider!.calls[0]!.attachments).toHaveLength(1);
+    });
+
+    it("sends the token only to the Bot API address while fetching", async () => {
+      const r = await ready();
+      fake.files.set("tok", PNG);
+      fake.push({ ...dm, photo: [{ file_id: "tok", file_size: PNG.length }], caption: "x" });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      expect(fake.fileGets.every((g) => g.startsWith(`${TOKEN}:`))).toBe(true);
+      expect(JSON.stringify(r.bed.events.readSince(0, { limit: 5000 }))).not.toContain(TOKEN);
+    });
   });
 
   it("answers group messages as a reply to the asking message, and only when mentioned or replied to", async () => {

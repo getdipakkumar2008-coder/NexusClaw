@@ -30,6 +30,8 @@ class FakeDiscord {
   readonly restAuth: Array<string | undefined> = [];
   readonly identifies: Array<Record<string, unknown>> = [];
   readonly resumes: Array<Record<string, unknown>> = [];
+  readonly files = new Map<string, Buffer>();
+  readonly cdnGets: Array<{ url: string; auth: string | undefined }> = [];
   connections = 0;
   validToken = TOKEN;
   failSends = 0;
@@ -112,6 +114,13 @@ class FakeDiscord {
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     let raw = "";
     for await (const c of req) raw += c as string;
+    if (req.method === "GET" && (req.url ?? "").startsWith("/cdn/")) {
+      // Discord's file hosts need no credentials; seeing one here would mean the bot token leaked to a file download.
+      this.cdnGets.push({ url: req.url!, auth: req.headers["authorization"] });
+      const bytes = this.files.get(req.url!.slice(5));
+      res.writeHead(bytes ? 200 : 404);
+      return void res.end(bytes ?? "gone");
+    }
     const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
     const auth = req.headers["authorization"];
     this.restAuth.push(auth);
@@ -380,6 +389,66 @@ describe("the Discord plugin", () => {
     await waitFor(() => fake.sent.some((s) => s.content.includes("echo: what is this?")));
     expect(fake.sent.some((s) => s.channel === "55")).toBe(false);
     expect(r.bed.provider?.calls).toHaveLength(1);
+  });
+
+  describe("attachments", () => {
+    const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("....IHDR discord picture")]);
+    const who = person(8);
+    async function ready(): Promise<Awaited<ReturnType<typeof rig>>> {
+      const r = await rig();
+      await waitFor(() => channelState(r.bed) === "connected", 10_000);
+      r.bed.pairing.registerOwner({ channel: "discord", accountId: "default", externalId: who.id });
+      return r;
+    }
+
+    it("downloads a file from Discord's file host and the assistant gets it, with no credentials sent to the download", async () => {
+      const r = await ready();
+      fake.files.set("pic.png", PNG);
+      fake.push({ channel_id: "740", author: who, content: "what is this?", mentions: [], attachments: [{ filename: "pic.png", content_type: "text/html", size: PNG.length, url: `${fake.base}/cdn/pic.png` }] });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      const att = r.bed.provider!.calls[0]!.attachments!;
+      expect(att[0]).toMatchObject({ name: "pic.png", mime: "image/png" }); // not "text/html", whatever Discord was told
+      expect(att[0]!.read()).toEqual(PNG);
+      expect(fake.cdnGets).toEqual([{ url: "/cdn/pic.png", auth: undefined }]);
+    });
+
+    it("will not fetch a file from an address that is not Discord's, whatever the message says", async () => {
+      const r = await ready();
+      fake.push({
+        channel_id: "741",
+        author: who,
+        content: "see these",
+        mentions: [],
+        attachments: [
+          { filename: "a.png", size: 10, url: "http://evil.example.com/a.png" },
+          { filename: "b.png", size: 10, url: "https://cdn.discordapp.com.evil.example/b.png" },
+          { filename: "c.png", size: 10, url: "file:///etc/passwd" },
+          { filename: "d.png", size: 10, url: "http://169.254.169.254/latest/meta-data/" },
+          { filename: "e.png", size: 10, url: "not a url" },
+        ],
+      });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      const refs = r.bed.provider!.calls[0]!.messages.at(-1)!.attachments!;
+      expect(refs.every((x) => x.id === undefined && /not downloaded/.test(x.dropped ?? ""))).toBe(true);
+      expect(fake.cdnGets).toEqual([]);
+    });
+
+    it("does not fetch what is declared too big, and refuses a file that turns out bigger than it said", async () => {
+      const r = await ready();
+      fake.files.set("big.bin", Buffer.alloc(9 * 1024 * 1024, 65));
+      fake.push({ channel_id: "742", author: who, content: "big", mentions: [], attachments: [{ filename: "big.bin", size: 99 * 1024 * 1024, url: `${fake.base}/cdn/big.bin` }, { filename: "liar.txt", size: 10, url: `${fake.base}/cdn/big.bin` }] });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      expect(fake.cdnGets).toHaveLength(1); // only the one that claimed to be small was tried, and it was cut off
+      expect(r.bed.provider!.calls[0]!.messages.at(-1)!.attachments!.every((x) => x.id === undefined)).toBe(true);
+    });
+
+    it("answers a picture with no words", async () => {
+      const r = await ready();
+      fake.files.set("only.png", PNG);
+      fake.push({ channel_id: "743", author: who, content: "", mentions: [], attachments: [{ filename: "only.png", size: PNG.length, url: `${fake.base}/cdn/only.png` }] });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      expect(r.bed.provider!.calls[0]!.attachments).toHaveLength(1);
+    });
   });
 
   it("waits out Discord's rate limit once instead of dropping the reply", async () => {

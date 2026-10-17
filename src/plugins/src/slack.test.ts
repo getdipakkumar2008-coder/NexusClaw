@@ -30,6 +30,8 @@ class FakeSlack {
   readonly sent: Sent[] = [];
   readonly auths: Array<string | undefined> = [];
   readonly acked = new Set<string>();
+  readonly files = new Map<string, Buffer>();
+  readonly fileGets: Array<{ url: string; auth: string | undefined }> = [];
   opens = 0;
   connections = 0;
   validBot = BOT_TOKEN;
@@ -104,6 +106,13 @@ class FakeSlack {
     for await (const c of req) raw += c as string;
     const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
     const auth = req.headers["authorization"];
+    if (req.method === "GET" && (req.url ?? "").startsWith("/files/")) {
+      // Slack's private file URLs need the bot token; record what was presented.
+      this.fileGets.push({ url: req.url!, auth });
+      const bytes = auth === `Bearer ${this.validBot}` ? this.files.get(req.url!.slice(7)) : undefined;
+      res.writeHead(bytes ? 200 : 404);
+      return void res.end(bytes ?? "not found");
+    }
     this.auths.push(auth);
     const method = (req.url ?? "").replace(/^\//, "");
     if (method === "apps.connections.open") {
@@ -385,6 +394,66 @@ describe("the Slack plugin", () => {
     await waitFor(() => fake.sent.some((s) => s.text.includes("echo: what is this?")));
     expect(fake.sent.every((s) => s.channel === "D730")).toBe(true);
     expect(r.bed.provider?.calls).toHaveLength(1);
+  });
+
+  describe("files", () => {
+    const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("....IHDR slack picture")]);
+    const who = userId(58);
+    async function ready(): Promise<Awaited<ReturnType<typeof rig>>> {
+      const r = await rig();
+      await waitFor(() => channelState(r.bed) === "connected", 10_000);
+      r.bed.pairing.registerOwner({ channel: "slack", accountId: "default", externalId: who });
+      return r;
+    }
+    const dm = { type: "message", channel_type: "im", channel: "D750", user: who, subtype: "file_share" };
+
+    it("downloads a private file with the bot token, and the assistant gets it", async () => {
+      const r = await ready();
+      fake.files.set("pic.png", PNG);
+      fake.event({ ...dm, text: "what is this?", files: [{ name: "pic.png", mimetype: "application/zip", size: PNG.length, url_private_download: `${fake.base}/files/pic.png` }] });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      const att = r.bed.provider!.calls[0]!.attachments!;
+      expect(att[0]).toMatchObject({ name: "pic.png", mime: "image/png" });
+      expect(att[0]!.read()).toEqual(PNG);
+      expect(fake.fileGets).toEqual([{ url: "/files/pic.png", auth: `Bearer ${BOT_TOKEN}` }]);
+    });
+
+    it("never sends the bot token to an address that is not Slack's, however a file is described", async () => {
+      const r = await ready();
+      // a second server standing in for an attacker's host: it must see no request at all
+      const seen: Array<string | undefined> = [];
+      const evil = createServer((req, res) => (seen.push(req.headers["authorization"]), res.writeHead(200).end("x")));
+      await new Promise<void>((resolve) => evil.listen(0, "127.0.0.1", resolve));
+      const evilBase = `http://127.0.0.1:${(evil.address() as { port: number }).port}`;
+      try {
+        fake.event({
+          ...dm,
+          text: "look",
+          files: [
+            { name: "a.png", size: 5, url_private: `${evilBase}/a.png` },
+            { name: "b.png", size: 5, url_private_download: "https://files.slack.com.evil.example/b.png" },
+            { name: "c.png", size: 5, url_private: "file:///etc/passwd" },
+          ],
+        });
+        await waitFor(() => r.bed.provider?.calls.length === 1);
+        await new Promise((res) => setTimeout(res, 200));
+        expect(seen).toEqual([]);
+        expect(fake.fileGets).toEqual([]);
+        expect(r.bed.provider!.calls[0]!.messages.at(-1)!.attachments!.every((x) => x.id === undefined)).toBe(true);
+      } finally {
+        evil.closeAllConnections();
+        await new Promise<void>((resolve) => evil.close(() => resolve()));
+      }
+    });
+
+    it("answers a file with no words, and notes one it could not get", async () => {
+      const r = await ready();
+      fake.files.set("only.png", PNG);
+      fake.event({ ...dm, text: "", files: [{ name: "only.png", size: PNG.length, url_private_download: `${fake.base}/files/only.png` }, { name: "missing.png", size: 5, url_private_download: `${fake.base}/files/missing.png` }] });
+      await waitFor(() => r.bed.provider?.calls.length === 1);
+      const refs = r.bed.provider!.calls[0]!.messages.at(-1)!.attachments!;
+      expect(refs.map((x) => (x.id ? "kept" : "dropped"))).toEqual(["kept", "dropped"]);
+    });
   });
 
   it("waits out Slack's rate limit once instead of dropping the reply", async () => {
