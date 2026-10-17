@@ -14,9 +14,21 @@
 |---|---|
 | Local CLI/TUI on same host | Unix socket / named pipe with OS-user check, or token file with 0600 perms |
 | Web Control UI | Session cookie after token login; SameSite=Strict; CSRF token; Origin check |
-| Paired device (apps) | Device keypair (Ed25519). Challenge–response on every connect; short-lived access token (≤15 min) refreshed by signature. Revocable. |
+| Paired device (apps, other computers) | Device keypair (Ed25519), implemented (see "Device sign-in" below). Challenge–response on every connect; the sign-in lasts at most 15 minutes and is renewed by signing a new challenge. Revocable at once. |
 | Plugin/extension processes | Separate internal channel, capability-scoped |
 Roles: `owner`, `operator` (team), `viewer`, `device:<scope>`. Every request authorised against role + method scope. Failed auth rate-limited; lockout with backoff.
+
+### Device sign-in (WP5)
+- **Keys.** A device makes an Ed25519 key pair and keeps the private half. The Gateway stores only the public half (32 bytes, base64url). Keys that make a signature meaningless (zero, one, the field prime and its neighbours, either sign) are refused.
+- **Pairing.** The owner runs `device.pair.begin`: a one-time code of 10 characters from an alphabet without 0/O/1/I/L, valid for 5 minutes, kept only as a hash in memory (a restart cancels it), at most 5 waiting and 20 devices. The device sends `hello` with `auth.pair`; on success it is signed in at once and receives its id. Wrong codes count against the sender's address and against everyone together: 10 wrong guesses cancel every waiting code.
+- **Signing in.** `hello` with `auth.device {id}` returns `challenge {nonce, expiresInMs}` (32 random bytes, 30 s, single use, spent even by a wrong answer). The device answers `auth.verify {signature}`: Ed25519 over the UTF-8 bytes `clawnexus-device-auth-v1\n<deviceId>\n<nonce>\nconnect`. A recorded answer is useless: the next challenge differs, and the purpose word stops a sign-in answer being used to extend a sign-in.
+- **Lease.** A device's sign-in lasts 15 minutes. Before then it sends `auth.challenge` then `auth.refresh` (same message with purpose `refresh`); otherwise the Gateway closes the connection with code 4401. There is no bearer token to steal: the private key never leaves the device.
+- **Scopes.** `read`: `status`, `events.subscribe/unsubscribe`, `session.list/get`, `approval.list`. `chat`: `session.create/send/cancel` (messages are recorded as from `device:<id>`). `approve`: `approval.decide` (recorded as decided by `device:<id>`). Everything else (tools, plugins, memory, pairing, other devices, session export/delete) is the owner's alone and returns `AUTH.FORBIDDEN` naming the scope that would be needed.
+- **Revocation.** `device.revoke` closes that device's connections (4401) and refuses it afterwards (`AUTH.REVOKED`); the record stays, marked revoked.
+- **Errors.** `AUTH.BAD_DEVICE`, `AUTH.REVOKED`, `AUTH.BAD_PAIRING_CODE`, `AUTH.PAIRING`, `AUTH.NO_CHALLENGE`, `AUTH.CHALLENGE_EXPIRED`, `AUTH.BAD_SIGNATURE`, `AUTH.LOCKED`.
+
+### TLS (WP5)
+`gateway.tls.enabled` serves HTTPS and secure WebSocket (TLS 1.2 or later) from `<data>/tls/cert.pem` and `key.pem`, which must match; the Gateway will not start otherwise. Binding beyond loopback requires TLS, or `gateway.insecureAcknowledged`. The Host header must be a loopback name, the bound address, or a name in the certificate's subject alternative names, so a page on another site cannot reach the Gateway by rebinding a name it controls. `tls init` makes a self-signed ECDSA P-256 certificate (server authentication only, not a CA); a certificate from an authority can be dropped in instead. Clients trust it by its SHA-256 fingerprint (`--fingerprint`, checked before anything is sent) or by the certificate file (`--ca`). While running, the Gateway writes `<data>/gateway.endpoint` (address and fingerprint) so commands on the same computer find it; it is removed on shutdown.
 
 ## 4. Frame format
 ```jsonc
@@ -32,7 +44,8 @@ Max frame 1 MiB; larger payloads via `/v1/upload` + blob reference.
 ## 5. Methods (v1 set)
 | Group | Methods |
 |---|---|
-| connect | `hello`, `auth.challenge`, `auth.verify`, `auth.refresh` |
+| connect | `connection.hello` (`auth` is exactly one of `token`, `device:{id}`, `pair:{code, publicKey, name?}`), `auth.verify {signature}`, and for a signed-in device `auth.challenge`, `auth.refresh {signature}` |
+| devices (owner only) | `device.pair.begin {name?, scopes?}` → `{code, expiresAt, scopes, url, fingerprint?}`, `device.list`, `device.revoke {id}` |
 | sessions | `session.list`, `session.get`, `session.create`, `session.send`, `session.cancel`, `session.export`, `session.delete` |
 | approvals | `approval.list`, `approval.decide` (owner); `approval.status` (tool bridge, own approvals only) |
 | channels (owner only) | `channel.list`, `channel.webchat.link`, `pairing.owner` (register your own identity on a channel) |

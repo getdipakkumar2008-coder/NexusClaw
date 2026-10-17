@@ -8,6 +8,8 @@ import { CliError, type Io } from "@clawnexus/cli";
 import { Gateway, startGateway } from "@clawnexus/gateway";
 import { FakeProvider } from "@clawnexus/sessions";
 import { loadConfig } from "./configfile.js";
+import { RotatingLog, attachOperationalLog, logPath } from "./logfile.js";
+import { loadTls } from "./tlsinit.js";
 import { BRIDGE_ENV } from "./mcpbridge.js";
 
 const LOCK_FILE = "gateway.lock";
@@ -105,6 +107,7 @@ export async function startFromConfig(o: ServeOptions): Promise<Running> {
                     env: [
                       { name: BRIDGE_ENV.url, value: m.url },
                       { name: BRIDGE_ENV.token, value: m.token },
+                      ...(m.pin ? [{ name: BRIDGE_ENV.pin, value: m.pin }] : []),
                     ],
                   },
                 ],
@@ -118,9 +121,12 @@ export async function startFromConfig(o: ServeOptions): Promise<Running> {
           ...(bridge ? { bridge } : {}),
         }) : undefined;
     const provider = o.fakeProvider ? new FakeProvider({ chunkSize: 6 }) : acp;
+    const tls = config.gateway.tls.enabled ? loadTls(o.dataDir) : undefined;
     const started = await startGateway({
       dataDir: o.dataDir,
       config,
+      ...(tls ? { tls } : {}),
+      ...(config.gateway.insecureAcknowledged ? { insecure: true } : {}),
       ...(o.port === undefined ? {} : { port: o.port }),
       ...(provider ? { provider } : {}),
     }).catch(async (e: unknown) => {
@@ -153,8 +159,14 @@ export async function startFromConfig(o: ServeOptions): Promise<Running> {
 
 /** Foreground `gateway run`: starts, prints where it listens, and stops cleanly on Ctrl-C / SIGTERM. */
 export async function runGateway(o: ServeOptions): Promise<number> {
-  const g = await startFromConfig(o);
-  o.io.out(`${BRAND.name} Gateway listening on ws://${g.host}:${g.port}/v1/ws (data: ${o.dataDir})\n`);
+  const log = new RotatingLog(logPath(o.dataDir));
+  const g = await startFromConfig(o).catch((e: unknown) => {
+    log.write("error", "gateway.start_failed", { reason: e instanceof Error ? e.message : String(e) });
+    throw e;
+  });
+  const detach = attachOperationalLog(g.gateway.events, log);
+  log.write("info", "gateway.listening", { host: g.host, port: g.port, dataDir: o.dataDir, provider: g.hasProvider });
+  o.io.out(`${BRAND.name} Gateway listening on ${g.gateway.url.startsWith("wss") ? "wss" : "ws"}://${g.host.includes(":") ? `[${g.host}]` : g.host}:${g.port}/v1/ws (data: ${o.dataDir})\n`);
   if (o.fakeProvider) o.io.err("Warning: running with the built-in echo provider. No model is connected.\n");
   else if (g.hasProvider) o.io.out("Model provider: the configured harness starts on the first chat.\n");
   else o.io.err(`Note: no model provider is configured; \`chat\` will say so. Run \`${BRAND.cli} setup --harness claude\` (or codex, cursor, gemini), or use --fake-provider to try the flow.\n`);
@@ -164,6 +176,9 @@ export async function runGateway(o: ServeOptions): Promise<number> {
     process.once("SIGTERM", done);
   });
   o.io.out("Shutting down...\n");
+  log.write("info", "gateway.stopping");
+  detach();
   await g.stop();
+  log.write("info", "gateway.stopped");
   return 0;
 }

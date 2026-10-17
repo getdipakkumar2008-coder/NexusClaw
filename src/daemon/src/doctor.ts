@@ -1,12 +1,16 @@
 import { chmodSync, existsSync, mkdirSync, statSync, statfsSync } from "node:fs";
 import { get } from "node:http";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { HarnessError, planLaunch, resolveSpec } from "@clawnexus/acp";
 import { BRAND } from "@clawnexus/brand";
 import { isLoopback } from "@clawnexus/config";
 import { inspectDb } from "@clawnexus/store";
 import { defaultConfig, loadConfig, migrateConfigFile, writeConfig } from "./configfile.js";
+import { serviceStatus } from "./service.js";
+import { entryScript } from "./servicecmd.js";
+import { tlsProblems } from "./tlsinit.js";
 
 export type CheckStatus = "ok" | "warn" | "fail";
 export interface Check {
@@ -166,12 +170,28 @@ export async function runDoctor(o: DoctorOptions): Promise<Check[]> {
     }
   }
 
+  // TLS: the certificate the Gateway would serve with
+  if (g.tls.enabled) {
+    const problems = tlsProblems(o.dataDir, Date.now(), platform);
+    if (problems.length === 0) add({ id: "tls", status: "ok", message: "TLS certificate present, matching its key and not about to expire" });
+    for (const p of problems) add({ id: "tls", status: p.level, message: p.message, fix: p.fix });
+  }
+
   // Port / running state
   const port = o.port ?? g.port;
   const state = await probeHealth(port);
   if (state === "gateway") add({ id: "port", status: "ok", message: `a Gateway is running on port ${port}` });
   else if (state === "other" || !(await portFree(port))) add({ id: "port", status: "warn", message: `port ${port} is in use by another program`, fix: `Stop it, or set gateway.port to a free port.` });
   else add({ id: "port", status: "ok", message: `port ${port} is free` });
+
+  // Background service: looked at only if one is installed, and never started or stopped from here.
+  try {
+    const st = await serviceStatus({ platform, home: homedir(), env: process.env, node: process.execPath, script: entryScript(), dataDir: resolve(o.dataDir) }, async () => ({ code: 1, stdout: "", stderr: "" }));
+    if (st.installed && st.problems.length === 0) add({ id: "service", status: "ok", message: `background service installed (${st.kind})` });
+    else if (st.installed) add({ id: "service", status: "warn", message: st.problems.join("; "), fix: `Run \`${BRAND.cli} service install\` again from the program and data directory you want it to use.` });
+  } catch {
+    /* an unsupported system or an odd path: there is nothing useful to say */
+  }
 
   return checks;
 }

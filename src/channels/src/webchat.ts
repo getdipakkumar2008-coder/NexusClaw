@@ -19,6 +19,8 @@ export interface WebChatOptions {
    * authenticated local surface can mint.
    */
   registerOwner(senderId: string, display: string): void;
+  /** How the page is served; a browser's Origin header must match it. Default "http". */
+  scheme?: "http" | "https";
   /** Read-only view of how the router sees a sender. */
   principalOf(senderId: string): "owner" | "guest" | "unpaired";
   now?: () => number;
@@ -175,7 +177,7 @@ export class WebChatAdapter implements ChannelAdapter {
     // Only the page we serve may connect from a browser: a web page on another site must not be able to open this socket.
     const origin = req.headers.origin;
     const host = req.headers.host;
-    if (origin !== undefined && (host === undefined || origin.toLowerCase() !== `http://${host.toLowerCase()}`)) return reject("403 Forbidden");
+    if (origin !== undefined && (host === undefined || origin.toLowerCase() !== `${this.o.scheme ?? "http"}://${host.toLowerCase()}`)) return reject("403 Forbidden");
     if (this.conns.size >= (this.o.maxConnections ?? 100)) return reject("503 Service Unavailable");
     this.wss.handleUpgrade(req, socket, Buffer.alloc(0), (ws) => this.wss?.emit("connection", ws, req));
     return true;

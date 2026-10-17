@@ -1,7 +1,7 @@
 import { GatewayToolBackend, runMcpServer } from "@clawnexus/acp";
 import { GatewayClient } from "@clawnexus/cli";
 
-export const BRIDGE_ENV = { url: "CLAWNEXUS_BRIDGE_URL", token: "CLAWNEXUS_BRIDGE_TOKEN", waitSeconds: "CLAWNEXUS_BRIDGE_WAIT_S" } as const;
+export const BRIDGE_ENV = { url: "CLAWNEXUS_BRIDGE_URL", token: "CLAWNEXUS_BRIDGE_TOKEN", waitSeconds: "CLAWNEXUS_BRIDGE_WAIT_S", pin: "CLAWNEXUS_BRIDGE_PIN" } as const;
 
 /**
  * `clawnexus mcp-bridge`: started by the model's harness (not by a person) to give the model the Gateway's tools.
@@ -17,7 +17,7 @@ export async function runMcpBridge(env: NodeJS.ProcessEnv, stdin: NodeJS.Readabl
   }
   let gateway: GatewayClient;
   try {
-    gateway = await GatewayClient.connect(url, token);
+    gateway = await GatewayClient.connect(url, token, env[BRIDGE_ENV.pin] ? { pin: env[BRIDGE_ENV.pin] as string } : {});
   } catch (e) {
     stderr(`mcp-bridge could not reach the Gateway: ${e instanceof Error ? e.message : "unknown error"}\n`);
     return 1;

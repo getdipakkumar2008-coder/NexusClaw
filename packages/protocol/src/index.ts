@@ -1,4 +1,7 @@
 import { z } from "zod";
+import { DEVICE_ID } from "./device.js";
+
+export * from "./device.js";
 
 /** Protocol version negotiated in `hello` (docs/03 section 2). Minor bumps are additive only. */
 export const PROTOCOL_VERSION = { major: 1, minor: 0 } as const;
@@ -111,7 +114,20 @@ export const helloParamsSchema = z.strictObject({
   protocol: z.strictObject({ major: z.number().int(), minor: z.number().int().nonnegative() }),
   client: z.strictObject({ kind: z.string().min(1), version: z.string().min(1) }),
   capabilities: z.array(z.string()).default([]),
-  auth: z.strictObject({ token: z.string().min(1).max(512) }).optional(),
+  /**
+   * Exactly one way to prove who is connecting:
+   * - `token`: the owner token, or a tool-bridge credential;
+   * - `device`: a paired device; the Gateway answers with a challenge to sign (`auth.verify`);
+   * - `pair`: a new device using a one-time code from the owner, registering its public key.
+   */
+  auth: z
+    .strictObject({
+      token: z.string().min(1).max(512).optional(),
+      device: z.strictObject({ id: z.string().regex(DEVICE_ID) }).optional(),
+      pair: z.strictObject({ code: z.string().min(6).max(32), publicKey: z.string().regex(/^[A-Za-z0-9_-]{43}$/), name: z.string().min(1).max(64).optional() }).optional(),
+    })
+    .refine((a) => [a.token, a.device, a.pair].filter((x) => x !== undefined).length === 1, "give exactly one of token, device or pair")
+    .optional(),
 });
 export type HelloParams = z.infer<typeof helloParamsSchema>;
 

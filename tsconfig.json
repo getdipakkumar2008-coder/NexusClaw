@@ -16,6 +16,7 @@
     { "path": "src/channels" },
     { "path": "src/vault" },
     { "path": "src/memory" },
+    { "path": "src/devices" },
     { "path": "src/gateway" },
     { "path": "src/daemon" }
   ]

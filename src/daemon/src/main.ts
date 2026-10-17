@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -11,6 +11,8 @@ import { runGateway } from "./serve.js";
 import { runMcpBridge } from "./mcpbridge.js";
 import { runProviderTest } from "./providertest.js";
 import { runSetup } from "./setup.js";
+import { runLogsCommand, runServiceCommand } from "./servicecmd.js";
+import { colonFingerprint, initTls, summarize, tlsFiles } from "./tlsinit.js";
 
 /** Server-side commands live here; everything else is a Gateway client command handled by @clawnexus/cli. */
 export async function main(argv: readonly string[], io: Io = systemIo()): Promise<number> {
@@ -43,6 +45,35 @@ export async function main(argv: readonly string[], io: Io = systemIo()): Promis
           rl?.close();
         }
         return 0;
+      }
+      case "tls": {
+        const sub = p.positionals[1] ?? "show";
+        if (sub === "init") {
+          const hostsText = strFlag(p, "host");
+          const days = strFlag(p, "days") === undefined ? undefined : Number(strFlag(p, "days"));
+          const r = initTls(dataDir, { ...(hostsText ? { hosts: hostsText.split(",") } : {}), ...(days === undefined ? {} : { days }), force: p.flags.force === true });
+          io.out(
+            json
+              ? `${JSON.stringify(r, null, 2)}\n`
+              : `Made a self-signed certificate valid for: ${r.names.join(", ")}\n  until ${r.notAfter.slice(0, 10)}\n  files: ${r.certPath} and ${r.keyPath} (keep the key private)\n  fingerprint: ${colonFingerprint(r.fingerprint)}\nTo use it, set gateway.tls.enabled to true in the config and restart the Gateway. Other computers trust it with --fingerprint ${r.fingerprint} (or --ca ${r.certPath}).\n`,
+          );
+          return 0;
+        }
+        if (sub === "show") {
+          const f = tlsFiles(dataDir);
+          if (!existsSync(f.certPath)) throw new CliError("TLS_MISSING", `no certificate at ${f.certPath}`, `Run \`${BRAND.cli} tls init\`, or put your own cert.pem and key.pem there.`);
+          const s = summarize(readFileSync(f.certPath));
+          io.out(json ? `${JSON.stringify({ ...f, ...s }, null, 2)}\n` : `Certificate: ${f.certPath}\n  valid for: ${s.names.join(", ")}\n  expires: ${s.notAfter.slice(0, 10)} (${s.daysLeft} days)\n  ${s.selfSigned ? "self-signed" : "issued by a certificate authority"}\n  fingerprint: ${colonFingerprint(s.fingerprint)}\n  to trust it from another computer: --fingerprint ${s.fingerprint}\n`);
+          return 0;
+        }
+        throw new CliError("USAGE", `unknown tls command ${sub}`, "Use init or show.");
+      }
+      case "service":
+        return await runServiceCommand({ sub: p.positionals[1], dataDir, io, json, ...(port === undefined ? {} : { port }) });
+      case "logs": {
+        const n = strFlag(p, "lines") === undefined ? 50 : Number(strFlag(p, "lines"));
+        if (!Number.isInteger(n) || n < 1) throw new CliError("USAGE", `invalid --lines ${strFlag(p, "lines")}`, "Use a whole number, for example --lines 100.");
+        return runLogsCommand({ dataDir, io, json, lines: n });
       }
       case "mcp-bridge":
         return await runMcpBridge(process.env, process.stdin, process.stdout, (t) => io.err(t));

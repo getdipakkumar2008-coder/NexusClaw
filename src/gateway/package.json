@@ -29,6 +29,7 @@
     "@clawnexus/tools": "workspace:*",
     "@clawnexus/vault": "workspace:*",
     "@clawnexus/memory": "workspace:*",
+    "@clawnexus/devices": "workspace:*",
     "ws": "^8.18.0",
     "zod": "^4.0.0"
   },

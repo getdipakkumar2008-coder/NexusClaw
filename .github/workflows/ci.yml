@@ -25,6 +25,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm check:all
+      # Build the installable package and use it from an empty folder, as a user would.
+      - run: pnpm package -- --no-build
+      - run: pnpm package:smoke
 
   audit:
     runs-on: ubuntu-latest

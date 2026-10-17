@@ -20,6 +20,9 @@ importers:
       dependency-cruiser:
         specifier: ^16.8.0
         version: 16.10.4
+      esbuild:
+        specifier: 0.21.5
+        version: 0.21.5
       eslint:
         specifier: ^9.17.0
         version: 9.39.5
@@ -134,6 +137,15 @@ importers:
         specifier: ^8.18.0
         version: 8.22.0
 
+  src/devices:
+    dependencies:
+      '@clawnexus/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@clawnexus/store':
+        specifier: workspace:*
+        version: link:../store
+
   src/gateway:
     dependencies:
       '@clawnexus/brand':
@@ -145,6 +157,9 @@ importers:
       '@clawnexus/config':
         specifier: workspace:*
         version: link:../config
+      '@clawnexus/devices':
+        specifier: workspace:*
+        version: link:../devices
       '@clawnexus/memory':
         specifier: workspace:*
         version: link:../memory

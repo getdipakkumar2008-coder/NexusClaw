@@ -5,7 +5,9 @@
   "description": "Self-hostable personal AI assistant platform (working name; see docs/12-clean-room-and-ip-policy.md).",
   "license": "Apache-2.0",
   "packageManager": "pnpm@9.15.9",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "type": "module",
   "scripts": {
     "build": "tsc -b",
@@ -16,16 +18,19 @@
     "check:boundaries:selftest": "node tools/boundaries-selftest.mjs",
     "check:licenses": "node tools/check-licenses.mjs",
     "check:all": "pnpm build && pnpm lint && pnpm test && pnpm check:boundaries && pnpm check:boundaries:selftest && pnpm check:licenses",
-    "changeset": "changeset"
+    "changeset": "changeset",
+    "package": "node tools/package.mjs",
+    "package:smoke": "node tools/package-smoke.mjs"
   },
   "devDependencies": {
     "@changesets/cli": "^2.27.10",
     "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.0",
     "dependency-cruiser": "^16.8.0",
+    "esbuild": "0.21.5",
     "eslint": "^9.17.0",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.18.0",
-    "vitest": "^2.1.8",
-    "@types/node": "^22.10.0"
+    "vitest": "^2.1.8"
   }
 }

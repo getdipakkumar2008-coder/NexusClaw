@@ -1,8 +1,10 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer as createSecureServer, type Server as SecureServer } from "node:https";
+import { X509Certificate } from "node:crypto";
 import type { Duplex } from "node:stream";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
 import { BRAND } from "@clawnexus/brand";
@@ -11,8 +13,13 @@ import {
   helloParamsSchema,
   isCompatible,
   parseFrame,
+  newNonce,
+  verifyDeviceSignature,
+  type AuthPurpose,
+  type DeviceScope,
   type ErrorBody,
 } from "@clawnexus/protocol";
+import { DeviceError, DeviceRegistry } from "@clawnexus/devices";
 import { isLoopback, type Config } from "@clawnexus/config";
 import { EventLog, CursorExpiredError, openDb, type Db, type StoredEvent } from "@clawnexus/store";
 import { PairingError, PairingService } from "@clawnexus/pairing";
@@ -51,6 +58,14 @@ export interface GatewayOptions {
   /** Failed-auth lockout: this many failures within the window blocks the remote address for the window. */
   maxAuthFailures?: number;
   authFailureWindowMs?: number;
+  /** TLS certificate chain and private key (PEM). Required to listen beyond loopback; allowed on loopback too. */
+  tls?: { cert: string | Buffer; key: string | Buffer };
+  /** Listen beyond loopback WITHOUT TLS. Only for an owner who has explicitly accepted the risk (SEC-6). */
+  insecure?: boolean;
+  /** How long a device's sign-in lasts before it must prove itself again (docs/03 section 3). Default 15 minutes. */
+  deviceLeaseMs?: number;
+  /** How long a challenge may be answered. Default 30 seconds. */
+  challengeTtlMs?: number;
 }
 
 const VERSION = "0.0.0";
@@ -76,6 +91,11 @@ interface Conn {
   authed: boolean;
   /** Set when the connection authenticated with a tool-bridge credential instead of the owner token. */
   grant?: BridgeGrant;
+  /** Set when the connection signed in as a paired device. What it may do is limited to its scopes. */
+  device?: { id: string; scopes: readonly DeviceScope[]; leaseUntil: number };
+  /** A challenge sent to this connection and not yet answered. Single use, short lived. */
+  challenge?: { deviceId: string; nonce: string; purpose: AuthPurpose; expiresAt: number };
+  leaseTimer?: NodeJS.Timeout;
   unsubscribe?: () => void;
   /** Runs right after the current request's response is sent (used to start event replay after the ack). */
   postReply?: () => void;
@@ -85,6 +105,35 @@ interface Conn {
 }
 
 const sha = (s: string): Buffer => createHash("sha256").update(s).digest();
+
+/** What a paired device may call, and the scope that allows it. Anything not listed is the owner's alone. */
+const DEVICE_METHODS: Record<string, DeviceScope> = {
+  status: "read",
+  "events.subscribe": "read",
+  "events.unsubscribe": "read",
+  "session.list": "read",
+  "session.get": "read",
+  "approval.list": "read",
+  "session.create": "chat",
+  "session.send": "chat",
+  "session.cancel": "chat",
+  "approval.decide": "approve",
+};
+
+const isWildcard =(host: string): boolean => host === "0.0.0.0" || host === "::" || host === "[::]";
+
+/** The names and addresses a certificate says it is valid for (its subject alternative names), lower-case. */
+function certNames(cert: X509Certificate): string[] {
+  const out: string[] = [];
+  for (const part of (cert.subjectAltName ?? "").split(",")) {
+    const m = /^\s*(DNS|IP Address):(.+?)\s*$/.exec(part);
+    if (m?.[2]) out.push(m[2].toLowerCase());
+  }
+  return out;
+}
+
+/** File the Gateway writes so a client on this computer finds it and knows how to trust it. */
+export const ENDPOINT_FILE = "gateway.endpoint";
 
 /**
  * Gateway control plane (docs/02, docs/03). Slice 1: HTTP health, WebSocket protocol with token auth,
@@ -101,13 +150,19 @@ export class Gateway {
   readonly plugins: PluginHost;
   private readonly vault: LocalVault;
   readonly memory: MemoryStore;
+  readonly devices: DeviceRegistry;
+  private readonly tls: { cert: string | Buffer; key: string | Buffer } | undefined;
+  /** Host names the certificate is valid for, lower-case. Browsers only reach us under one of these. */
+  private readonly certHosts: string[] = [];
+  /** SHA-256 fingerprint of our certificate, for clients that pin it. */
+  readonly certFingerprint: string | undefined;
   readonly channels: ChannelManager;
   private readonly webchat: WebChatAdapter;
   private readonly profile: "standard" | "locked-down" | "trusted";
   readonly tokenPath: string;
 
   private readonly db: Db;
-  private readonly http: Server;
+  private readonly http: Server | SecureServer;
   private readonly wss: WebSocketServer;
   private readonly conns = new Set<Conn>();
   private readonly token: string;
@@ -118,7 +173,7 @@ export class Gateway {
   private boundPort = 0;
   private readonly host: string;
   private readonly requestedPort: number;
-  private readonly o: Required<Pick<GatewayOptions, "helloTimeoutMs" | "maxBufferedBytes" | "requestsPerSecond" | "maxAuthFailures" | "authFailureWindowMs">> & {
+  private readonly o: Required<Pick<GatewayOptions, "helloTimeoutMs" | "maxBufferedBytes" | "requestsPerSecond" | "maxAuthFailures" | "authFailureWindowMs" | "deviceLeaseMs" | "challengeTtlMs">> & {
     allowedOrigins: readonly string[];
     now: () => number;
   };
@@ -126,10 +181,17 @@ export class Gateway {
   constructor(opts: GatewayOptions) {
     this.host = opts.host ?? opts.config?.gateway.bind ?? "127.0.0.1";
     this.requestedPort = opts.port ?? opts.config?.gateway.port ?? 7391;
-    if (!isLoopback(this.host)) {
+    this.tls = opts.tls;
+    if (!isLoopback(this.host) && !this.tls && opts.insecure !== true) {
       throw new Error(
-        `refusing to listen on ${this.host}: only loopback is supported until TLS is implemented (SEC-6). Use a VPN or reverse proxy that terminates TLS in front of a loopback bind.`,
+        `refusing to listen on ${this.host} without TLS (SEC-6). Turn on gateway.tls and run \`${BRAND.cli} tls init\`, keep the bind on loopback behind a VPN or a proxy that terminates TLS, or accept the risk with gateway.insecureAcknowledged.`,
       );
+    }
+    if (this.tls) {
+      // Reading the certificate here also proves it parses before anything listens.
+      const cert = new X509Certificate(this.tls.cert);
+      this.certFingerprint = cert.fingerprint256.replace(/:/g, "").toLowerCase();
+      this.certHosts = certNames(cert);
     }
     this.o = {
       allowedOrigins: opts.allowedOrigins ?? [],
@@ -138,6 +200,8 @@ export class Gateway {
       requestsPerSecond: opts.requestsPerSecond ?? 50,
       maxAuthFailures: opts.maxAuthFailures ?? 5,
       authFailureWindowMs: opts.authFailureWindowMs ?? 60_000,
+      deviceLeaseMs: opts.deviceLeaseMs ?? 15 * 60_000,
+      challengeTtlMs: opts.challengeTtlMs ?? 30_000,
       now: opts.now ?? Date.now,
     };
     this.startedAt = this.o.now();
@@ -166,7 +230,9 @@ export class Gateway {
     this.plugins = new PluginHost({ dataDir: opts.dataDir, db: this.db, events: this.events, tools: this.tools, secrets: this.vault, channels: { attach: (a) => this.channels.attach(a), detach: (id) => this.channels.detach(id) }, now: this.o.now, ...opts.plugins });
     this.sessions = opts.provider ? new SessionManager(this.db, this.events, opts.provider, { now: this.o.now, context: (s) => this.memoryContext(s), ...opts.sessions }) : undefined;
 
+    this.devices = new DeviceRegistry(this.db, { now: this.o.now, events: this.events });
     this.webchat = new WebChatAdapter({
+      scheme: this.tls ? "https" : "http",
       registerOwner: (externalId, display) => void this.pairing.registerOwner({ channel: WEBCHAT_ID, accountId: "default", externalId, display }),
       principalOf: (externalId) => this.pairing.principalOf({ channel: WEBCHAT_ID, accountId: "default", externalId }),
       now: this.o.now,
@@ -174,7 +240,8 @@ export class Gateway {
     this.channels = new ChannelManager({ db: this.db, events: this.events, pairing: this.pairing, sessions: this.sessions, now: this.o.now });
     this.channels.register(this.webchat);
 
-    this.http = createServer((req, res) => this.handleHttp(req, res));
+    const handler = (req: IncomingMessage, res: import("node:http").ServerResponse): void => this.handleHttp(req, res);
+    this.http = this.tls ? createSecureServer({ cert: this.tls.cert, key: this.tls.key, minVersion: "TLSv1.2" }, handler) : createServer(handler);
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
     this.http.on("upgrade", (req, socket) => this.handleUpgrade(req, socket as Duplex));
     this.wss.on("connection", (ws, req) => this.onConnection(ws, req));
@@ -198,7 +265,16 @@ export class Gateway {
     await this.plugins.startEnabled().catch(() => undefined);
     await this.channels.start();
     this.ready = true;
-    this.events.append([{ type: "gateway.started", data: { version: VERSION } }]);
+    try {
+      writeFileSync(
+        join(dirname(this.tokenPath), ENDPOINT_FILE),
+        `${JSON.stringify({ url: `${this.tls ? "wss" : "ws"}://${this.selfHost()}:${this.boundPort}/v1/ws`, ...(this.certFingerprint ? { fingerprint: this.certFingerprint } : {}), pid: process.pid })}\n`,
+        { mode: 0o600 },
+      );
+    } catch {
+      /* clients can still be told the address by hand */
+    }
+    this.events.append([{ type: "gateway.started", data: { version: VERSION, tls: this.tls !== undefined } }]);
     return { host: this.host, port: this.boundPort };
   }
 
@@ -212,8 +288,15 @@ export class Gateway {
       /* database may already be closed */
     }
     this.bridgeGrants.revokeAll();
+    try {
+      const p = join(dirname(this.tokenPath), ENDPOINT_FILE);
+      if ((JSON.parse(readFileSync(p, "utf8")) as { pid?: number }).pid === process.pid) rmSync(p, { force: true });
+    } catch {
+      /* not there, or not ours */
+    }
     await this.channels.stop();
     for (const c of this.conns) {
+      clearTimeout(c.leaseTimer);
       c.ws.close(1001, "gateway shutting down");
     }
     await this.sessions?.close();
@@ -231,13 +314,14 @@ export class Gateway {
 
   /** Where a tool bridge connects. */
   get url(): string {
-    return `ws://${this.host.includes(":") ? `[${this.host}]` : this.host}:${this.boundPort}/v1/ws`;
+    return `${this.tls ? "wss" : "ws"}://${this.selfHost()}:${this.boundPort}/v1/ws`;
   }
 
   /** Issue a credential for one session's tool bridge. Revoke it when that session's harness goes away. */
-  mintBridge(o: MintOptions): { token: string; url: string; revoke(): void } {
+  mintBridge(o: MintOptions): { token: string; url: string; pin?: string; revoke(): void } {
     const m = this.bridgeGrants.mint(o);
-    return { token: m.token, url: this.url, revoke: m.revoke };
+    // The bridge runs on this computer and trusts exactly our certificate, whatever names it carries.
+    return { token: m.token, url: this.url, ...(this.certFingerprint ? { pin: this.certFingerprint } : {}), revoke: m.revoke };
   }
 
   // ---------------- HTTP ----------------
@@ -258,12 +342,28 @@ export class Gateway {
     else res.writeHead(404, headers).end(JSON.stringify({ ok: false }));
   }
 
-  /** DNS-rebinding defence: the Host header must name a loopback address on our port. */
+  /**
+   * DNS-rebinding defence: the Host header must name this machine on our port: a loopback name, the address we are
+   * bound to, or (with TLS) a name our certificate is valid for. A page on another site cannot get a browser to send
+   * any of those to us for a name it controls.
+   */
   private hostAllowed(req: IncomingMessage): boolean {
     const host = req.headers.host;
     if (!host) return false;
-    const allowed = new Set([`127.0.0.1:${this.boundPort}`, `localhost:${this.boundPort}`, `[::1]:${this.boundPort}`]);
-    return allowed.has(host.toLowerCase());
+    const names = ["127.0.0.1", "localhost", "[::1]", ...this.certHosts.map((h) => (h.includes(":") ? `[${h}]` : h))];
+    if (!isWildcard(this.host)) names.push(this.host.includes(":") ? `[${this.host}]` : this.host);
+    return names.some((n) => `${n.toLowerCase()}:${this.boundPort}` === host.toLowerCase());
+  }
+
+  /** An address on this computer that reaches us, whatever we are bound to. */
+  private selfHost(): string {
+    const h = isWildcard(this.host) ? (this.host.includes(":") ? "::1" : "127.0.0.1") : this.host;
+    return h.includes(":") ? `[${h}]` : h;
+  }
+
+  /** Where clients on this computer reach us, e.g. `https://127.0.0.1:7391`. */
+  get origin(): string {
+    return `${this.tls ? "https" : "http"}://${this.selfHost()}:${this.boundPort}`;
   }
 
   private handleUpgrade(req: IncomingMessage, socket: Duplex): void {
@@ -304,6 +404,7 @@ export class Gateway {
     });
     ws.on("close", () => {
       clearTimeout(c.helloTimer);
+      clearTimeout(c.leaseTimer);
       c.unsubscribe?.();
       this.conns.delete(c);
     });
@@ -352,8 +453,27 @@ export class Gateway {
         this.reply(c, id, this.hello(c, params));
         return;
       }
+      if (method === "auth.verify") {
+        this.reply(c, id, this.verifyDevice(c, params));
+        return;
+      }
       if (!c.authed) {
         this.fail(c, id, err("AUTH.REQUIRED", "send connection.hello with credentials first", "Authenticate before calling methods."));
+        return;
+      }
+      if (c.device && this.o.now() > c.device.leaseUntil) {
+        c.ws.close(4401, "device authorization expired");
+        return;
+      }
+      if (c.device && method === "auth.challenge") {
+        this.reply(c, id, this.newChallenge(c, c.device.id, "refresh"));
+        return;
+      }
+      if (c.device && method === "auth.refresh") {
+        const d = this.checkAnswer(c, params, "refresh");
+        if (d.id !== c.device.id) throw new MethodError(err("AUTH.BAD_SIGNATURE", "the signature does not match", "Check the device's key."));
+        this.setLease(c);
+        this.reply(c, id, { leaseMs: this.o.deviceLeaseMs });
         return;
       }
       const result = await this.dispatch(c, method, params);
@@ -381,6 +501,8 @@ export class Gateway {
     if (!isCompatible(p.protocol.major)) {
       throw new MethodError(err("UNSUPPORTED.PROTOCOL", `protocol ${p.protocol.major}.x is not supported`, `This Gateway speaks ${PROTOCOL_VERSION.major}.${PROTOCOL_VERSION.minor}.`));
     }
+    if (p.auth?.device) return this.helloDevice(c, p.auth.device.id);
+    if (p.auth?.pair) return this.helloPair(c, p.auth.pair);
     const supplied = p.auth?.token;
     const isOwner = supplied !== undefined && timingSafeEqual(sha(supplied), sha(this.token));
     const grant = !isOwner && supplied !== undefined ? this.bridgeGrants.lookup(supplied) : undefined;
@@ -392,6 +514,83 @@ export class Gateway {
     if (grant) c.grant = grant;
     clearTimeout(c.helloTimer);
     return { protocol: PROTOCOL_VERSION, server: `${BRAND.name} ${VERSION}`, role: grant ? "agent" : "owner", latestSeq: this.events.latestSeq() };
+  }
+
+  // ---------------- device sign-in (docs/03 section 3, ADR 0010) ----------------
+
+  private newChallenge(c: Conn, deviceId: string, purpose: AuthPurpose): { nonce: string; expiresInMs: number } {
+    const nonce = newNonce();
+    c.challenge = { deviceId, nonce, purpose, expiresAt: this.o.now() + this.o.challengeTtlMs };
+    return { nonce, expiresInMs: this.o.challengeTtlMs };
+  }
+
+  /** A known device asks to sign in: send it something fresh to sign. Nothing is granted yet. */
+  private helloDevice(c: Conn, id: string): unknown {
+    const d = this.devices.get(id);
+    if (!d || d.revokedAt !== undefined) {
+      this.recordAuthFailure(c.remote);
+      throw d
+        ? new MethodError(err("AUTH.REVOKED", "this device has been revoked", "Pair it again from the owner's computer if you trust it."))
+        : new MethodError(err("AUTH.BAD_DEVICE", "this device is not paired", "Pair it again from the owner's computer."));
+    }
+    return { protocol: PROTOCOL_VERSION, server: `${BRAND.name} ${VERSION}`, challenge: this.newChallenge(c, id, "connect") };
+  }
+
+  /** A new device presents a one-time code and its public key. */
+  private helloPair(c: Conn, pair: { code: string; publicKey: string; name?: string | undefined }): unknown {
+    try {
+      const d = this.devices.completePairing(pair.code, pair.publicKey, pair.name);
+      this.signIn(c, d);
+      return { protocol: PROTOCOL_VERSION, server: `${BRAND.name} ${VERSION}`, role: "device", device: { id: d.id, name: d.name, scopes: d.scopes }, leaseMs: this.o.deviceLeaseMs, latestSeq: this.events.latestSeq() };
+    } catch (e) {
+      if (!(e instanceof DeviceError)) throw e;
+      if (e.code === "BAD_CODE") {
+        this.recordAuthFailure(c.remote);
+        throw new MethodError(err("AUTH.BAD_PAIRING_CODE", e.message, "Ask the owner for a new code (`devices pair`)."));
+      }
+      throw new MethodError(err("AUTH.PAIRING", e.message, "Check the key, or ask the owner to revoke an old device."));
+    }
+  }
+
+  private signIn(c: Conn, d: { id: string; scopes: readonly DeviceScope[] }): void {
+    c.authed = true;
+    c.device = { id: d.id, scopes: d.scopes, leaseUntil: 0 };
+    clearTimeout(c.helloTimer);
+    this.setLease(c);
+  }
+
+  /** A device's sign-in lasts a short while; it must prove itself again to keep going. */
+  private setLease(c: Conn): void {
+    if (!c.device) return;
+    clearTimeout(c.leaseTimer);
+    c.device.leaseUntil = this.o.now() + this.o.deviceLeaseMs;
+    c.leaseTimer = setTimeout(() => c.ws.close(4401, "device authorization expired"), this.o.deviceLeaseMs);
+    c.leaseTimer.unref();
+  }
+
+  /** Check the answer to the challenge this connection was given. A challenge works once, whatever the outcome. */
+  private checkAnswer(c: Conn, params: unknown, purpose: AuthPurpose): { id: string; scopes: readonly DeviceScope[] } {
+    const p = z.strictObject({ signature: z.string().min(1).max(200) }).parse(params);
+    const ch = c.challenge;
+    delete c.challenge;
+    if (!ch || ch.purpose !== purpose) throw new MethodError(err("AUTH.NO_CHALLENGE", "there is no challenge to answer", "Ask for one first."));
+    if (this.isLockedOut(c.remote)) throw new MethodError(err("AUTH.LOCKED", "too many failed attempts", "Wait a minute and retry.", true));
+    if (this.o.now() > ch.expiresAt) throw new MethodError(err("AUTH.CHALLENGE_EXPIRED", "the challenge took too long to answer", "Ask for a new one.", true));
+    const d = this.devices.usable(ch.deviceId);
+    if (!d || !verifyDeviceSignature(d.publicKey, d.id, ch.nonce, purpose, p.signature)) {
+      this.recordAuthFailure(c.remote);
+      this.events.append([{ type: "device.auth_failed", data: { id: ch.deviceId, reason: d ? "bad signature" : "device revoked" } }]);
+      throw new MethodError(err("AUTH.BAD_SIGNATURE", "the signature does not match", "Check the device's key, or pair it again."));
+    }
+    return d;
+  }
+
+  private verifyDevice(c: Conn, params: unknown): unknown {
+    if (c.authed) throw new MethodError(err("UNSUPPORTED.ALREADY_AUTHENTICATED", "already authenticated", "Open a new connection to re-authenticate."));
+    const d = this.checkAnswer(c, params, "connect");
+    this.devices.touch(d.id);
+    this.signIn(c, d);
+    return { role: "device", device: { id: d.id, scopes: d.scopes }, leaseMs: this.o.deviceLeaseMs, latestSeq: this.events.latestSeq() };
   }
 
   private isLockedOut(remote: string): boolean {
@@ -542,7 +741,38 @@ export class Gateway {
 
   private async dispatch(c: Conn, method: string, params: unknown): Promise<unknown> {
     if (c.grant) return this.agentDispatch(c, c.grant, method, params);
+    if (c.device) {
+      // A paired device does only what its scopes allow; everything else (plugins, memory, tools, pairing, other
+      // devices) stays with the owner's own connection.
+      const need = DEVICE_METHODS[method];
+      if (need === undefined || !c.device.scopes.includes(need)) {
+        throw new MethodError(err("AUTH.FORBIDDEN", `this device may not call ${method}`, need === undefined ? "That action is only available from the owner's computer." : `The owner can allow it by pairing the device with the "${need}" scope.`));
+      }
+    }
     switch (method) {
+      case "device.pair.begin": {
+        const p = z.strictObject({ name: z.string().min(1).max(64).optional(), scopes: z.array(z.enum(["read", "chat", "approve"])).min(1).max(3).optional() }).parse(params ?? {});
+        try {
+          const r = this.devices.beginPairing(p.name, p.scopes);
+          return { ...r, url: `${this.tls ? "wss" : "ws"}://${this.selfHost()}:${this.boundPort}/v1/ws`, ...(this.certFingerprint ? { fingerprint: this.certFingerprint } : {}) };
+        } catch (e) {
+          if (e instanceof DeviceError) throw new MethodError(err(`AUTH.PAIRING`, e.message, "Revoke a device, or wait for pending codes to expire."));
+          throw e;
+        }
+      }
+      case "device.list":
+        return { devices: this.devices.list().map((d) => ({ id: d.id, name: d.name, scopes: d.scopes, createdAt: d.createdAt, ...(d.lastSeenAt === undefined ? {} : { lastSeenAt: d.lastSeenAt }), ...(d.revokedAt === undefined ? {} : { revokedAt: d.revokedAt }) })), pendingCodes: this.devices.pending() };
+      case "device.revoke": {
+        const p = z.strictObject({ id: z.string().min(1).max(64) }).parse(params);
+        try {
+          const d = this.devices.revoke(p.id);
+          for (const x of this.conns) if (x.device?.id === d.id) x.ws.close(4401, "device revoked");
+          return { device: { id: d.id, name: d.name, revokedAt: d.revokedAt } };
+        } catch (e) {
+          if (e instanceof DeviceError) throw new MethodError(err("AUTH.BAD_DEVICE", e.message, "List devices to see their ids."));
+          throw e;
+        }
+      }
       case "status":
         return {
           server: `${BRAND.name} ${VERSION}`,
@@ -585,7 +815,7 @@ export class Gateway {
       case "approval.decide": {
         const p = z.strictObject({ id: z.string().min(1), approve: z.boolean() }).parse(params);
         try {
-          const a = this.approvals.decide(p.id, p.approve, { kind: "owner", id: "owner" });
+          const a = this.approvals.decide(p.id, p.approve, { kind: "owner", id: c.device ? `device:${c.device.id}` : "owner" });
           this.events.append([{ type: "approval.decided", data: { id: a.id, state: a.state, tool: a.tool } }]);
           return { approval: a };
         } catch (e) {
@@ -632,8 +862,7 @@ export class Gateway {
       case "channel.list":
         return { channels: this.channels.list() };
       case "channel.webchat.link": {
-        const host = this.host.includes(":") ? `[${this.host}]` : this.host;
-        return this.webchat.createOwnerLink(`http://${host}:${this.boundPort}`);
+        return this.webchat.createOwnerLink(this.origin);
       }
       case "pairing.owner": {
         const p = z.strictObject({ channel: z.string().min(1).max(64), accountId: z.string().min(1).max(64).default("default"), id: z.string().min(1).max(256), display: z.string().max(64).optional() }).parse(params);
@@ -666,7 +895,7 @@ export class Gateway {
       case "session.export":
       case "session.import":
       case "session.delete":
-        return this.sessionMethod(method, params);
+        return this.sessionMethod(method, params, c.device ? `device:${c.device.id}` : "owner");
 
       default:
         throw new MethodError(err("UNSUPPORTED.METHOD", `unknown method ${method}`, "See docs/03-gateway-protocol.md for the method list."));
@@ -722,7 +951,7 @@ export class Gateway {
     }
   }
 
-  private sessionMethod(method: string, params: unknown): unknown {
+  private sessionMethod(method: string, params: unknown, sender = "owner"): unknown {
     const mgr = this.sessions;
     if (!mgr) throw new MethodError(err("PROVIDER.NOT_CONFIGURED", "no model provider is configured", "Configure a provider before using sessions."));
     const id = z.string().min(1).max(64);
@@ -748,7 +977,7 @@ export class Gateway {
         }
         case "session.send": {
           const p = z.strictObject({ session: id, text: z.string() }).parse(params);
-          return mgr.send(p.session, p.text, { sender: "owner" });
+          return mgr.send(p.session, p.text, { sender });
         }
         case "session.cancel": {
           const p = z.strictObject({ session: id }).parse(params);

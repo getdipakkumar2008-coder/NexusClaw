@@ -94,6 +94,16 @@ const SCHEMA: readonly string[] = [
      json       TEXT NOT NULL,
      updated_at INTEGER NOT NULL
    );`,
+  // v7: paired devices (docs/03 section 3). Only the PUBLIC key is stored; a revoked device stays as a record.
+  `CREATE TABLE devices (
+     id           TEXT PRIMARY KEY,
+     name         TEXT NOT NULL,
+     public_key   TEXT NOT NULL UNIQUE,
+     scopes       TEXT NOT NULL,
+     created_at   INTEGER NOT NULL,
+     last_seen_at INTEGER,
+     revoked_at   INTEGER
+   );`,
 ];
 
 export const SCHEMA_VERSION = SCHEMA.length;

@@ -123,7 +123,7 @@ describe("HTTP", () => {
 
 describe("startup safety", () => {
   it("refuses non-loopback binds until TLS exists", () => {
-    expect(() => new Gateway({ dataDir: dir, host: "0.0.0.0", port: 0 })).toThrow(/loopback/);
+    expect(() => new Gateway({ dataDir: dir, host: "0.0.0.0", port: 0 })).toThrow(/without TLS/);
   });
 
   it("creates a private token once and reuses it across restarts, keeping event numbering", async () => {

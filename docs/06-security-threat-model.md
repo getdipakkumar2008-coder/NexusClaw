@@ -35,9 +35,9 @@ Boundaries: (B1) Internet↔channel platform↔Gateway; (B2) Gateway↔plugin pr
 | T3 | Pairing-code brute force / spam | B1 | Unauthorised access, DoS | High-entropy codes, expiry 1 h, rate limits, max pending, owner approval | Low |
 | T4 | Malicious plugin (typosquat, compromised publisher) | B2/B7 | Full compromise | Signing, provenance, tiers, permission display, revocation, no install-time code, pinned versions, process isolation | Medium |
 | T5 | Malicious/ compromised MCP server in bundle | B3/B4 | Tool abuse | Listed at install, policy-governed, sandboxable, default off | Medium |
-| T6 | Gateway exposed to internet without auth | B5 | Total compromise | SEC-6 refusal, startup warnings, `doctor` check, secure defaults | Low |
+| T6 | Gateway exposed to internet without auth | B5 | Total compromise | SEC-6 refusal (implemented: no non-loopback bind without TLS, or an explicit acknowledgement), startup warnings, `doctor` check, secure defaults | Low |
 | T7 | Token theft from disk | — | Account takeover | Vault encryption (OS keychain), 0600 perms, short-lived device tokens | Medium (host compromise) |
-| T8 | Stolen/lost paired device | B5 | Gateway control | Revocation, per-device scopes, re-auth for sensitive approvals, biometric gate on app | Low |
+| T8 | Stolen/lost paired device | B5 | Gateway control | Revocation (implemented: immediate disconnect and refusal), per-device scopes (implemented), re-auth every 15 minutes (implemented), re-auth for sensitive approvals and biometric gate on app (apps, not yet) | Low |
 | T9 | Relay abuse by unofficial builds (spam push, impersonation) | B6 | Cost, phishing | App Attest / Play Integrity attestation + **delegated send grants** (gateway signs time-/rate-limited grant for a specific device token; relay verifies grant signature + attestation) | Low-Med |
 | T10 | Relay compromise reading content | B6 | Privacy | E2E payload encryption; relay stores minimal state; self-host option | Low |
 | T11 | Cross-user data leakage in team Gateway | B5 | Privacy | Documented as out of guarantee (mutual-trust only) + per-sender session/memory scoping as defence in depth | Accepted by design |

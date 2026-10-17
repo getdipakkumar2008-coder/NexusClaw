@@ -89,7 +89,7 @@ export function verifyBackup(dir: string): Manifest {
   return manifest;
 }
 
-function gatewayRunning(port: number): Promise<boolean> {
+export function gatewayRunning(port: number): Promise<boolean> {
   return new Promise((resolvePromise) => {
     const req = get({ host: "127.0.0.1", port, path: "/healthz", timeout: 800 }, (res) => {
       res.resume();

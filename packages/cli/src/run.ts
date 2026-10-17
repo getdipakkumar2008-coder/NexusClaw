@@ -1,10 +1,11 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { BRAND } from "@clawnexus/brand";
-import { PROTOCOL_VERSION } from "@clawnexus/protocol";
+import { PROTOCOL_VERSION, generateDeviceKey } from "@clawnexus/protocol";
 import { parseArgs, strFlag, type Parsed } from "./args.js";
-import { CliError, GatewayClient } from "./client.js";
+import { CliError, GatewayClient, type ConnectOptions, type DeviceCredential } from "./client.js";
 import { DEFAULT_PORT, TOKEN_FILE, defaultDataDir } from "./paths.js";
 
 export interface Io {
@@ -82,6 +83,12 @@ Run the Gateway
   gateway run [--fake-provider]   start the Gateway in this terminal
   setup [--profile P] [--yes]     create the data directory, config and token
   doctor [--fix]                  check this installation and (with --fix) repair what is safe to repair
+  devices pair [--name N] [--scopes read,chat,approve]   one-time code for a phone or another computer
+  devices list | devices revoke ID
+  devices enroll --url wss://HOST:PORT/v1/ws --code CODE [--fingerprint HEX | --ca FILE]   make THIS computer a device of another Gateway
+  tls init [--host a,b] [--days N] [--force] | tls show   make or inspect the Gateway's certificate
+  service install|uninstall|status|start|stop|restart   run the Gateway in the background, started when you sign in
+  logs [--lines N]                show the Gateway's log (secret-free, rotated)
   backup [--out DIR]              write a verified snapshot of your data
   restore <DIR> [--force]         restore a snapshot (Gateway must be stopped)
 
@@ -97,7 +104,7 @@ Talk to a running Gateway
   memory list|contacts|show|write|delete|export|erase|path   your saved notes (plain Markdown files)
     memory list [--contact CHANNEL:ID]   memory show NAME   memory write NAME (--text T | --file F) [--append]
     memory export DIR   memory erase (--all | --owner | --contact CHANNEL:ID) --yes   memory path
-  plugins list|info|install|enable|disable|remove [ID | PATH]  [--yes] [--replace] [--purge-data]
+  plugins list|info|install|enable|disable|remove [ID | PATH | NAME]   (NAME: telegram, discord, slack, hello-tool ship with the program)  [--yes] [--replace] [--purge-data]
   plugins config ID [set KEY=VALUE... | unset KEY...]   a plugin's settings
   plugins secret ID [set NAME | delete NAME]            a plugin's secrets (the value is asked for, never typed on the command line)
 
@@ -105,6 +112,9 @@ Options
   --json            machine-readable output
   --url URL         Gateway WebSocket URL (default ws://127.0.0.1:${DEFAULT_PORT}/v1/ws)
   --port N          shorthand for the port on 127.0.0.1
+  --fingerprint HEX trust only the Gateway certificate with this SHA-256 fingerprint (self-signed Gateways)
+  --ca FILE         also trust this certificate file
+  --device          sign in with this computer's paired-device key even if a token is available
   --data-dir DIR    data directory (default: per-OS; env ${BRAND.envPrefix}DATA_DIR)
   --help, --version
 `;
@@ -122,35 +132,115 @@ const need = (p: Parsed, i: number, what: string): string => {
   return v;
 };
 
-function resolveToken(c: Context): string {
-  const flag = strFlag(c.p, "token");
-  if (flag) return flag;
-  const env = c.io.env[`${BRAND.envPrefix}TOKEN`];
-  if (env) return env;
-  const path = join(c.dataDir, TOKEN_FILE);
+/** What `devices enroll` saves: where the Gateway is, who this device is, and how to trust the Gateway's certificate. */
+interface DeviceFile {
+  url: string;
+  deviceId: string;
+  privateKeyPem: string;
+  fingerprint?: string;
+  ca?: string;
+}
+export const DEVICE_FILE = "device.json";
+
+function readJson<T>(path: string): T | undefined {
   try {
-    const t = readFileSync(path, "utf8").trim();
-    if (t) return t;
+    return JSON.parse(readFileSync(path, "utf8")) as T;
   } catch {
-    /* handled below */
+    return undefined;
   }
-  throw new CliError(
-    "NO_TOKEN",
-    `no Gateway token found at ${path}`,
-    `Run \`${BRAND.cli} setup\` (or start the Gateway) on this machine, or set ${BRAND.envPrefix}TOKEN for a remote Gateway.`,
-  );
 }
 
-function resolveUrl(c: Context): string {
-  const url = strFlag(c.p, "url");
-  if (url) return url;
-  const port = strFlag(c.p, "port") ?? c.io.env[`${BRAND.envPrefix}PORT`] ?? String(DEFAULT_PORT);
-  if (!/^\d{1,5}$/.test(port)) throw new CliError("USAGE", `invalid port ${port}`, "Use a number between 1 and 65535.");
-  return `ws://127.0.0.1:${port}/v1/ws`;
+const pidAlive = (pid: unknown): boolean => {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+/** Where a running Gateway on this computer says it is (and the certificate it uses). Ignored if that Gateway is gone. */
+function localEndpoint(c: Context): { url: string; fingerprint?: string } | undefined {
+  const e = readJson<{ url?: string; fingerprint?: string; pid?: number }>(join(c.dataDir, "gateway.endpoint"));
+  return e?.url && pidAlive(e.pid) ? { url: e.url, ...(e.fingerprint ? { fingerprint: e.fingerprint } : {}) } : undefined;
+}
+
+interface Connection {
+  url: string;
+  credential: string | DeviceCredential;
+  options: ConnectOptions;
+}
+
+function resolveConnection(c: Context): Connection {
+  const urlFlag = strFlag(c.p, "url");
+  const caFile = strFlag(c.p, "ca");
+  let ca: string | undefined;
+  if (caFile) {
+    try {
+      ca = readFileSync(resolve(caFile), "utf8");
+    } catch {
+      throw new CliError("NO_FILE", `cannot read ${caFile}`, "Check the path of the certificate file.");
+    }
+  }
+  const pinFlag = strFlag(c.p, "fingerprint") ?? c.io.env[`${BRAND.envPrefix}FINGERPRINT`];
+
+  // Who we are: the owner's token if this computer has it (or it was given), otherwise a paired device's key.
+  const tokenFlag = strFlag(c.p, "token") ?? c.io.env[`${BRAND.envPrefix}TOKEN`];
+  let token = c.p.flags["device"] === true ? undefined : tokenFlag;
+  if (token === undefined && c.p.flags["device"] !== true) {
+    const t = (() => {
+      try {
+        return readFileSync(join(c.dataDir, TOKEN_FILE), "utf8").trim();
+      } catch {
+        return "";
+      }
+    })();
+    if (t) token = t;
+  }
+  const device = token === undefined ? readJson<DeviceFile>(join(c.dataDir, DEVICE_FILE)) : undefined;
+  if (token === undefined && !device?.deviceId) {
+    throw new CliError(
+      "NO_TOKEN",
+      `no Gateway token found at ${join(c.dataDir, TOKEN_FILE)} and this computer is not paired as a device`,
+      `Run \`${BRAND.cli} setup\` (or start the Gateway) on this machine; set ${BRAND.envPrefix}TOKEN for a remote Gateway you own; or pair this computer with \`${BRAND.cli} devices enroll --url wss://HOST:PORT/v1/ws --code CODE\`.`,
+    );
+  }
+
+  // Where the Gateway is.
+  let url = urlFlag;
+  let pin = pinFlag;
+  if (url === undefined) {
+    if (device && token === undefined) {
+      url = device.url;
+      pin ??= device.fingerprint;
+      ca ??= device.ca;
+    } else {
+      const portText = strFlag(c.p, "port") ?? c.io.env[`${BRAND.envPrefix}PORT`];
+      if (portText !== undefined && !/^\d{1,5}$/.test(portText)) throw new CliError("USAGE", `invalid port ${portText}`, "Use a number between 1 and 65535.");
+      const e = localEndpoint(c);
+      if (e && (portText === undefined || new URL(e.url).port === portText)) {
+        url = e.url;
+        pin ??= e.fingerprint;
+      } else url = `ws://127.0.0.1:${portText ?? String(DEFAULT_PORT)}/v1/ws`;
+    }
+  } else if (device && token === undefined) {
+    // an explicit address for a paired device: keep its saved trust only if it is the same server
+    if (new URL(url).host === new URL(device.url).host) {
+      pin ??= device.fingerprint;
+      ca ??= device.ca;
+    }
+  }
+  return {
+    url,
+    credential: token ?? { deviceId: device!.deviceId, privateKeyPem: device!.privateKeyPem },
+    options: { ...(pin ? { pin } : {}), ...(ca ? { ca } : {}) },
+  };
 }
 
 async function withClient<T>(c: Context, fn: (g: GatewayClient) => Promise<T>): Promise<T> {
-  const g = await GatewayClient.connect(resolveUrl(c), resolveToken(c));
+  const conn = resolveConnection(c);
+  const g = await GatewayClient.connect(conn.url, conn.credential, conn.options);
   try {
     return await fn(g);
   } finally {
@@ -435,7 +525,9 @@ const plugins: Handler = (c) =>
       const r = await g.call<{ plugin: PluginView }>("plugin.info", { id: need(c.p, 2, "plugin id") });
       show(c, r, () => describePlugin(r.plugin));
     } else if (sub === "install") {
-      const path = resolve(need(c.p, 2, "plugin folder"));
+      const given = need(c.p, 2, "plugin folder or name");
+      // A bare name means the plugin of that name that ships with this program; use ./name for a folder here.
+      const path = bundledPlugin(given) ?? resolve(given);
       const r = await g.call<{ plugin: PluginView }>("plugin.install", { path, replace: c.p.flags.replace === true });
       show(c, r, () => `Installed ${r.plugin.id}. Nothing has been run and it is not enabled.\n\n${describePlugin(r.plugin)}\nTo enable it: ${BRAND.cli} plugins enable ${r.plugin.id} --yes\n`);
     } else if (sub === "enable") {
@@ -512,7 +604,19 @@ const plugins: Handler = (c) =>
     return 0;
   });
 
-type MemScope = { kind: "owner" } | { kind: "contact"; channel: string; contact: string };
+/** The folder of a plugin that ships with this program, found by walking up from this file (installed or in the repository). */
+export function bundledPlugin(name: string, from: string = dirname(fileURLToPath(import.meta.url))): string | undefined {
+  if (!/^[a-z][a-z0-9-]{0,39}$/.test(name)) return undefined;
+  let dir = from;
+  for (let i = 0; i < 4; i++) {
+    const p = join(dir, "extensions", name);
+    if (existsSync(join(p, "clawnexus.plugin.json"))) return p;
+    dir = dirname(dir);
+  }
+  return undefined;
+}
+
+type MemScope ={ kind: "owner" } | { kind: "contact"; channel: string; contact: string };
 
 /** `--contact telegram:12345` names one person on one channel; without it, the owner's own notes. */
 function memoryScope(c: Context): MemScope {
@@ -596,7 +700,72 @@ const memory: Handler = async (c) => {
   });
 };
 
-const HANDLERS: Record<string, Handler> = { status, chat, sessions, pairing, approvals, tool, plugins, channels, webchat, memory };
+/** `devices`: phones, tablets and other computers that sign in with their own key instead of the owner token. */
+const devices: Handler = async (c) => {
+  const sub = c.p.positionals[1] ?? "list";
+  if (sub === "enroll") {
+    // This computer becomes a device of a remote Gateway. It needs no token: the one-time code from the owner is the proof.
+    const url = strFlag(c.p, "url");
+    const code = strFlag(c.p, "code");
+    if (!url || !code) throw new CliError("USAGE", "enroll needs --url and --code", `Ask the owner to run \`${BRAND.cli} devices pair\`, then: ${BRAND.cli} devices enroll --url wss://HOST:PORT/v1/ws --code CODE [--fingerprint HEX]`);
+    const caFile = strFlag(c.p, "ca");
+    let ca: string | undefined;
+    if (caFile) {
+      try {
+        ca = readFileSync(resolve(caFile), "utf8");
+      } catch {
+        throw new CliError("NO_FILE", `cannot read ${caFile}`, "Check the path of the certificate file.");
+      }
+    }
+    const pin = strFlag(c.p, "fingerprint")?.replace(/[:\s]/g, "").toLowerCase();
+    if (existsSync(join(c.dataDir, DEVICE_FILE)) && c.p.flags["force"] !== true) {
+      throw new CliError("ALREADY_ENROLLED", `this computer is already paired (${join(c.dataDir, DEVICE_FILE)})`, "Use --force to pair again; the old pairing stays valid on the Gateway until the owner revokes it.");
+    }
+    const key = generateDeviceKey();
+    const name = strFlag(c.p, "name");
+    const { device: d, client } = await GatewayClient.pair(url, { code, publicKey: key.publicKey, ...(name ? { name } : {}) }, { ...(pin ? { pin } : {}), ...(ca ? { ca } : {}) });
+    client.close();
+    mkdirSync(c.dataDir, { recursive: true, mode: 0o700 });
+    const file: DeviceFile = { url, deviceId: d.id, privateKeyPem: key.privateKeyPem, ...(pin ? { fingerprint: pin } : {}), ...(ca ? { ca } : {}) };
+    writeFileSync(join(c.dataDir, DEVICE_FILE), `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+    show(c, { device: d }, () => `Paired as ${d.id} ("${d.name}") with these permissions: ${d.scopes.join(", ")}.\nThe key is stored in ${join(c.dataDir, DEVICE_FILE)}; keep that file private. Commands here now talk to ${url}.\n`);
+    return 0;
+  }
+  return withClient(c, async (g) => {
+    if (sub === "pair") {
+      const name = strFlag(c.p, "name");
+      const scopesText = strFlag(c.p, "scopes");
+      const scopes = scopesText ? scopesText.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+      const r = await g.call<{ code: string; expiresAt: number; scopes: string[]; url: string; fingerprint?: string }>("device.pair.begin", { ...(name ? { name } : {}), ...(scopes ? { scopes } : {}) });
+      const where = r.url.replace(/\/\/(127\.0\.0\.1|\[::1\])/, "//HOST");
+      const mins = Math.max(1, Math.round((r.expiresAt - Date.now()) / 60_000));
+      show(
+        c,
+        r,
+        () =>
+          `Pairing code: ${r.code}   (works once, for about ${mins} minutes)\nThe device will be allowed to: ${r.scopes.join(", ")}.\n\nOn the other computer run:\n  ${BRAND.cli} devices enroll --url ${where} --code ${r.code}${r.fingerprint ? ` --fingerprint ${r.fingerprint}` : ""}\n` +
+          (where.includes("HOST") ? "Replace HOST with this computer's address as the other device sees it.\n" : "") +
+          "A phone or tablet app takes the same code and address.\n",
+      );
+    } else if (sub === "list") {
+      const r = await g.call<{ devices: Array<{ id: string; name: string; scopes: string[]; createdAt: number; lastSeenAt?: number; revokedAt?: number }>; pendingCodes: number }>("device.list", {});
+      show(
+        c,
+        r,
+        () =>
+          (r.devices.length
+            ? `${r.devices.map((d) => `${d.id}  ${d.revokedAt ? "revoked" : "active "}  ${d.name.padEnd(22)} ${d.scopes.join(",").padEnd(18)} ${d.lastSeenAt ? `last seen ${new Date(d.lastSeenAt).toISOString().slice(0, 16).replace("T", " ")}` : "never connected"}`).join("\n")}\n`
+            : "No devices are paired. Pair one with `devices pair`.\n") + (r.pendingCodes ? `${r.pendingCodes} pairing code(s) waiting.\n` : ""),
+      );
+    } else if (sub === "revoke") {
+      const r = await g.call<{ device: { id: string; name: string } }>("device.revoke", { id: need(c.p, 2, "device id") });
+      show(c, r, () => `Revoked ${r.device.id} ("${r.device.name}"). It is disconnected now and cannot sign in again.\n`);
+    } else throw new CliError("USAGE", `unknown devices command ${sub}`, "Use pair, list, revoke or enroll.");
+    return 0;
+  });
+};
+
+const HANDLERS: Record<string, Handler> = { status, chat, sessions, pairing, approvals, tool, plugins, channels, webchat, memory, devices };
 export const CLIENT_COMMANDS = Object.keys(HANDLERS);
 
 /** Print an error the way users should see it: code, cause, fix. No stack traces. */

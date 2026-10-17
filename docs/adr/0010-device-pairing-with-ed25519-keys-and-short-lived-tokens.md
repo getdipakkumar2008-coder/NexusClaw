@@ -9,5 +9,8 @@ Devices hold a keypair; connect via challenge-response; access tokens live at mo
 ## Rationale and consequences
 No long-lived bearer secret on phones.
 
+## Implementation (Phase 1, WP5)
+The "short-lived token" is realised as a **lease on the connection**: a sign-in lasts at most 15 minutes and is renewed by signing a new challenge, so no bearer secret exists at all. Devices carry scopes (read, chat, approve). Details: docs/03 "Device sign-in" and docs/15.
+
 ## References
 docs/03 section 3.
