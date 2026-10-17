@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { BRAND } from "@clawnexus/brand";
@@ -94,6 +94,9 @@ Talk to a running Gateway
   channels                        show channels and their health
   approvals list|approve|deny [ID]
   tool list | tool call <name> --args '<json>' [--approval ID]
+  memory list|contacts|show|write|delete|export|erase|path   your saved notes (plain Markdown files)
+    memory list [--contact CHANNEL:ID]   memory show NAME   memory write NAME (--text T | --file F) [--append]
+    memory export DIR   memory erase (--all | --owner | --contact CHANNEL:ID) --yes   memory path
   plugins list|info|install|enable|disable|remove [ID | PATH]  [--yes] [--replace] [--purge-data]
   plugins config ID [set KEY=VALUE... | unset KEY...]   a plugin's settings
   plugins secret ID [set NAME | delete NAME]            a plugin's secrets (the value is asked for, never typed on the command line)
@@ -509,7 +512,91 @@ const plugins: Handler = (c) =>
     return 0;
   });
 
-const HANDLERS: Record<string, Handler> = { status, chat, sessions, pairing, approvals, tool, plugins, channels, webchat };
+type MemScope = { kind: "owner" } | { kind: "contact"; channel: string; contact: string };
+
+/** `--contact telegram:12345` names one person on one channel; without it, the owner's own notes. */
+function memoryScope(c: Context): MemScope {
+  const raw = strFlag(c.p, "contact");
+  if (raw === undefined) return { kind: "owner" };
+  const i = raw.indexOf(":");
+  if (i < 1 || i === raw.length - 1) throw new CliError("USAGE", `--contact needs CHANNEL:ID, got ${raw}`, "For example: --contact telegram:123456789");
+  return { kind: "contact", channel: raw.slice(0, i), contact: raw.slice(i + 1) };
+}
+const scopeLabel = (s: MemScope): string => (s.kind === "owner" ? "your notes" : `notes about ${s.channel}:${s.contact}`);
+/** A folder name that is safe on every system for an arbitrary id. */
+const safeSegment = (s: string): string => s.replace(/[^A-Za-z0-9_-]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+
+const memory: Handler = async (c) => {
+  if (c.p.positionals[1] === "path") {
+    const dir = join(c.dataDir, "memory");
+    show(c, { path: dir }, () => `${dir}\nThese are plain Markdown files. Edit them with any text editor; the Gateway reads them fresh each time.\n`);
+    return 0;
+  }
+  return withClient(c, async (g) => {
+    const sub = c.p.positionals[1] ?? "list";
+    if (sub === "list") {
+      const scope = memoryScope(c);
+      const r = await g.call<{ files: Array<{ name: string; bytes: number; oversized?: boolean }> }>("memory.list", { scope });
+      show(c, r, () => (r.files.length ? `${r.files.map((f) => `${f.name.padEnd(30)} ${String(f.bytes).padStart(7)} bytes${f.oversized ? "  (too large; only the start is used)" : ""}`).join("\n")}\n` : `No ${scopeLabel(scope)} yet.\n`));
+    } else if (sub === "contacts") {
+      const r = await g.call<{ scopes: Array<{ scope: MemScope; files: number; bytes: number }> }>("memory.scopes", {});
+      show(c, r, () => (r.scopes.length ? `${r.scopes.map((s) => `${(s.scope.kind === "owner" ? "(you)" : `${s.scope.channel}:${s.scope.contact}`).padEnd(34)} ${String(s.files).padStart(3)} notes ${String(s.bytes).padStart(8)} bytes`).join("\n")}\n` : "No memory is kept yet.\n"));
+    } else if (sub === "show") {
+      const scope = memoryScope(c);
+      const r = await g.call<{ note: { name: string; content: string; truncated: boolean } }>("memory.read", { scope, name: need(c.p, 2, "note name") });
+      show(c, r, () => r.note.content);
+    } else if (sub === "write") {
+      const scope = memoryScope(c);
+      const name = need(c.p, 2, "note name");
+      const text = strFlag(c.p, "text");
+      const file = strFlag(c.p, "file");
+      if ((text === undefined) === (file === undefined)) throw new CliError("USAGE", "give the text with exactly one of --text or --file", "For example: memory write preferences --text \"Prefers short answers\" --append");
+      let content = text ?? "";
+      if (file !== undefined) {
+        try {
+          content = readFileSync(resolve(file), "utf8");
+        } catch {
+          throw new CliError("NO_FILE", `cannot read ${file}`, "Check the path.");
+        }
+      }
+      const r = await g.call<{ note: { name: string; bytes: number } }>("memory.write", { scope, name, content, mode: c.p.flags["append"] === true ? "append" : "replace" });
+      show(c, r, () => `Saved ${r.note.name} (${r.note.bytes} bytes) in ${scopeLabel(scope)}.\n`);
+    } else if (sub === "delete") {
+      const scope = memoryScope(c);
+      const name = need(c.p, 2, "note name");
+      await g.call("memory.delete", { scope, name });
+      show(c, { deleted: name }, () => `Deleted ${name} from ${scopeLabel(scope)}.\n`);
+    } else if (sub === "export") {
+      const out = resolve(need(c.p, 2, "folder to write to"));
+      if (existsSync(out) && readdirSync(out).length > 0) throw new CliError("EXISTS", `${out} is not empty`, "Choose a new or empty folder.");
+      const all = await g.call<{ scopes: Array<{ scope: MemScope }> }>("memory.scopes", {});
+      let written = 0;
+      for (const { scope } of all.scopes) {
+        const r = await g.call<{ files: Array<{ name: string; content: string }> }>("memory.export", { scope });
+        const dir = scope.kind === "owner" ? join(out, "owner") : join(out, "contacts", safeSegment(scope.channel), safeSegment(scope.contact));
+        mkdirSync(dir, { recursive: true });
+        for (const f of r.files) {
+          writeFileSync(join(dir, `${f.name}.md`), f.content);
+          written++;
+        }
+      }
+      show(c, { exported: written, to: out }, () => `Exported ${written} notes to ${out}.\n`);
+    } else if (sub === "erase") {
+      const all = c.p.flags["all"] === true;
+      const owner = c.p.flags["owner"] === true;
+      const contact = strFlag(c.p, "contact");
+      if ([all, owner, contact !== undefined].filter(Boolean).length !== 1) throw new CliError("USAGE", "say what to erase with exactly one of --all, --owner or --contact CHANNEL:ID", "For example: memory erase --contact telegram:123456789 --yes");
+      const scope: MemScope | "all" = all ? "all" : memoryScope(c);
+      const label = scope === "all" ? "ALL notes (yours and every contact's)" : scopeLabel(scope);
+      if (c.p.flags["yes"] !== true) throw new CliError("CONFIRM_REQUIRED", `this permanently deletes ${label}`, "Run it again with --yes. Consider `memory export` first.");
+      const r = await g.call<{ files: number }>("memory.erase", { scope });
+      show(c, r, () => `Erased ${r.files} notes (${label}), including the record of changes to them.\n`);
+    } else throw new CliError("USAGE", `unknown memory command ${sub}`, "Use list, contacts, show, write, delete, export, erase or path.");
+    return 0;
+  });
+};
+
+const HANDLERS: Record<string, Handler> = { status, chat, sessions, pairing, approvals, tool, plugins, channels, webchat, memory };
 export const CLIENT_COMMANDS = Object.keys(HANDLERS);
 
 /** Print an error the way users should see it: code, cause, fix. No stack traces. */

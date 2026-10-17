@@ -43,6 +43,9 @@
     },
     {
       "path": "../vault"
+    },
+    {
+      "path": "../memory"
     }
   ]
 }

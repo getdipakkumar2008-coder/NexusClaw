@@ -51,6 +51,8 @@ export interface SessionManagerOptions {
   historyLimit?: number;
   /** Streaming deltas are written to the event log at most this often (0 = every delta). */
   deltaFlushMs?: number;
+  /** Extra context for the model about who it is talking to (memory). A failure here never stops a run. */
+  context?: (session: Session) => string | undefined;
   now?: () => number;
 }
 
@@ -115,7 +117,8 @@ export class SessionManager {
   private running = 0;
   private closed = false;
   private idleWaiters: Array<() => void> = [];
-  private readonly o: Required<SessionManagerOptions>;
+  private readonly o: Required<Omit<SessionManagerOptions, "context">>;
+  private readonly context: SessionManagerOptions["context"];
 
   constructor(
     private readonly db: Db,
@@ -133,6 +136,7 @@ export class SessionManager {
       deltaFlushMs: opts.deltaFlushMs ?? 50,
       now: opts.now ?? Date.now,
     };
+    this.context = opts.context;
     this.recover();
   }
 
@@ -386,8 +390,15 @@ export class SessionManager {
       const from = this.db.prepare("SELECT sender FROM messages WHERE id = ?").get(job.messageId) as { sender: string } | undefined;
       const source = { channel: session.channel, sender: from?.sender ?? "", principal: session.principal };
 
+      let system: string | undefined;
+      try {
+        system = this.context?.(session);
+      } catch {
+        system = undefined;
+      }
+
       const aborted = new Promise<"aborted">((resolve) => a.abort.signal.addEventListener("abort", () => resolve("aborted"), { once: true }));
-      const it = this.provider.run({ sessionId, runId, messages: history, signal: a.abort.signal, source })[Symbol.asyncIterator]();
+      const it = this.provider.run({ sessionId, runId, messages: history, signal: a.abort.signal, source, ...(system === undefined ? {} : { system }) })[Symbol.asyncIterator]();
       let stopped = false;
       for (;;) {
         const step = await Promise.race([it.next(), aborted]);

@@ -42,7 +42,8 @@ export function createBackup(dataDir: string, outDir: string, opts: { includeWor
     snapshotDb(dbPath, join(dest, DB));
     if (existsSync(configPath(dataDir))) copyFileSync(configPath(dataDir), join(dest, BRAND.configFile));
     if (existsSync(join(dataDir, VAULT))) copyFileSync(join(dataDir, VAULT), join(dest, VAULT));
-    if (opts.includeWorkspace && existsSync(join(dataDir, "workspace"))) cpSync(join(dataDir, "workspace"), join(dest, "workspace"), { recursive: true });
+    if (existsSync(join(dataDir, "memory"))) cpSync(join(dataDir, "memory"), join(dest, "memory"), { recursive: true });
+    if (opts.includeWorkspace &&existsSync(join(dataDir, "workspace"))) cpSync(join(dataDir, "workspace"), join(dest, "workspace"), { recursive: true });
 
     const files: ManifestFile[] = [];
     const walk = (dir: string, prefix: string): void => {

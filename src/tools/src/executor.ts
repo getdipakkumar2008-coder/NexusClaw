@@ -7,6 +7,9 @@ import type { WorkspaceGuard } from "./guard.js";
 export interface ToolEnv {
   guard: WorkspaceGuard;
   signal: AbortSignal;
+  /** Who the call is for. Tools that keep per-person data (memory) scope themselves by this, never by their arguments. */
+  principal: PrincipalKind;
+  session?: string;
 }
 
 export interface ToolDef<A = unknown> {
@@ -217,7 +220,7 @@ export class ToolExecutor {
 
     this.audit(req, def, "tool.started", { args: summarizeArgs(args) });
     try {
-      const running = def.run(args, { guard: this.o.guard, signal: abort.signal });
+      const running = def.run(args, { guard: this.o.guard, signal: abort.signal, principal: req.principal, ...(req.session === undefined ? {} : { session: req.session }) });
       running.catch(() => undefined);
       const out = await Promise.race([running, aborted]);
       if (out === "aborted") {

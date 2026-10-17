@@ -605,6 +605,63 @@ describe("WebChat from the command line", () => {
   });
 });
 
+describe("memory from the command line", () => {
+  it("writes, shows, lists, exports and erases notes, as plain files you can also edit by hand", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    const port = String(await start(true));
+    const m = (...a: string[]): Promise<{ code: number; out: string; err: string }> => cli([...a, "--port", port]);
+
+    expect((await m("memory", "path")).out).toContain(join(dir, "memory"));
+    expect((await m("memory", "list")).out).toContain("No your notes yet");
+    expect((await m("memory", "write", "preferences", "--text", "Likes short answers")).out).toContain("Saved preferences");
+    expect((await m("memory", "write", "preferences", "--text", "Metric units", "--append")).code).toBe(0);
+    expect((await m("memory", "write", "likes", "--contact", "telegram:1001", "--text", "tea")).code).toBe(0);
+    expect(readFileSync(join(dir, "memory", "owner", "preferences.md"), "utf8")).toBe("Likes short answers\nMetric units\n");
+
+    expect((await m("memory", "show", "preferences")).out).toBe("Likes short answers\nMetric units\n");
+    expect((await m("memory", "list")).out).toMatch(/preferences\s+\d+ bytes/);
+    expect((await m("memory", "show", "likes", "--contact", "telegram:1001")).out).toBe("tea\n");
+    expect((await m("memory", "contacts")).out).toMatch(/\(you\)[\s\S]*telegram:1001/);
+
+    // a note typed in an editor is seen without a restart
+    writeFileSync(join(dir, "memory", "owner", "handmade.md"), "from my editor\n");
+    expect((await m("memory", "show", "handmade")).out).toBe("from my editor\n");
+
+    const out = join(base, "export");
+    expect((await m("memory", "export", out)).out).toContain("Exported 3 notes");
+    expect(readFileSync(join(out, "owner", "preferences.md"), "utf8")).toBe("Likes short answers\nMetric units\n");
+    expect(readFileSync(join(out, "contacts", "telegram", "1001", "likes.md"), "utf8")).toBe("tea\n");
+    expect((await m("memory", "export", out)).err).toContain("EXISTS");
+
+    // erasing needs an explicit target and an explicit yes
+    expect((await m("memory", "erase")).err).toContain("USAGE");
+    expect((await m("memory", "erase", "--all")).err).toContain("CONFIRM_REQUIRED");
+    expect(existsSync(join(dir, "memory", "owner", "preferences.md"))).toBe(true);
+    expect((await m("memory", "erase", "--contact", "telegram:1001", "--yes")).out).toContain("Erased 1 notes");
+    expect((await m("memory", "contacts")).out).not.toContain("1001");
+    expect((await m("memory", "erase", "--all", "--yes")).out).toContain("Erased 2 notes");
+    expect(existsSync(join(dir, "memory"))).toBe(false);
+
+    expect((await m("memory", "write", "Bad Name", "--text", "x")).err).toContain("MEMORY.INVALID");
+    expect((await m("memory", "write", "n")).err).toContain("USAGE");
+    expect((await m("memory", "show", "x", "--contact", "nocolon")).err).toContain("USAGE");
+  }, 30_000);
+
+  it("travels in a backup and comes back on restore", async () => {
+    await runSetup({ dataDir: dir, out: () => undefined });
+    const db = openDb(join(dir, "gateway.db"));
+    db.close();
+    mkdirSync(join(dir, "memory", "owner"), { recursive: true });
+    writeFileSync(join(dir, "memory", "owner", "prefs.md"), "Likes short answers\n");
+    const out = join(base, "bk");
+    const manifest = createBackup(dir, out);
+    expect(manifest.files.map((f) => f.name)).toContain("memory/owner/prefs.md");
+    rmSync(dir, { recursive: true, force: true });
+    await restoreBackup(out, dir, { port: 59993 });
+    expect(readFileSync(join(dir, "memory", "owner", "prefs.md"), "utf8")).toBe("Likes short answers\n");
+  });
+});
+
 describe("plugin settings and secrets from the command line", () => {
   const SECRET = "bot-secret-0123456789";
 

@@ -79,6 +79,23 @@ describe("AcpProvider with a scripted harness", () => {
     expect(b).not.toContain("secret of A");
   });
 
+  it("shows the model its notes once, again when they change, and a retraction when they go away", async () => {
+    const p = make("ctx");
+    const turn = (system: string | undefined, text: string): Promise<string> => collect(p, { ...req("gN", [user(text)]), ...(system === undefined ? {} : { system }) });
+    const first = await turn("Likes tea", "one");
+    expect(first).toContain("[Notes]");
+    expect(first).toContain("Likes tea");
+    expect(await turn("Likes tea", "two")).not.toContain("Likes tea");
+    const changed = await turn("Likes coffee", "three");
+    expect(changed).toContain("Likes coffee");
+    const gone = await turn(undefined, "four");
+    expect(gone).toContain("no longer available");
+    expect(gone).not.toContain("Likes");
+    expect(await turn(undefined, "five")).not.toContain("no longer available");
+    // another conversation never sees them
+    expect(await collect(p, req("gOther", [user("hi")]))).not.toContain("Likes");
+  });
+
   it("rejects permission requests by default, choosing the reject option", async () => {
     const declined: string[] = [];
     const p = make("perm", { onDeclined: (w) => declined.push(w) });

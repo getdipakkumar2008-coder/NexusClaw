@@ -16,13 +16,14 @@ import {
 import { isLoopback, type Config } from "@clawnexus/config";
 import { EventLog, CursorExpiredError, openDb, type Db, type StoredEvent } from "@clawnexus/store";
 import { PairingError, PairingService } from "@clawnexus/pairing";
-import { ApprovalError, ApprovalStore } from "@clawnexus/policy";
+import { ApprovalError, ApprovalStore, type PrincipalKind } from "@clawnexus/policy";
 import { BUILTIN_TOOLS, ToolExecutor, WorkspaceGuard } from "@clawnexus/tools";
 import { BridgeRegistry, type BridgeGrant, type MintOptions } from "./bridge.js";
 import { ChannelManager, WEBCHAT_ID, WebChatAdapter } from "@clawnexus/channels";
 import { PluginError, PluginHost, type HostOptions } from "@clawnexus/plugins";
 import { LocalVault, VaultError } from "@clawnexus/vault";
-import { SessionError, SessionManager, type Provider, type SessionManagerOptions } from "@clawnexus/sessions";
+import { SessionError, SessionManager, type Provider, type Session, type SessionManagerOptions } from "@clawnexus/sessions";
+import { MemoryError, MemoryStore, memoryTools, renderContext, type MemoryScope, type ScopeDecision } from "@clawnexus/memory";
 
 export interface GatewayOptions {
   /** Directory holding the database and token file. Created (mode 0700) if missing. */
@@ -99,6 +100,7 @@ export class Gateway {
   readonly bridgeGrants: BridgeRegistry;
   readonly plugins: PluginHost;
   private readonly vault: LocalVault;
+  readonly memory: MemoryStore;
   readonly channels: ChannelManager;
   private readonly webchat: WebChatAdapter;
   private readonly profile: "standard" | "locked-down" | "trusted";
@@ -153,10 +155,16 @@ export class Gateway {
     });
     const workspace = opts.workspace ?? join(opts.dataDir, "workspace");
     mkdirSync(workspace, { recursive: true, mode: 0o700 });
-    this.tools = new ToolExecutor({ events: this.events, approvals: this.approvals, guard: new WorkspaceGuard([workspace]), tools: BUILTIN_TOOLS });
+    this.memory = new MemoryStore(join(opts.dataDir, "memory"), { db: this.db, events: this.events, now: this.o.now });
+    this.tools = new ToolExecutor({
+      events: this.events,
+      approvals: this.approvals,
+      guard: new WorkspaceGuard([workspace]),
+      tools: [...BUILTIN_TOOLS, ...memoryTools({ store: this.memory, scopeFor: (env) => this.memoryScopeFor(env.principal, env.session) })],
+    });
     this.vault = new LocalVault(opts.dataDir);
     this.plugins = new PluginHost({ dataDir: opts.dataDir, db: this.db, events: this.events, tools: this.tools, secrets: this.vault, channels: { attach: (a) => this.channels.attach(a), detach: (id) => this.channels.detach(id) }, now: this.o.now, ...opts.plugins });
-    this.sessions = opts.provider ? new SessionManager(this.db, this.events, opts.provider, { now: this.o.now, ...opts.sessions }) : undefined;
+    this.sessions = opts.provider ? new SessionManager(this.db, this.events, opts.provider, { now: this.o.now, context: (s) => this.memoryContext(s), ...opts.sessions }) : undefined;
 
     this.webchat = new WebChatAdapter({
       registerOwner: (externalId, display) => void this.pairing.registerOwner({ channel: WEBCHAT_ID, accountId: "default", externalId, display }),
@@ -445,6 +453,79 @@ export class Gateway {
     }
   }
 
+  // ---------------- memory ----------------
+
+  /**
+   * Which notes a caller may see. The owner's own, when acting for the owner; the contact's own, when talking to a
+   * guest one-to-one; none in a group (several people share it, so nothing personal belongs there). The session row is
+   * the truth, never the model's arguments.
+   */
+  private memoryScopeFor(principal: PrincipalKind, sessionId: string | undefined): ScopeDecision {
+    if (principal === "owner") return { scope: { kind: "owner" } };
+    if (principal !== "guest") return { unavailable: "memory is not available to this caller" };
+    let s: Session | undefined;
+    try {
+      s = sessionId === undefined ? undefined : this.sessions?.get(sessionId);
+    } catch {
+      s = undefined;
+    }
+    if (!s) return { unavailable: "memory is not available outside a conversation" };
+    const scope = this.memoryScopeOfSession(s);
+    return scope ? { scope } : { unavailable: "memory is not kept in group conversations" };
+  }
+
+  private memoryScopeOfSession(s: Session): MemoryScope | undefined {
+    if (s.principal === "owner") return { kind: "owner" };
+    if (s.scope === "group") return undefined;
+    return { kind: "contact", channel: s.channel, contact: s.scope };
+  }
+
+  private memoryContext(s: Session): string | undefined {
+    const scope = this.memoryScopeOfSession(s);
+    return scope ? renderContext(this.memory, scope) : undefined;
+  }
+
+  private memoryMethod(method: string, params: unknown): unknown {
+    const scope = z.discriminatedUnion("kind", [
+      z.strictObject({ kind: z.literal("owner") }),
+      z.strictObject({ kind: z.literal("contact"), channel: z.string().min(1).max(64), contact: z.string().min(1).max(256) }),
+    ]);
+    const name = z.string().min(1).max(64);
+    const owner = { via: "owner" as const };
+    try {
+      switch (method) {
+        case "memory.list": {
+          const p = z.strictObject({ scope }).parse(params);
+          return { files: this.memory.list(p.scope) };
+        }
+        case "memory.read": {
+          const p = z.strictObject({ scope, name }).parse(params);
+          return { note: this.memory.read(p.scope, p.name) };
+        }
+        case "memory.write": {
+          const p = z.strictObject({ scope, name, content: z.string().max(200_000), mode: z.enum(["replace", "append"]).default("replace") }).parse(params);
+          return { note: this.memory.write(p.scope, p.name, p.content, p.mode, owner) };
+        }
+        case "memory.delete": {
+          const p = z.strictObject({ scope, name }).parse(params);
+          this.memory.delete(p.scope, p.name, owner);
+          return {};
+        }
+        case "memory.export": {
+          const p = z.strictObject({ scope }).parse(params);
+          return { files: this.memory.export(p.scope) };
+        }
+        default: {
+          const p = z.strictObject({ scope: z.union([scope, z.literal("all")]) }).parse(params);
+          return this.memory.erase(p.scope);
+        }
+      }
+    } catch (e) {
+      if (e instanceof MemoryError) throw new MethodError(err(`MEMORY.${e.code}`, e.message, "Check the note name and size."));
+      throw e;
+    }
+  }
+
   /**
    * Who the model is acting for RIGHT NOW. The session row is the truth (a sender may have been demoted since the
    * bridge was opened); a bridge minted as guest can never rise above guest; a session that no longer exists is guest.
@@ -537,6 +618,16 @@ export class Gateway {
           ...(p.session === undefined ? {} : { session: p.session }),
         });
       }
+
+      case "memory.scopes":
+        return { scopes: this.memory.scopes() };
+      case "memory.list":
+      case "memory.read":
+      case "memory.write":
+      case "memory.delete":
+      case "memory.export":
+      case "memory.erase":
+        return this.memoryMethod(method, params);
 
       case "channel.list":
         return { channels: this.channels.list() };

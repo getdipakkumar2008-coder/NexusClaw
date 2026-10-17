@@ -48,7 +48,7 @@ Boundaries: (B1) Internet↔channel platform↔Gateway; (B2) Gateway↔plugin pr
 | T16 | Update channel compromise | B7 | Fleet RCE | Signed releases (Foundation key, offline root), TUF-style metadata, rollback protection | Low-Med |
 | T17 | Log/diagnostic leakage | — | Privacy | Redaction, user-reviewed bundles | Low |
 | T18 | Web Control UI XSS/CSRF/clickjacking | B5 | Takeover | CSP strict, no inline scripts, SameSite, CSRF tokens, frame-ancestors none, markdown sanitised | Low |
-| T19 | Memory poisoning (persistent injection stored in memory) | B1 | Long-term manipulation | Memory writes from untrusted sessions need approval or are scoped per-contact; provenance recorded; easy review/diff | Medium |
+| T19 | Memory poisoning (persistent injection stored in memory) | B1 | Long-term manipulation | Memory writes from untrusted sessions need approval or are scoped per-contact; provenance recorded; easy review/diff. Implemented (WP11): the model's scope comes from the session, never its arguments; guests cannot write; groups have no memory; the owner's notes are never shown to a guest; notes are shown labelled as information, not instructions | Medium |
 | T20 | Device-action abuse (silent camera/mic) | B5 | Privacy | On-device consent, visible indicators, audit, no background capture | Low |
 
 ## 4. Tool policy model

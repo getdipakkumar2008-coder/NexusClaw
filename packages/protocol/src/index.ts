@@ -20,6 +20,7 @@ export const ERROR_CODE_FAMILIES = [
   "BAD_FRAME",
   "SYNC",
   "SESSION",
+  "MEMORY",
 ] as const;
 
 export const errorCodeSchema = z

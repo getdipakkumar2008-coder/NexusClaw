@@ -12,6 +12,8 @@ export interface ProviderRequest {
   signal: AbortSignal;
   /** Where the message being answered came from. External senders are untrusted and the model should be told so. */
   source?: { channel: string; sender: string; principal: "owner" | "guest" };
+  /** Notes to show the model this turn (memory). Recomputed every turn, so a provider that keeps its own conversation should resend it only when it changes. Absent when there is nothing to show. */
+  system?: string;
 }
 
 export type ProviderEvent = { type: "delta"; text: string };

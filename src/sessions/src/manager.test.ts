@@ -51,6 +51,34 @@ describe("sessions", () => {
   });
 });
 
+describe("context for the model", () => {
+  it("is asked for per session on every run and handed to the provider", async () => {
+    const p = new FakeProvider();
+    const m = make(p, { context: (s) => (s.scope === "alice" ? "Alice likes tea" : undefined) });
+    const a = m.getOrCreate(key("alice"));
+    const b = m.getOrCreate(key("bob"));
+    m.send(a.id, "hi");
+    m.send(b.id, "hi");
+    await m.idle();
+    expect(p.calls.find((c) => c.sessionId === a.id)?.system).toBe("Alice likes tea");
+    expect(p.calls.find((c) => c.sessionId === b.id)).not.toHaveProperty("system");
+  });
+
+  it("never stops a run when the context cannot be produced", async () => {
+    const p = new FakeProvider();
+    const m = make(p, {
+      context: () => {
+        throw new Error("disk on fire");
+      },
+    });
+    const s = m.getOrCreate(key("alice"));
+    const { runId } = m.send(s.id, "hi");
+    await m.idle();
+    expect(m.runStatus(runId)?.status).toBe("completed");
+    expect(p.calls[0]).not.toHaveProperty("system");
+  });
+});
+
 describe("runs", () => {
   it("runs a message to completion and stores the transcript and events", async () => {
     const m = make();

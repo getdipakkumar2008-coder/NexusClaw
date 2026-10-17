@@ -18,6 +18,7 @@
       "@clawnexus/plugins": ["src/plugins/src/index.ts"],
       "@clawnexus/channels": ["src/channels/src/index.ts"],
       "@clawnexus/vault": ["src/vault/src/index.ts"],
+      "@clawnexus/memory": ["src/memory/src/index.ts"],
       "@clawnexus/gateway": ["src/gateway/src/index.ts"],
       "@clawnexus/daemon": ["src/daemon/src/index.ts"]
     }

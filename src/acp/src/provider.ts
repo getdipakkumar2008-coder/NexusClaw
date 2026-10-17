@@ -57,6 +57,8 @@ export class AcpProvider implements Provider {
   readonly name: string;
   private conn: Promise<AcpConnection> | undefined;
   private readonly sessions = new Map<string, string>();
+  /** The notes last shown to each harness session, so they are resent only when they change. */
+  private readonly shown = new Map<string, string>();
   private readonly bridges = new Map<string, () => void>();
   /** harness session id -> the MCP server names we handed it. */
   private readonly offered = new Map<string, Set<string>>();
@@ -122,6 +124,7 @@ export class AcpProvider implements Provider {
         throw e;
       }
       this.sessions.set(req.sessionId, sid);
+      this.shown.delete(req.sessionId);
       if (bridge) {
         this.bridges.set(req.sessionId, bridge.close);
         this.offered.set(sid, new Set(bridge.mcpServers.map((m) => m.name)));
@@ -129,7 +132,7 @@ export class AcpProvider implements Provider {
     }
     const body = fresh ? buildPrompt(req.messages, this.o.maxContextChars ?? 24_000) : [...req.messages].reverse().find((m) => m.role === "user")?.content ?? "";
     if (body === "") return;
-    const text = externalHeader(req.source) + body;
+    const text = this.notesFor(req) + externalHeader(req.source) + body;
 
     // Bridge the callback into an async iterator.
     const queue: string[] = [];
@@ -191,9 +194,22 @@ export class AcpProvider implements Provider {
     }
   }
 
+  /** Notes for this turn: the full text the first time and whenever it changes, a short retraction if it went away, otherwise nothing. */
+  private notesFor(req: ProviderRequest): string {
+    const before = this.shown.get(req.sessionId);
+    if (req.system === before) return "";
+    if (req.system === undefined) {
+      this.shown.delete(req.sessionId);
+      return "[The notes shown earlier are no longer available. Do not rely on them.]\n";
+    }
+    this.shown.set(req.sessionId, req.system);
+    return `[Notes]\n${req.system}\n[End of notes]\n\n`;
+  }
+
   /** The harness session is gone, so its tool credentials must stop working too. */
   private forgetSessions(): void {
     this.sessions.clear();
+    this.shown.clear();
     this.offered.clear();
     for (const close of this.bridges.values()) {
       try {

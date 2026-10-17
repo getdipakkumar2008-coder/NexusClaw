@@ -41,7 +41,7 @@ Max frame 1 MiB; larger payloads via `/v1/upload` + blob reference.
 | events | `events.subscribe {sessions?, since:seq}`, `events.unsubscribe` |
 | channels | `channel.list`, `channel.status`, `channel.enable/disable`, `pairing.list`, `pairing.approve`, `pairing.deny` |
 | devices | `device.pair.begin`, `device.list`, `device.revoke`, `device.action.result` |
-| memory | `memory.list/read/write/delete/export` |
+| memory | `memory.scopes`, `memory.list/read/write/delete/export/erase` (owner only; a tool bridge cannot call them). A scope is `{kind:"owner"}` or `{kind:"contact", channel, contact}`; `erase` also takes `"all"`. Errors: `MEMORY.NOT_FOUND`, `MEMORY.INVALID`, `MEMORY.TOO_LARGE`, `MEMORY.LIMIT`. |
 | automations | `automation.list/create/update/delete/run` |
 | config | `config.get` (secrets redacted), `config.validate`, `config.patch` (schema-checked), `doctor.run` |
 | plugins | `plugin.list/install/enable/disable/remove` |
@@ -52,7 +52,7 @@ Max frame 1 MiB; larger payloads via `/v1/upload` + blob reference.
 Guarantee: events are **totally ordered by `seq`**, durable, at-least-once delivery with client-side dedupe by `seq`; resume with `since`. Retention configurable (default 30 days, compacted).
 
 ## 7. Errors
-`{code, message, remediation, retryable, docsUrl?}`. Code families: `AUTH_*`, `POLICY_*`, `PROVIDER_*`, `CHANNEL_*`, `CONFIG_*`, `PLUGIN_*`, `RATE_LIMIT`, `UNSUPPORTED`, `INTERNAL`. No stack traces to clients (logged locally with correlation id).
+`{code, message, remediation, retryable, docsUrl?}`. Code families: `AUTH_*`, `POLICY_*`, `PROVIDER_*`, `CHANNEL_*`, `CONFIG_*`, `PLUGIN_*`, `MEMORY_*`, `RATE_LIMIT`, `UNSUPPORTED`, `INTERNAL`. No stack traces to clients (logged locally with correlation id).
 
 ## 8. Backpressure & limits
 Per-connection send queue cap (default 5 MiB) → slow clients dropped with `SLOW_CONSUMER` (can resume by cursor). Request rate limits per role. Max concurrent runs per session = 1 (inputs queued, with `steer`/`interrupt` modes **[Proposed]**).
