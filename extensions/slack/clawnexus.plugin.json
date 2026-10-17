@@ -1,0 +1,16 @@
+{
+  "id": "slack",
+  "name": "Slack channel",
+  "version": "0.1.0",
+  "kind": "code",
+  "sdkRange": "^0.3.0",
+  "entry": "index.mjs",
+  "provides": ["channel:slack"],
+  "permissions": {
+    "network": ["slack.com", "*.slack.com"],
+    "secrets": ["bot_token", "app_token"]
+  },
+  "configSchema": {
+    "apiBase": { "type": "string", "maxLength": 200, "optional": true, "description": "Slack Web API address; leave unset for Slack itself" }
+  }
+}
