@@ -119,6 +119,12 @@ try {
     gateway.kill();
     await new Promise((r) => gateway.once("exit", r));
   }
-  rmSync(work, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  // On Windows a plugin process can hold its folder for a moment after the Gateway ends. A leftover temp folder is not a
+  // failure of what is being tested, so wait for it a while and then only say so.
+  try {
+    rmSync(work, { recursive: true, force: true, maxRetries: 60, retryDelay: 250 });
+  } catch (e) {
+    process.stdout.write(`  note: could not remove ${work}: ${e instanceof Error ? e.message : e}\n`);
+  }
 }
 process.exit(failed ? 1 : 0);

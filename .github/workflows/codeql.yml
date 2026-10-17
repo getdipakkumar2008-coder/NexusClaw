@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
   security-events: write
+  actions: read # the upload step looks up the workflow run
 
 jobs:
   analyze:
