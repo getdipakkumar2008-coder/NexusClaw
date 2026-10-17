@@ -150,6 +150,51 @@ describe("files going out", () => {
     expect(adapter.sent).toHaveLength(1);
   });
 
+  it("gets longer than a text reply to finish uploading, and is sent once, not again while the first upload runs", async () => {
+    const adapter = new FakeAdapter("fake", { files: true });
+    bed = await createBed({ adapters: [adapter], provider: new FakeProvider({ chunkSize: 1000, reply: () => "seen" }), manager: { adapterTimeoutMs: 100, fileTimeoutMs: 3000 } });
+    bed.pairing.registerOwner({ channel: "fake", accountId: "default", externalId: "owner1" });
+    await say(adapter, "m1", { text: "hello" });
+    await waitFor(() => adapter.sent.length === 1);
+    adapter.sendDelayMs = 400; // slower than the text limit, well inside the file limit
+    bed.manager.sendFile(bed.sessions!.list()[0]!.id, file(bed), "slow");
+    await waitFor(() => adapter.sent.length === 2, 5000);
+    await new Promise((r) => setTimeout(r, 1500)); // a repeat would have come by now
+    expect(adapter.sent).toHaveLength(2);
+    expect(bed.manager.outbox.summary()).toMatchObject({ pending: 0, failed: 0 });
+  });
+
+  it("does not hold up the conversation when the stored file cannot be read at all", async () => {
+    const { adapter, bed: b, session } = await talking();
+    const real = b.blobs.read.bind(b.blobs);
+    (b.blobs as { read: unknown }).read = () => {
+      throw new Error("disk error");
+    };
+    b.manager.sendFile(session, file(b), "never arrives");
+    await waitFor(() => b.manager.outbox.summary().failed >= 1);
+    expect(b.events.readSince(0, { limit: 5000 }).some((e) => e.type === "channel.send_failed")).toBe(true);
+    (b.blobs as { read: unknown }).read = real;
+    await say(adapter, "m2", { text: "still there?" });
+    await waitFor(() => adapter.sent.length === 2); // the next reply goes out; the failed file is not in front of it
+    expect(adapter.sent[1]!.files).toBeUndefined();
+  });
+
+  it("is recorded before it is delivered, and a record that fails leaves nothing queued to be sent twice", async () => {
+    const { adapter, bed: b, session } = await talking();
+    const order: string[] = [];
+    b.manager.sendFile(session, file(b), "first", () => order.push("recorded"));
+    await waitFor(() => adapter.sent.length === 2);
+    expect(order).toEqual(["recorded"]);
+    expect(() =>
+      b.manager.sendFile(session, file(b, Buffer.concat([PNG, Buffer.from("2")])), "second", () => {
+        throw new Error("no such session");
+      }),
+    ).toThrow(/no such session/);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(adapter.sent).toHaveLength(2); // the second never went out
+    expect(b.manager.outbox.summary()).toMatchObject({ pending: 0, failed: 0 });
+  });
+
   it("waits in the outbox while the platform is down and arrives when it is back", async () => {
     const { adapter, bed: b, session } = await talking();
     adapter.failSends = 1;

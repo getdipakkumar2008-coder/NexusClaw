@@ -27,8 +27,15 @@ class El {
     remove: (c: string) => void (this.className = this.className.split(" ").filter((x) => x !== c).join(" ")),
     add: (c: string) => void (this.className = `${this.className} ${c}`.trim()),
   };
+  parentNode: El | undefined;
   appendChild(c: El): El {
     this.children.push(c);
+    c.parentNode = this;
+    return c;
+  }
+  removeChild(c: El): El {
+    this.children = this.children.filter((x) => x !== c);
+    c.parentNode = undefined;
     return c;
   }
   addEventListener(name: string, fn: (e: unknown) => void): void {
@@ -85,6 +92,7 @@ function load(hash = "") {
     localStorage: { getItem: (k: string) => storage[k] ?? null, setItem: (k: string, v: string) => void (storage[k] = v) },
     crypto: { randomUUID: () => "11111111-2222-3333-4444-555555555555", getRandomValues: (a: Uint8Array) => a },
     setTimeout: (fn: () => void) => timers.push(fn),
+    clearTimeout: (n: number) => void (timers[n - 1] = () => undefined),
   };
   const sandbox = {
     window: win,
@@ -236,6 +244,9 @@ describe("the browser page script", () => {
     p.els["input"]!.value = "look";
     p.els["form"]!.fire("submit", { preventDefault() {} });
     await new Promise((r) => setTimeout(r, 20));
+    expect((p.sock.sent.slice(1) as Array<Record<string, unknown>>).map((x) => x["t"])).toEqual(["file", "file"]); // the message waits for the Gateway
+    p.sock.deliver({ t: "file", up: (p.sock.sent[1] as Record<string, unknown>)["up"], status: "ready" });
+    await new Promise((r) => setTimeout(r, 20));
     const frames = p.sock.sent.slice(1) as Array<Record<string, unknown>>;
     expect(frames.map((x) => x["t"])).toEqual(["file", "file", "message"]);
     expect(frames[0]).toMatchObject({ seq: 0, last: false, name: "<b>pic</b>.png" });
@@ -244,6 +255,93 @@ describe("the browser page script", () => {
     expect(Buffer.from(frames[0]!["data"] as string, "base64").length + Buffer.from(frames[1]!["data"] as string, "base64").length).toBe(big.length);
     expect(p.els["log"]!.children[0]!.textContent).toBe("look\nAttached: <b>pic</b>.png");
     expect(p.els["files"]!.hidden).toBe(true);
+  });
+
+  describe("when the files do not get there", () => {
+    const start = (text = "see attached") => {
+      const p = load();
+      p.sock.onopen?.();
+      p.sock.deliver({ t: "ready", role: "guest" });
+      const big = new Uint8Array(200 * 1024).fill(66);
+      (p.els["attach"] as unknown as { files: unknown[] }).files = [{ name: "doc.txt", size: big.length, arrayBuffer: async () => big.buffer }];
+      p.els["attach"]!.fire("change");
+      p.els["input"]!.value = text;
+      p.els["form"]!.fire("submit", { preventDefault() {} });
+      return p;
+    };
+    const tick = () => new Promise((r) => setTimeout(r, 20));
+    const messages = (p: ReturnType<typeof load>) => (p.sock.sent as Array<Record<string, unknown>>).filter((x) => x["t"] === "message");
+    const gaveBack = (p: ReturnType<typeof load>) => {
+      expect(messages(p)).toHaveLength(0); // nothing was sent
+      expect(p.els["log"]!.children).toHaveLength(0); // the waiting bubble is gone
+      expect(p.els["input"]!.value).toBe("see attached"); // the visitor has their words back
+      expect(p.els["files"]!.hidden).toBe(false); // and their file
+      expect(p.els["files"]!.children.map((c) => c.textContent)).toEqual(["doc.txt"]);
+      expect(p.els["notice"]!.textContent).toMatch(/not sent/);
+    };
+
+    it("gives the text and the files back when the Gateway refuses a file, and says why", async () => {
+      const p = start();
+      await tick();
+      const up = (p.sock.sent[1] as Record<string, unknown>)["up"];
+      p.sock.deliver({ t: "file", up, status: "too_large" });
+      await tick();
+      gaveBack(p);
+      expect(p.els["notice"]!.textContent).toMatch(/too large/);
+    });
+
+    it("stops sending pieces of a file the Gateway has already refused", async () => {
+      const p = load();
+      p.sock.onopen?.();
+      p.sock.deliver({ t: "ready", role: "guest" });
+      (p.sock as unknown as { bufferedAmount: number }).bufferedAmount = 5_000_000; // the connection is backed up: nothing goes yet
+      const big = new Uint8Array(500 * 1024).fill(67);
+      (p.els["attach"] as unknown as { files: unknown[] }).files = [{ name: "doc.txt", size: big.length, arrayBuffer: async () => big.buffer }];
+      p.els["attach"]!.fire("change");
+      p.els["input"]!.value = "see attached";
+      p.els["form"]!.fire("submit", { preventDefault() {} });
+      await tick();
+      expect(p.sock.sent).toHaveLength(1); // only the hello
+      p.sock.deliver({ t: "file", up: "11111111222233334444555555555555", status: "limited" });
+      (p.sock as unknown as { bufferedAmount: number }).bufferedAmount = 0;
+      p.timers.forEach((t) => t());
+      await tick();
+      expect(p.sock.sent.filter((x) => (x as Record<string, unknown>)["t"] === "file")).toHaveLength(0);
+      gaveBack(p);
+      expect(p.els["notice"]!.textContent).toMatch(/too many files/);
+    });
+
+    it("gives everything back when the connection drops during the upload", async () => {
+      const p = start();
+      await tick();
+      p.sock.onclose?.();
+      await tick();
+      gaveBack(p);
+      expect(p.els["notice"]!.textContent).toMatch(/connection was lost/);
+    });
+
+    it("gives up waiting for the Gateway after a while", async () => {
+      const p = start();
+      await tick();
+      expect(p.timers).toHaveLength(1);
+      p.timers[0]!(); // thirty seconds pass without a word from the Gateway
+      await tick();
+      gaveBack(p);
+      expect(p.els["notice"]!.textContent).toMatch(/did not confirm/);
+    });
+
+    it("can send again afterwards", async () => {
+      const p = start();
+      await tick();
+      p.sock.deliver({ t: "file", up: (p.sock.sent[1] as Record<string, unknown>)["up"], status: "too_large" });
+      await tick();
+      p.els["form"]!.fire("submit", { preventDefault() {} }); // the same text and file, as they were given back
+      await tick();
+      p.sock.deliver({ t: "file", up: (p.sock.sent.at(-1) as Record<string, unknown>)["up"], status: "ready" });
+      await tick();
+      expect(messages(p)).toHaveLength(1);
+      expect(messages(p)[0]).toMatchObject({ text: "see attached" });
+    });
   });
 
   it("offers a file from the assistant as a download, never as something to open in the page", () => {

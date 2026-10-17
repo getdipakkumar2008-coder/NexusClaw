@@ -32,5 +32,6 @@ Per docs/12 section 4: for each module, what spec it implements and which extern
 | 2026-10-16 | extensions/telegram | docs/05 | Telegram Bot API public documentation (getMe, getUpdates, sendMessage, deleteWebhook, error parameters), recalled from general knowledge; no reference-project material | Phase 1 WP10 slice 3 |
 | 2026-10-16 | src/channels (router, WebChat, conformance suite) | docs/05, docs/06 T2/T3 | `ws` library documentation; general web security practice (CSP, same-origin checks); no reference-project material | Phase 1 WP10 slice 1 |
 | 2026-10-16 | spikes/* | docs/11 section D | Node.js docs (node:sqlite, node:crypto, child_process) | Phase 0 scaffold |
+| 2026-10-17 | Review fixes: file send time limit, WebChat upload failure handling, picture cleaning result, export folder, Telegram captions, scan hook messages | docs/17, docs/05 | Node.js child_process and Telegram Bot API documentation (caption length, photo limits); no reference-project material | Phase 1 WP13 follow-up |
 
 Note: the planning docs themselves were derived from `req.odt`, a brief that the owner states was reconstructed from the reference project's public artifacts. See docs/12 section 3 for the renames/rewrites still pending (Q-19).

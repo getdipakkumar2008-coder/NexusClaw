@@ -287,9 +287,11 @@ export class WebChatAdapter implements ChannelAdapter {
     c.tokens -= 1;
     // Files named by the message must be complete uploads of this connection; they are used once.
     const attachments: Array<{ name: string; bytes: number; data: string }> = [];
-    for (const up of new Set(f.files ?? [])) {
-      const u = c.uploads.get(up);
-      if (!u?.done) return this.out(c, { t: "ack", id: f.id, status: "ignored" });
+    // Every name is checked before any is used, so a message that names a missing file leaves the others for a second try.
+    const named = [...new Set(f.files ?? [])];
+    for (const up of named) if (!c.uploads.get(up)?.done) return this.out(c, { t: "ack", id: f.id, status: "ignored" });
+    for (const up of named) {
+      const u = c.uploads.get(up) as Upload;
       attachments.push({ name: u.name, bytes: u.bytes, data: Buffer.concat(u.chunks).toString("base64") });
       c.uploads.delete(up);
     }

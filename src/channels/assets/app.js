@@ -19,6 +19,15 @@
   var CHUNK = 192 * 1024;
   var chosen = [];
   var sending = false;
+  var uploads = {}; // files going up right now, by upload id: what the Gateway has said about each
+  var WHY = {
+    not_paired: "Files can be sent once the owner has approved you.",
+    too_large: "That file is too large.",
+    limited: "You have sent too many files for now.",
+    too_many: "Too many files at once.",
+    timeout: "The Gateway did not confirm the file in time.",
+    closed: "The connection was lost before the file arrived."
+  };
 
   var memory = {};
   function store(name, value) {
@@ -123,6 +132,7 @@
     };
     socket.onclose = function () {
       open = false;
+      Object.keys(uploads).forEach(function (k) { uploads[k].end("closed"); });
       enable(false);
       typingEl.hidden = true;
       setStatus("Disconnected. Reconnecting…");
@@ -156,10 +166,9 @@
     } else if (f.t === "typing") {
       typingEl.hidden = !f.on;
     } else if (f.t === "file") {
-      if (f.status !== "ready") {
-        var why = { not_paired: "Files can be sent once the owner has approved you.", too_large: "That file is too large.", limited: "You have sent too many files for now.", too_many: "Too many files at once." };
-        showNotice(why[f.status] || "A file could not be sent.");
-      }
+      var going = uploads[f.up];
+      if (going) going.end(f.status);
+      else if (f.status !== "ready") showNotice(WHY[f.status] || "A file could not be sent.");
     } else if (f.t === "ack") {
       var el = pending[f.id];
       if (el) {
@@ -200,21 +209,55 @@
       })();
     });
   }
-  // A file goes up in pieces so that no single frame is large; the Gateway puts them together and checks them.
+  // A file goes up in pieces so that no single frame is large; the Gateway puts them together and checks them. The
+  // message that names the file is sent only after the Gateway has said it is complete ("ready"); if it says anything else,
+  // or the connection drops, this fails with the reason and nothing is sent.
   function upload(file) {
     var up = newId();
-    return file.arrayBuffer().then(function (buf) {
-      var bytes = new Uint8Array(buf);
-      var seq = 0;
-      function next(at) {
-        var end = Math.min(at + CHUNK, bytes.length);
-        return drained().then(function () {
-          socket.send(JSON.stringify({ t: "file", up: up, name: file.name, seq: seq++, last: end >= bytes.length, data: toBase64(bytes.subarray(at, end)) }));
-          return end >= bytes.length ? up : next(end);
-        });
-      }
-      return next(0);
+    var state = { status: "" };
+    var settled = new Promise(function (resolve, reject) {
+      state.end = function (status) {
+        if (state.status) return;
+        state.status = status;
+        if (status === "ready") resolve();
+        else reject(new Error(status));
+      };
     });
+    settled.catch(function () {});
+    uploads[up] = state;
+    function finish() {
+      delete uploads[up];
+    }
+    return file
+      .arrayBuffer()
+      .then(function (buf) {
+        var bytes = new Uint8Array(buf);
+        var seq = 0;
+        function next(at) {
+          var end = Math.min(at + CHUNK, bytes.length);
+          return drained().then(function () {
+            if (state.status && state.status !== "ready") throw new Error(state.status); // refused part-way: stop sending pieces
+            if (!open) throw new Error("closed");
+            socket.send(JSON.stringify({ t: "file", up: up, name: file.name, seq: seq++, last: end >= bytes.length, data: toBase64(bytes.subarray(at, end)) }));
+            return end >= bytes.length ? undefined : next(end);
+          });
+        }
+        return next(0);
+      })
+      .then(function () {
+        var timer;
+        var late = new Promise(function (resolve, reject) {
+          timer = window.setTimeout(function () { reject(new Error("timeout")); }, 30000);
+        });
+        return Promise.race([settled, late]).then(
+          function () { window.clearTimeout(timer); },
+          function (e) { window.clearTimeout(timer); throw e; }
+        );
+      })
+      .then(
+        function () { finish(); return up; },
+        function (e) { finish(); throw e; }
+      );
   }
 
   function submit() {
@@ -229,6 +272,17 @@
     pending[id] = addMessage("you", shown, "pending");
     if (files.length === 0) return void socket.send(JSON.stringify({ t: "message", id: id, text: text }));
     sending = true;
+    // If the files cannot be delivered, nothing was sent: take the message back out of the log and give the visitor
+    // their text and their files again, with the reason.
+    function giveBack(reason) {
+      var el = pending[id];
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+      delete pending[id];
+      if (!input.value) input.value = text;
+      chosen = files;
+      showChosen();
+      showNotice((WHY[reason] || "The files could not be sent.") + " Your message was not sent; it is back in the box.");
+    }
     files
       .reduce(function (p, f) {
         return p.then(function (ids) {
@@ -241,8 +295,8 @@
       .then(function (ids) {
         socket.send(JSON.stringify({ t: "message", id: id, text: text, files: ids }));
       })
-      .catch(function () {
-        showNotice("The files could not be read.");
+      .catch(function (e) {
+        giveBack(e && e.message);
       })
       .then(function () {
         sending = false;

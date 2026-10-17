@@ -47,7 +47,14 @@ class Client {
   }
 }
 
-const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("....IHDR gateway picture")]);
+// A picture made of real chunks, as every PNG is (a file that cannot be followed is not sent: see the test below).
+const chunk = (type: string, body: string): Buffer => {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(body.length);
+  return Buffer.concat([len, Buffer.from(type, "latin1"), Buffer.from(body, "latin1"), Buffer.alloc(4)]);
+};
+const SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const PNG = Buffer.concat([SIGNATURE, chunk("IHDR", "0123456789012"), chunk("IDAT", "gateway picture"), chunk("IEND", "")]);
 
 let dir: string;
 let gw: Gateway;
@@ -167,6 +174,21 @@ describe("the assistant sending a file", () => {
     const sent = Buffer.from(adapter.sent[0]!.files![0]!.data, "base64").toString("latin1");
     expect(sent).not.toContain("GPS");
     expect(sent).toContain("PIXELS");
+  });
+
+  it("cuts what is appended to a picture, and refuses a picture whose hidden data cannot be removed", async () => {
+    const session = conversation("owner");
+    const appended = Buffer.concat([PNG, Buffer.from("EXIF GPS 51.5N hidden after the end")]);
+    expect((await approvedCall(session, "owner", { path: put(appended, "tail.png") })).status).toBe("ok");
+    await waitFor(() => adapter.sent.length === 1);
+    expect(Buffer.from(adapter.sent[0]!.files![0]!.data, "base64")).toEqual(PNG);
+
+    // starts like a JPEG but cannot be followed to its end: the location in it might be anywhere
+    const broken = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0xff, 0xff]), Buffer.from("Exif GPS 51.5N, and no end")]);
+    const refused = await approvedCall(session, "owner", { path: put(broken, "broken.jpg") });
+    expect(refused).toMatchObject({ status: "error", message: expect.stringMatching(/hidden data.*could not be removed/) });
+    expect(adapter.sent).toHaveLength(1);
+    expect(gw.blobs.stats().count).toBe(1); // nothing of the refused file was kept
   });
 
   it("keeps a file that is waiting to be sent when the store is cleaned", async () => {

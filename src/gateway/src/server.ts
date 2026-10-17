@@ -20,7 +20,7 @@ import {
   type ErrorBody,
 } from "@clawnexus/protocol";
 import { DeviceError, DeviceRegistry } from "@clawnexus/devices";
-import { BlobStore, findScanHook, isBlobId, scanHook } from "@clawnexus/blobs";
+import { BlobStore, findScanHook, isBlobId, scanHook, sweepScanTemp } from "@clawnexus/blobs";
 import { isLoopback, type Config } from "@clawnexus/config";
 import { EventLog, CursorExpiredError, openDb, type Db, type StoredEvent } from "@clawnexus/store";
 import { PairingError, PairingService } from "@clawnexus/pairing";
@@ -243,6 +243,7 @@ export class Gateway {
       now: this.o.now,
     });
     const scanner = findScanHook(opts.dataDir);
+    if (scanner) sweepScanTemp(scanner.workDir); // copies from a check that a crash cut short
     this.channels = new ChannelManager({ db: this.db, events: this.events, pairing: this.pairing, sessions: this.sessions, blobs: this.blobs, ...(scanner ? { scan: scanHook(scanner) } : {}), now: this.o.now });
     this.channels.register(this.webchat);
 

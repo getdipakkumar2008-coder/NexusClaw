@@ -172,19 +172,40 @@ export default {
       }
     }
 
-    /** One file, as a photo, audio or document. The Gateway has already checked what it is; Telegram only ever gets our bot's upload. */
+    const CAPTION_MAX = 1024; // what Telegram allows under a file (a message may be 4096)
+
+    /**
+     * One file, as a photo, audio or document. The Gateway has already checked what it is; Telegram only ever gets our bot's upload.
+     * A caption longer than Telegram allows under a file goes as an ordinary message right after it, whole. A picture that
+     * Telegram refuses as a photo (too big, or a shape it does not like) is sent again as a document.
+     */
     async function sendFile(target, file, caption) {
       const [method, field] = file.mime === "image/png" || file.mime === "image/jpeg" ? ["sendPhoto", "photo"] : file.mime === "audio/mpeg" || file.mime === "audio/mp4" ? ["sendAudio", "audio"] : ["sendDocument", "document"];
-      const form = new FormData();
-      form.append("chat_id", String(Number(target.conversationId)));
-      if (caption) form.append("caption", String(caption).slice(0, 1024));
-      form.append(field, new Blob([Buffer.from(file.data, "base64")], { type: file.mime }), String(file.name).slice(0, 100));
+      const text = caption ? String(caption) : "";
+      const followUp = text.length > CAPTION_MAX;
+      const form = (as) => {
+        const f = new FormData();
+        f.append("chat_id", String(Number(target.conversationId)));
+        if (text && !followUp) f.append("caption", text);
+        f.append(as, new Blob([Buffer.from(file.data, "base64")], { type: file.mime }), String(file.name).slice(0, 100));
+        return f;
+      };
+      let sent;
       try {
-        const sent = await api(method, form, { timeoutMs: 60_000 });
-        return { messageId: `${target.conversationId}:${sent.message_id}` };
+        try {
+          sent = await api(method, form(field), { timeoutMs: 60_000 });
+        } catch (e) {
+          if (method !== "sendPhoto" || e.status !== 400) throw e;
+          sent = await api("sendDocument", form("document"), { timeoutMs: 60_000 });
+        }
       } catch (e) {
         throw new Error(clean(e));
       }
+      if (followUp) {
+        // The file has arrived. If the words cannot follow, do not fail the send: the Gateway would send the file again.
+        await api("sendMessage", { chat_id: Number(target.conversationId), text, disable_web_page_preview: true }).catch((e) => ctx.log("warn", `telegram: the text for a file could not be sent: ${clean(e)}`));
+      }
+      return { messageId: `${target.conversationId}:${sent.message_id}` };
     }
 
     ctx.registerChannel({

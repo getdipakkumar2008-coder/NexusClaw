@@ -72,6 +72,8 @@ export class FakeAdapter implements ChannelAdapter {
   readonly typingLog: Array<{ conversationId: string; on: boolean }> = [];
   /** Fail this many upcoming sends. */
   failSends = 0;
+  /** Take this long to send (a slow upload). */
+  sendDelayMs = 0;
   private state: ChannelStatus = { state: "stopped" };
 
   constructor(id = "fake", caps: Partial<ChannelCapabilities> = {}) {
@@ -94,6 +96,7 @@ export class FakeAdapter implements ChannelAdapter {
       this.failSends--;
       throw new Error("platform unavailable");
     }
+    if (this.sendDelayMs > 0) await new Promise((r) => setTimeout(r, this.sendDelayMs));
     this.sent.push({ conversationId: target.conversationId, text: content.text, ...(content.files ? { files: content.files } : {}) });
     return { messageId: `out-${this.sent.length}` };
   }

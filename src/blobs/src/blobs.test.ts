@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb, type Db } from "@clawnexus/store";
-import { BlobError, BlobStore, DEFAULT_INGEST, ingestAttachments, isBlobId, safeName, scanHook, sniff, stripMetadata } from "./index.js";
+import { BlobError, BlobStore, DEFAULT_INGEST, cleanPicture, ingestAttachments, isBlobId, safeName, scanHook, sniff, stripMetadata, sweepScanTemp } from "./index.js";
 
 const b = (...parts: Array<number[] | string>): Buffer => Buffer.concat(parts.map((p) => (typeof p === "string" ? Buffer.from(p, "latin1") : Buffer.from(p))));
 const PNG = b([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], "....IHDR rest of a picture");
@@ -255,11 +255,54 @@ describe("stripMetadata: personal data out of pictures", () => {
       [b([0xff, 0xd8, 0xff, 0xe1, 0xff, 0xff], "short"), "image/jpeg"], // a block longer than the file
       [b([0xff, 0xd8]), "image/jpeg"],
       [PNG, "image/png"], // not made of chunks
-      [Buffer.concat([png(), b("trailing bytes")]), "image/png"], // data after the end
       [b([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], u32(0xffffffff), "IHDR"), "image/png"],
     ];
     for (const [file, mime] of odd) expect(stripMetadata(file, mime)).toEqual(file);
     expect(stripMetadata(GIF, "image/jpeg")).toEqual(GIF);
+  });
+
+  it("cuts what is appended after the end of a picture: a second picture, a video, a note", () => {
+    const tail = b("APPENDED video and an EXIF GPS 51.5N");
+    const p = Buffer.concat([png(pngChunk("tEXt", "Author Someone")), tail]);
+    const pc = cleanPicture(p, "image/png");
+    expect(pc.failed).toBe(false);
+    expect(pc.bytes.toString("latin1")).not.toMatch(/APPENDED|GPS|Someone/);
+    expect(pc.bytes.subarray(0, 8)).toEqual(p.subarray(0, 8));
+    expect(pc.bytes.toString("latin1").endsWith("IEND    ")).toBe(true);
+    const j = Buffer.concat([jpeg(jpegSeg(0xe1, "Exif GPS 51.5N")), tail]);
+    const jc = cleanPicture(j, "image/jpeg");
+    expect(jc.failed).toBe(false);
+    expect(jc.bytes.toString("latin1")).not.toMatch(/APPENDED|GPS/);
+    expect(jc.bytes.subarray(-2)).toEqual(b([0xff, 0xd9]));
+    expect(sniff(jc.bytes)).toBe("image/jpeg");
+  });
+
+  it("keeps every scan of a picture made of several (progressive), even when the data holds marker-like bytes", () => {
+    const scan = (data: Buffer): Buffer => Buffer.concat([b([0xff, 0xda], u16(4), [0, 0]), data]);
+    const data1 = b("S1", [0xff, 0x00, 0xff, 0xd0, 0xff, 0x00], "x"); // stuffed zero and a restart marker are data
+    const data2 = b("S2", [0xff, 0x00]);
+    const dht = jpegSeg(0xc4, `table ${String.fromCharCode(0xff)}${String.fromCharCode(0xd9)} inside a segment`); // looks like an end marker but is not
+    const file = Buffer.concat([b([0xff, 0xd8]), jpegSeg(0xe1, "Exif GPS"), scan(data1), dht, scan(data2), b([0xff, 0xd9]), b("GPS trailing")]);
+    const out = cleanPicture(file, "image/jpeg");
+    expect(out.failed).toBe(false);
+    const text = out.bytes.toString("latin1");
+    expect(text).toContain("S1");
+    expect(text).toContain("S2");
+    expect(text).toContain("inside a segment");
+    expect(text).not.toMatch(/Exif GPS|trailing/);
+    expect(out.bytes.subarray(-2)).toEqual(b([0xff, 0xd9]));
+  });
+
+  it("says when a JPEG or PNG could not be followed, so a caller that must not leak can refuse it", () => {
+    const odd: Array<[Buffer, "image/jpeg" | "image/png"]> = [
+      [b([0xff, 0xd8, 0xff, 0xe1, 0xff, 0xff], "short"), "image/jpeg"],
+      [b([0xff, 0xd8]), "image/jpeg"],
+      [PNG, "image/png"],
+      [b([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], u32(0xffffffff), "IHDR"), "image/png"],
+    ];
+    for (const [file, mime] of odd) expect(cleanPicture(file, mime)).toEqual({ bytes: file, failed: true });
+    expect(cleanPicture(jpeg(jpegSeg(0xe1, "Exif")), "image/jpeg").failed).toBe(false);
+    expect(cleanPicture(GIF, "image/gif").failed).toBe(false); // other kinds are not cleaned and are not claimed to be
   });
 
   it("is applied before a picture is kept, so the stored copy has none of it", async () => {
@@ -336,5 +379,23 @@ describe("an installed file check program", () => {
     expect(await scanHook({ program: join(dir2, "nope"), workDir: join(dir2, "w") })(file)).toBe("the file check could not be run");
     const slow = scanHook({ ...program("setTimeout(() => {}, 60000)"), timeoutMs: 300 });
     expect(await slow(file)).toBe("the file check timed out");
+  });
+
+  it("says so when the program prints too much, instead of calling it a timeout; the file is still refused", async () => {
+    const chatty = scanHook(program("process.stdout.write('x'.repeat(500000)); setTimeout(() => {}, 20000)"));
+    expect(await chatty(file)).toBe("the file check printed too much and was stopped");
+    const quietSlow = scanHook({ ...program("setTimeout(() => {}, 60000)"), timeoutMs: 300 });
+    expect(await quietSlow(file)).toBe("the file check timed out"); // a real timeout is still reported as one
+  });
+
+  it("clears copies a crashed Gateway left behind, and only those", () => {
+    const work = join(dir2, "scan-tmp");
+    mkdirSync(work, { recursive: true });
+    writeFileSync(join(work, "scan-0123456789abcdef.png"), "left over");
+    writeFileSync(join(work, "scan-fedcba9876543210.txt"), "left over");
+    writeFileSync(join(work, "notes.txt"), "not ours");
+    expect(sweepScanTemp(work)).toBe(2);
+    expect(readdirSync(work)).toEqual(["notes.txt"]);
+    expect(sweepScanTemp(join(dir2, "does-not-exist"))).toBe(0);
   });
 });

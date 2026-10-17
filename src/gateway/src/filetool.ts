@@ -1,6 +1,6 @@
 import { readFileSync, statSync } from "node:fs";
 import { basename } from "node:path";
-import { BlobError, safeName, sniff, stripMetadata, type BlobStore } from "@clawnexus/blobs";
+import { BlobError, cleanPicture, safeName, sniff, type BlobStore } from "@clawnexus/blobs";
 import type { ChannelManager } from "@clawnexus/channels";
 import { ChannelFileError } from "@clawnexus/channels";
 import type { SessionManager } from "@clawnexus/sessions";
@@ -42,6 +42,7 @@ export function fileSendTool(deps: FileToolDeps): ToolDef<{ attachment?: string 
     async run(a, env) {
       const sessions = deps.sessions();
       if (!sessions || env.session === undefined) throw new Error("there is no conversation to send a file to");
+      const session = env.session;
       const blobs = deps.blobs();
 
       let bytes: Buffer;
@@ -70,7 +71,10 @@ export function fileSendTool(deps: FileToolDeps): ToolDef<{ attachment?: string 
       if (bytes.length > MAX_SEND_BYTES) throw new Error("the file is too large to send");
       const mime = sniff(bytes);
       if (mime === undefined) throw new Error("only pictures, PDF, audio and text files can be sent");
-      bytes = stripMetadata(bytes, mime);
+      // What leaves the machine must not carry the owner's location or camera. A picture that cannot be cleaned is not sent.
+      const cleaned = cleanPicture(bytes, mime);
+      if (cleaned.failed) throw new Error("the hidden data (such as the location) of this picture could not be removed, so it was not sent; save a copy of the picture without it and send that");
+      bytes = cleaned.bytes;
       let cleanName = safeName(name, 0);
       if (!/\.[A-Za-z0-9]{1,5}$/.test(cleanName)) cleanName += EXT[mime] ?? "";
 
@@ -83,12 +87,12 @@ export function fileSendTool(deps: FileToolDeps): ToolDef<{ attachment?: string 
       }
       const ref = { id, name: cleanName, mime, bytes: bytes.length };
       try {
-        deps.channels().sendFile(env.session, ref, a.caption ?? "");
+        // The transcript entry is written before delivery starts, so a failure there cannot leave a file already on its way.
+        deps.channels().sendFile(session, ref, a.caption ?? "", () => sessions.recordFileSent(session, ref, a.caption ?? ""));
       } catch (e) {
         if (e instanceof ChannelFileError) throw new Error(e.message);
         throw e;
       }
-      sessions.recordFileSent(env.session, ref, a.caption ?? "");
       return { queued: true, name: cleanName, type: mime, bytes: bytes.length };
     },
   };

@@ -119,15 +119,21 @@ export class Outbox {
   }
 
   /** Queue one file, with an optional caption, as a single message. Returns false if the outbox is full. */
-  enqueueFile(target: SendTarget, file: OutboxFile, caption = ""): boolean {
+  enqueueFile(target: SendTarget, file: OutboxFile, caption = ""): string | undefined {
     const total = (this.db.prepare("SELECT COUNT(*) AS n FROM outbox WHERE state = 'pending'").get() as { n: number }).n;
     const mine = (this.db.prepare("SELECT COUNT(*) AS n FROM outbox WHERE state = 'pending' AND channel = ? AND account_id = ? AND conversation_id = ?").get(target.channel, target.accountId, target.conversationId) as { n: number }).n;
-    if (total + 1 > this.maxPending || mine + 1 > this.maxPerConversation) return false;
+    if (total + 1 > this.maxPending || mine + 1 > this.maxPerConversation) return undefined;
     const at = this.now();
+    const group = randomBytes(8).toString("hex");
     this.db
       .prepare("INSERT INTO outbox(grp, channel, account_id, conversation_id, reply_to, text, files, created_at, next_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(randomBytes(8).toString("hex"), target.channel, target.accountId, target.conversationId, target.replyTo ?? null, caption, JSON.stringify([file]), at, at);
-    return true;
+      .run(group, target.channel, target.accountId, target.conversationId, target.replyTo ?? null, caption, JSON.stringify([file]), at, at);
+    return group;
+  }
+
+  /** Take a queued reply back out before anything has tried to send it. */
+  discard(group: string): void {
+    this.db.prepare("DELETE FROM outbox WHERE grp = ? AND state = 'pending' AND attempts = 0").run(group);
   }
 
   /** Ids of the stored files that rows still need (so the store does not clean them up). */

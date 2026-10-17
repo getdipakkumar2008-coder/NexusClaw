@@ -306,7 +306,21 @@ export class SessionManager {
   /** Whether a stored file was part of this session's conversation (sent to it or by it). */
   hasFile(sessionId: string, blobId: string): boolean {
     if (!/^[0-9a-f]{64}$/.test(blobId)) return false;
-    return this.db.prepare("SELECT 1 AS x FROM messages WHERE session_id = ? AND attachments LIKE ? LIMIT 1").get(sessionId, `%"id":"${blobId}"%`) !== undefined;
+    try {
+      return this.db.prepare("SELECT 1 AS x FROM messages, json_each(messages.attachments) AS a WHERE messages.session_id = ? AND messages.attachments IS NOT NULL AND json_extract(a.value, '$.id') = ? LIMIT 1").get(sessionId, blobId) !== undefined;
+    } catch {
+      // One damaged value makes the query above fail as a whole; look at the messages one at a time instead.
+      const rows = this.db.prepare("SELECT attachments FROM messages WHERE session_id = ? AND attachments IS NOT NULL").all(sessionId) as unknown as Array<{ attachments: string }>;
+      for (const r of rows) {
+        try {
+          const list: unknown = JSON.parse(r.attachments);
+          if (Array.isArray(list) && list.some((x) => typeof x === "object" && x !== null && (x as { id?: unknown }).id === blobId)) return true;
+        } catch {
+          /* skip a damaged value */
+        }
+      }
+      return false;
+    }
   }
 
   /** Record that the assistant sent a file into the conversation, so it shows in the transcript and the file is kept. */

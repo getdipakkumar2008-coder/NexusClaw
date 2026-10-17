@@ -2,6 +2,9 @@ import { channelStatusSchema } from "@clawnexus/plugin-sdk";
 import type { ChannelAdapter, ChannelCapabilities, ChannelHost, ChannelStatus, InboundOutcome, OutboundContent, SendResult, SendTarget } from "@clawnexus/channels";
 import type { PluginProcess } from "./process.js";
 
+/** A send that carries a file may take far longer than a line of text (Slack uploads in three steps). Matches the router's limit. */
+const FILE_CALL_MS = 130_000;
+
 const clip = (s: unknown, n: number): string | undefined => (typeof s === "string" ? s.slice(0, n) : undefined);
 
 /**
@@ -50,7 +53,7 @@ export class PluginChannelAdapter implements ChannelAdapter {
     const r = (await this.proc.call(
       "channel:send",
       { target: { accountId: target.accountId, conversationId: target.conversationId, ...(target.replyTo ? { replyTo: target.replyTo } : {}) }, content: { text: content.text, ...(content.files?.length ? { files: content.files } : {}) } },
-      { timeoutMs: this.timeoutMs },
+      { timeoutMs: content.files?.length ? Math.max(this.timeoutMs, FILE_CALL_MS) : this.timeoutMs },
     )) as { messageId?: unknown } | null;
     const messageId = clip(r?.messageId, 256);
     return messageId ? { messageId } : {};

@@ -6,6 +6,7 @@ import { BRAND } from "@clawnexus/brand";
 import { PROTOCOL_VERSION, generateDeviceKey } from "@clawnexus/protocol";
 import { parseArgs, strFlag, type Parsed } from "./args.js";
 import { CliError, GatewayClient, type ConnectOptions, type DeviceCredential } from "./client.js";
+import { exportToFolder } from "./exportdir.js";
 import { DEFAULT_PORT, TOKEN_FILE, defaultDataDir } from "./paths.js";
 
 export interface Io {
@@ -362,27 +363,11 @@ const sessions: Handler = (c) =>
       else {
         // A folder holds the transcript and the files that came with it, so nothing in the conversation is left behind.
         const root = resolve(dir);
-        if (existsSync(root) && readdirSync(root).length > 0 && c.p.flags["force"] !== true) throw new CliError("EXISTS", `${root} is not empty`, "Choose a new folder, or pass --force.");
-        mkdirSync(join(root, "files"), { recursive: true });
-        writeFileSync(join(root, format === "markdown" ? "transcript.md" : "transcript.jsonl"), r.content);
-        const ids = new Map<string, string>();
-        if (format === "jsonl") {
-          for (const line of r.content.split(String.fromCharCode(10))) {
-            if (!line.includes('"files"')) continue;
-            for (const f of (JSON.parse(line) as { files?: Array<{ id?: string; name: string }> }).files ?? []) if (f.id) ids.set(f.id, f.name);
-          }
-        } else {
-          const m = await g.call<{ messages: Array<{ attachments?: Array<{ id?: string; name: string }> }> }>("session.get", { session });
-          for (const msg of m.messages) for (const f of msg.attachments ?? []) if (f.id) ids.set(f.id, f.name);
-        }
-        let saved = 0;
-        for (const [id, name] of ids) {
-          const b = await g.call<{ data: string }>("blob.get", { id });
-          const bare = (name.split(/[\\/]/).pop() ?? "file").replace(/[^\w. -]/g, "_") || "file";
-          writeFileSync(join(root, "files", `${id.slice(0, 12)}-${bare}`), Buffer.from(b.data, "base64"), { mode: 0o600 });
-          saved++;
-        }
-        show(c, { exported: root, files: saved }, () => `Saved the conversation and ${saved} file(s) to ${root}.\nThe files came from message senders: open them with care.\n`);
+        const done = await exportToFolder({ root, format, content: r.content, session, call: (method, params) => g.call(method, params), force: c.p.flags["force"] === true });
+        show(c, { exported: root, files: done.saved, missing: done.missing }, () => {
+          const gone = done.missing.length ? `\n${done.missing.length} file(s) are no longer stored and were not saved: ${done.missing.map((m) => m.name).join(", ")}.\n` : "";
+          return `Saved the conversation and ${done.saved} file(s) to ${root}.\n${gone}The files came from message senders: open them with care.\n`;
+        });
       }
     } else if (sub === "delete") {
       await g.call("session.delete", { session: need(c.p, 2, "session id") });

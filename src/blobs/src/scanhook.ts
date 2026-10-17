@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ScanFile } from "./ingest.js";
 
@@ -43,15 +43,39 @@ export function scanHook(o: ScanHookOptions): ScanFile {
         execFile(o.program, [...(o.args ?? []), copy], { timeout: o.timeoutMs ?? 30_000, env, windowsHide: true, maxBuffer: 64 * 1024, shell: false }, (error, stdout) => {
           if (!error) return resolve(undefined);
           const said = oneLine(String(stdout ?? ""));
-          const timedOut = (error as NodeJS.ErrnoException & { killed?: boolean }).killed === true;
-          const started = typeof (error as NodeJS.ErrnoException).code === "string";
-          resolve(timedOut ? "the file check timed out" : started ? "the file check could not be run" : said ? `the file check refused it: ${said}` : "the file check refused it");
+          const code = (error as NodeJS.ErrnoException).code;
+          const stopped = (error as NodeJS.ErrnoException & { killed?: boolean }).killed === true;
+          // Node stops a program for printing too much in the same way as for running too long; tell them apart.
+          const chatty = code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+          resolve(chatty ? "the file check printed too much and was stopped" : stopped ? "the file check timed out" : typeof code === "string" ? "the file check could not be run" : said ? `the file check refused it: ${said}` : "the file check refused it");
         });
       });
     } finally {
       rmSync(copy, { force: true });
     }
   };
+}
+
+/**
+ * Remove copies that a Gateway which died during a check left behind (they came from strangers' messages and were never
+ * meant to outlive the check). Only files this module names are touched. Returns how many were removed.
+ */
+export function sweepScanTemp(workDir: string): number {
+  let n = 0;
+  try {
+    for (const f of readdirSync(workDir)) {
+      if (!/^scan-[0-9a-f]{16}.[a-z0-9]+$/.test(f)) continue;
+      try {
+        rmSync(join(workDir, f), { force: true });
+        n++;
+      } catch {
+        /* in use or already gone */
+      }
+    }
+  } catch {
+    /* no folder yet */
+  }
+  return n;
 }
 
 /** The hook the owner installed, if any: a file named `scan` in `<data>/hooks`. */

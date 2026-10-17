@@ -36,6 +36,8 @@ class FakeTelegram {
   readonly uploads: Array<{ method: string; fields: Record<string, string>; file: { field: string; name: string; type: string; data: Buffer } }> = [];
   validToken = TOKEN;
   failSends = 0;
+  /** Refuse photos the way Telegram does for a picture that is too big or the wrong shape. */
+  refusePhotos = false;
   rateLimitOnce = false;
   conflict = false;
   confirmedUpTo = 0;
@@ -89,6 +91,7 @@ class FakeTelegram {
     this.calls.push({ method, token, body });
     if (token !== this.validToken) return this.reply(res, 401, { ok: false, error_code: 401, description: "Unauthorized" });
     if (form) {
+      if (this.refusePhotos && method === "sendPhoto") return this.reply(res, 400, { ok: false, error_code: 400, description: "Bad Request: PHOTO_INVALID_DIMENSIONS" });
       const file = form.find((p) => p.filename !== undefined);
       if (this.failSends > 0) {
         this.failSends--;
@@ -393,6 +396,31 @@ describe("the Telegram plugin", () => {
           ["sendDocument", "document", "notes.txt", undefined],
           ["sendAudio", "audio", "song.mp3", undefined],
         ]);
+      });
+
+      it("sends a picture Telegram will not take as a photo as a document instead", async () => {
+        const { r, session } = await talking();
+        fake.refusePhotos = true;
+        r.bed.manager.sendFile(session, stored(r, PNG, "image/png", "wide.png"), "still a picture");
+        await waitFor(() => fake.uploads.length === 1);
+        expect(fake.uploads[0]!.method).toBe("sendDocument");
+        expect(fake.uploads[0]!.file).toMatchObject({ field: "document", name: "wide.png" });
+        expect(fake.uploads[0]!.fields["caption"]).toBe("still a picture");
+        await waitFor(() => (r.bed.db.prepare("SELECT COUNT(*) AS n FROM outbox").get() as { n: number }).n === 0);
+        expect(fake.uploads).toHaveLength(1); // once
+      });
+
+      it("does not cut a long caption: the file goes first and the whole text follows as a message", async () => {
+        const { r, session } = await talking();
+        const long = "word ".repeat(400).trim(); // 2 000 characters, Telegram allows 1 024 under a file
+        r.bed.manager.sendFile(session, stored(r, PNG, "image/png", "long.png"), long);
+        await waitFor(() => fake.uploads.length === 1 && fake.sent.some((s) => s.text === long));
+        expect(fake.uploads[0]!.fields["caption"]).toBeUndefined();
+        const short = "x".repeat(1024);
+        r.bed.manager.sendFile(session, stored(r, Buffer.concat([PNG, Buffer.from("2")]), "image/png", "short.png"), short);
+        await waitFor(() => fake.uploads.length === 2);
+        expect(fake.uploads[1]!.fields["caption"]).toBe(short); // at the limit it stays a caption
+        expect(fake.sent.filter((s) => s.text === short)).toHaveLength(0);
       });
 
       it("keeps a file in the outbox and retries it when Telegram fails, without losing it", async () => {

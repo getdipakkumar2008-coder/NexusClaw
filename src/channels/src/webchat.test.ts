@@ -492,6 +492,20 @@ describe("sending files from the browser", () => {
     expect(v.closed?.code).toBe(1008);
   });
 
+  it("uses none of a message's files if one of them is missing, so the visitor can send the message again", async () => {
+    current = await rig();
+    const v = await owner(current);
+    pieces(v, "up-pic-010", "pic.png", PNG);
+    await status(v, "up-pic-010");
+    v.send({ t: "message", id: "msg-file-10", text: "two files", files: ["up-pic-010", "up-never-sent-1"] });
+    await waitFor(() => v.frames.some((f) => f.t === "ack" && f.id === "msg-file-10"));
+    expect(v.frames.find((f) => f.t === "ack" && f.id === "msg-file-10")!["status"]).toBe("ignored");
+    expect(current.bed.provider!.calls).toHaveLength(0);
+    v.send({ t: "message", id: "msg-file-11", text: "just the one", files: ["up-pic-010"] }); // the first file is still there
+    await waitFor(() => v.frames.some((f) => f.t === "ack" && f.id === "msg-file-11"));
+    expect(v.frames.find((f) => f.t === "ack" && f.id === "msg-file-11")!["status"]).toBe("accepted");
+  });
+
   it("is judged by what the file is: a program is stored by no one and the message still goes through", async () => {
     current = await rig();
     const v = await owner(current);

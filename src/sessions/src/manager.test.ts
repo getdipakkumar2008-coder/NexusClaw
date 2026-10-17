@@ -335,6 +335,36 @@ describe("transcripts", () => {
     expect(JSON.stringify(log.readSince(0))).not.toContain("private-text");
   });
 
+  it("knows which stored files belong to a conversation, whatever order or spacing the references were written in", () => {
+    const m = make();
+    const a = m.getOrCreate(key("a"));
+    const other = m.getOrCreate(key("b"));
+    const ids = ["1", "2", "3", "4"].map((c) => c.repeat(64));
+    const put = (session: string, attachments: string | null) =>
+      db.prepare("INSERT INTO messages(session_id, role, sender, content, ts, attachments) VALUES (?, 'user', '', 'x', 0, ?)").run(session, attachments);
+    put(a.id, JSON.stringify([{ id: ids[0], name: "a.png", mime: "image/png", bytes: 1 }]));
+    put(a.id, JSON.stringify([{ name: "b.png", bytes: 1, mime: "image/png", id: ids[1] }])); // another field order
+    put(a.id, JSON.stringify([{ id: ids[2], name: "c.png" }], null, 2)); // spaced out
+    put(other.id, JSON.stringify([{ id: ids[3], name: "d.png" }]));
+    expect(ids.slice(0, 3).map((i) => m.hasFile(a.id, i))).toEqual([true, true, true]);
+    expect(m.hasFile(a.id, ids[3] as string)).toBe(false); // it belongs to another conversation
+    expect(m.hasFile(other.id, ids[0] as string)).toBe(false);
+    expect(m.hasFile(a.id, "5".repeat(64))).toBe(false);
+    expect(m.hasFile(a.id, "not-an-id")).toBe(false);
+    // the id appearing as plain text in a name or in a message is not a reference
+    put(a.id, JSON.stringify([{ id: "6".repeat(64), name: `"id":"${"7".repeat(64)}"` }]));
+    expect(m.hasFile(a.id, "7".repeat(64))).toBe(false);
+  });
+
+  it("is not thrown by a damaged attachment column when looking for a file", () => {
+    const m = make();
+    const a = m.getOrCreate(key("a"));
+    db.prepare("INSERT INTO messages(session_id, role, sender, content, ts, attachments) VALUES (?, 'user', '', 'x', 0, ?)").run(a.id, "{not json");
+    db.prepare("INSERT INTO messages(session_id, role, sender, content, ts, attachments) VALUES (?, 'user', '', 'x', 0, ?)").run(a.id, JSON.stringify([{ id: "8".repeat(64), name: "ok.png" }]));
+    expect(m.hasFile(a.id, "8".repeat(64))).toBe(true);
+    expect(m.hasFile(a.id, "9".repeat(64))).toBe(false);
+  });
+
   it("deleting a session while a run is active is safe", async () => {
     const m = make(new FakeProvider({ hang: true }));
     const s = m.getOrCreate(key("a"));

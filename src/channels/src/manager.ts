@@ -46,6 +46,8 @@ export interface ChannelManagerOptions {
   sendRetry?: { attempts: number; baseMs: number };
   /** An adapter that takes longer than this to start or send is treated as failed. */
   adapterTimeoutMs?: number;
+  /** The longer limit for a send that carries a file (an upload can take much longer than a line of text). */
+  fileTimeoutMs?: number;
   /** The same notice (pairing prompt, "busy", ...) is not repeated to one sender within this time. */
   noticeCooldownMs?: number;
 }
@@ -123,6 +125,9 @@ export function chunkText(text: string, max: number): string[] {
   return chunks.filter((c) => c.length > 0);
 }
 
+/** Slack's three upload steps are allowed 30 + 60 + 30 s inside the plugin; this is a little more, so the plugin gives up first. */
+export const FILE_SEND_TIMEOUT_MS = 130_000;
+
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
@@ -153,7 +158,7 @@ export class ChannelManager {
   private inserts = 0;
   private stopped = false;
   private readonly now: () => number;
-  private readonly o: Required<Pick<ChannelManagerOptions, "senderPerMinute" | "senderBurst" | "adapterPerSecond" | "adapterBurst" | "dedupeRetentionMs" | "adapterTimeoutMs" | "noticeCooldownMs">> & {
+  private readonly o: Required<Pick<ChannelManagerOptions, "senderPerMinute" | "senderBurst" | "adapterPerSecond" | "adapterBurst" | "dedupeRetentionMs" | "adapterTimeoutMs" | "fileTimeoutMs" | "noticeCooldownMs">> & {
     sendRetry: { attempts: number; baseMs: number };
   };
 
@@ -167,6 +172,7 @@ export class ChannelManager {
       adapterBurst: c.adapterBurst ?? 200,
       dedupeRetentionMs: c.dedupeRetentionMs ?? 24 * 3600_000,
       adapterTimeoutMs: c.adapterTimeoutMs ?? 30_000,
+      fileTimeoutMs: c.fileTimeoutMs ?? FILE_SEND_TIMEOUT_MS,
       noticeCooldownMs: c.noticeCooldownMs ?? 30_000,
       sendRetry: c.sendRetry ?? { attempts: 3, baseMs: 500 },
     };
@@ -514,7 +520,7 @@ export class ChannelManager {
    * Send one already-stored file to the conversation a session belongs to. There is no destination argument: a file can
    * only go back to the people the session is with. Throws a ChannelFileError whose message is fit to show the model.
    */
-  sendFile(sessionId: string, file: OutboxFile, caption = ""): void {
+  sendFile(sessionId: string, file: OutboxFile, caption = "", record?: () => void): void {
     const sessions = this.c.sessions;
     if (!sessions) throw new ChannelFileError("the assistant is not ready");
     const s = sessions.get(sessionId);
@@ -523,7 +529,18 @@ export class ChannelManager {
     if (bar < 1 || !entry || entry.detached || !entry.started) throw new ChannelFileError("this conversation is not on a running messaging channel, so there is nobody to send a file to");
     if (!entry.adapter.capabilities.files) throw new ChannelFileError(`the ${s.channel} channel cannot carry files`);
     const target: SendTarget = { channel: s.channel, accountId: s.conversation.slice(0, bar), conversationId: s.conversation.slice(bar + 1) };
-    if (!this.outbox.enqueueFile(target, file, caption.slice(0, entry.adapter.capabilities.maxTextChars))) throw new ChannelFileError("too many messages are waiting to be delivered");
+    const group = this.outbox.enqueueFile(target, file, caption.slice(0, entry.adapter.capabilities.maxTextChars));
+    if (group === undefined) throw new ChannelFileError("too many messages are waiting to be delivered");
+    if (record) {
+      // Written down before anything is sent. If that fails, nothing has been sent and the queued file is taken back, so
+      // the caller reporting an error cannot lead to the file arriving twice.
+      try {
+        record();
+      } catch (e) {
+        this.outbox.discard(group);
+        throw e;
+      }
+    }
     void this.pump(target.channel, target.accountId, target.conversationId);
   }
 
@@ -581,7 +598,12 @@ export class ChannelManager {
         let content: OutboundContent = { text: row.text };
         if (row.files) {
           const f = row.files[0] as OutboxFile;
-          const bytes = entry.adapter.capabilities.files ? this.c.blobs?.read(f.id) : undefined;
+          let bytes: Buffer | undefined;
+          try {
+            bytes = entry.adapter.capabilities.files ? this.c.blobs?.read(f.id) : undefined;
+          } catch {
+            bytes = undefined; // an unreadable file must not hold up everything queued behind it
+          }
           if (bytes === undefined) {
             this.outbox.failGroup(row.group, entry.adapter.capabilities.files ? "the file is no longer stored" : "this channel cannot carry files");
             this.audit("channel.send_failed", { channel, accountId, error: "file could not be read" });
@@ -591,7 +613,7 @@ export class ChannelManager {
         }
         this.outbox.begin(row.id);
         try {
-          await withTimeout(entry.adapter.send(row.target, content), this.o.adapterTimeoutMs, `sending on ${channel}`);
+          await withTimeout(entry.adapter.send(row.target, content), row.files ? this.o.fileTimeoutMs : this.o.adapterTimeoutMs, `sending on ${channel}`);
           this.outbox.done(row.id);
           if (row.files) this.audit("channel.file_sent", { channel, accountId, mime: row.files[0]?.mime, bytes: row.files[0]?.bytes });
         } catch (e) {
