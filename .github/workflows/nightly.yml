@@ -1,0 +1,48 @@
+name: nightly
+# Long fuzz runs with a fresh seed each night, and the performance numbers from docs/01 (NFR-PERF-1..3).
+# A failure names the seed: re-run locally with FUZZ_SEED=<seed> FUZZ_ITERATIONS=<n> pnpm test src/gateway/src/fuzz.test.ts
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Fuzz targets, one million inputs each, new seed every night
+        run: |
+          export FUZZ_SEED=$(date +%Y%m%d)
+          echo "seed: $FUZZ_SEED"
+          FUZZ_ITERATIONS=1000000 pnpm exec vitest run src/gateway/src/fuzz.test.ts
+
+  performance:
+    # Targets are written for a 2-core machine; GitHub's standard runner has 4 vCPUs, so a miss here is a real miss.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: node tools/bench.mjs --check

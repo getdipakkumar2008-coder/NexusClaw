@@ -32,18 +32,37 @@ export interface WebChatOptions {
   maxTextChars?: number;
 }
 
+/** A file being sent up from the browser in pieces. It lives in memory only, and only for a visitor who is already paired. */
+interface Upload {
+  name: string;
+  chunks: Buffer[];
+  bytes: number;
+  next: number;
+  done: boolean;
+}
+
+/** Browser upload limits (the Gateway applies its own, stricter file rules again when the message is delivered). */
+export const UPLOAD = { chunkBytes: 192 * 1024, fileBytes: 8 * 1024 * 1024, pendingBytes: 16 * 1024 * 1024, connectionBytes: 64 * 1024 * 1024, files: 4, open: 8 } as const;
+
 interface Conn {
   ws: WebSocket;
   senderId?: string;
   tokens: number;
   at: number;
   helloTimer?: NodeJS.Timeout;
+  uploads: Map<string, Upload>;
+  uploaded: number;
 }
 
 const helloFrame = z.strictObject({ t: z.literal("hello"), secret: z.string().max(100).nullable().optional(), redeem: z.string().max(100).nullable().optional() });
-const messageFrame = z.strictObject({ t: z.literal("message"), id: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/), text: z.string().min(1).max(8000) });
+const upId = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/);
+const messageFrame = z.strictObject({ t: z.literal("message"), id: upId, text: z.string().max(8000), files: z.array(upId).max(UPLOAD.files).optional() });
+const fileFrame = z.strictObject({ t: z.literal("file"), up: upId, name: z.string().max(256), seq: z.number().int().min(0).max(100_000), last: z.boolean(), data: z.string().max(Math.ceil((UPLOAD.chunkBytes * 4) / 3) + 8) });
 const pingFrame = z.strictObject({ t: z.literal("ping") });
-const frame = z.discriminatedUnion("t", [helloFrame, messageFrame, pingFrame]);
+const frame = z.discriminatedUnion("t", [helloFrame, messageFrame, fileFrame, pingFrame]);
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+/** A frame from someone who has not said hello yet may not be large. */
+const PRE_HELLO_BYTES = 16 * 1024;
 
 const sha = (s: string): string => createHash("sha256").update(s).digest("hex");
 /** A browser's identity is derived from a secret only that browser holds; nobody can claim another visitor's id. */
@@ -76,7 +95,7 @@ export class WebChatAdapter implements ChannelAdapter {
 
   constructor(private readonly o: WebChatOptions) {
     this.now = o.now ?? Date.now;
-    this.capabilities = { typing: true, groups: false, maxTextChars: o.maxTextChars ?? 8000 };
+    this.capabilities = { typing: true, groups: false, maxTextChars: o.maxTextChars ?? 8000, files: true };
   }
 
   async start(host: ChannelHost): Promise<void> {
@@ -89,7 +108,7 @@ export class WebChatAdapter implements ChannelAdapter {
       const body = loadAsset(file);
       if (body) this.assets.set(path, { type, body });
     }
-    this.wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024, perMessageDeflate: false });
+    this.wss = new WebSocketServer({ noServer: true, maxPayload: Math.ceil((UPLOAD.chunkBytes * 4) / 3) + 4096, perMessageDeflate: false });
     this.wss.on("connection", (ws) => this.onConnection(ws));
     this.state = this.assets.size === 3 ? { state: "connected" } : { state: "degraded", detail: "the web page files are missing" };
   }
@@ -184,7 +203,7 @@ export class WebChatAdapter implements ChannelAdapter {
   }
 
   private onConnection(ws: WebSocket): void {
-    const c: Conn = { ws, tokens: 10, at: this.now() };
+    const c: Conn = { ws, tokens: 10, at: this.now(), uploads: new Map(), uploaded: 0 };
     this.conns.add(c);
     c.helloTimer = setTimeout(() => ws.close(4408, "hello timeout"), this.o.helloTimeoutMs ?? 5000);
     ws.on("message", (data, isBinary) => {
@@ -210,6 +229,7 @@ export class WebChatAdapter implements ChannelAdapter {
   }
 
   private async onFrame(c: Conn, raw: string): Promise<void> {
+    if (!c.senderId && raw.length > PRE_HELLO_BYTES) return void c.ws.close(1009, "too large");
     let parsed;
     try {
       parsed = frame.safeParse(JSON.parse(raw));
@@ -254,13 +274,25 @@ export class WebChatAdapter implements ChannelAdapter {
       return;
     }
 
-    // f.t === "message"
     if (!c.senderId) return void c.ws.close(1008, "say hello first");
+
+    if (f.t === "file") return this.onFile(c, f);
+
+    // f.t === "message"
+    if (f.text.trim() === "" && !(f.files && f.files.length > 0)) return void c.ws.close(1008, "bad frame");
     const t = this.now();
     c.tokens = Math.min(10, c.tokens + ((t - c.at) / 1000) * 5);
     c.at = t;
     if (c.tokens < 1) return this.out(c, { t: "ack", id: f.id, status: "limited" });
     c.tokens -= 1;
+    // Files named by the message must be complete uploads of this connection; they are used once.
+    const attachments: Array<{ name: string; bytes: number; data: string }> = [];
+    for (const up of new Set(f.files ?? [])) {
+      const u = c.uploads.get(up);
+      if (!u?.done) return this.out(c, { t: "ack", id: f.id, status: "ignored" });
+      attachments.push({ name: u.name, bytes: u.bytes, data: Buffer.concat(u.chunks).toString("base64") });
+      c.uploads.delete(up);
+    }
     const outcome = await host.deliver({
       accountId: ACCOUNT,
       conversationId: c.senderId,
@@ -268,6 +300,7 @@ export class WebChatAdapter implements ChannelAdapter {
       senderDisplay: "Web visitor",
       messageId: f.id,
       text: f.text,
+      ...(attachments.length ? { attachments } : {}),
       isGroup: false,
       mentionsBot: true,
       ts: t,
@@ -275,10 +308,43 @@ export class WebChatAdapter implements ChannelAdapter {
     this.out(c, { t: "ack", id: f.id, status: outcome.result, role: this.o.principalOf(c.senderId) });
   }
 
+  /** One piece of a file. Only paired visitors may upload, so a stranger never makes the Gateway hold a byte. */
+  private onFile(c: Conn, f: z.infer<typeof fileFrame>): void {
+    const fail = (status: string): void => {
+      c.uploads.delete(f.up);
+      this.out(c, { t: "file", up: f.up, status });
+    };
+    if (!c.senderId || this.o.principalOf(c.senderId) === "unpaired") return fail("not_paired");
+    let u = c.uploads.get(f.up);
+    if (!u) {
+      if (f.seq !== 0) return fail("bad_order");
+      if (c.uploads.size >= UPLOAD.open) return fail("too_many");
+      u = { name: f.name, chunks: [], bytes: 0, next: 0, done: false };
+      c.uploads.set(f.up, u);
+    }
+    if (u.done || f.seq !== u.next) return fail("bad_order");
+    if (!BASE64.test(f.data) || f.data.length % 4 !== 0) return fail("damaged");
+    const piece = Buffer.from(f.data, "base64");
+    if (piece.length > UPLOAD.chunkBytes) return fail("too_large");
+    let pending = 0;
+    for (const x of c.uploads.values()) pending += x.bytes;
+    if (u.bytes + piece.length > UPLOAD.fileBytes || pending + piece.length > UPLOAD.pendingBytes) return fail("too_large");
+    if (c.uploaded + piece.length > UPLOAD.connectionBytes) return fail("limited");
+    c.uploaded += piece.length;
+    u.chunks.push(piece);
+    u.bytes += piece.length;
+    u.next++;
+    if (f.last) {
+      if (u.bytes === 0) return fail("empty");
+      u.done = true;
+      this.out(c, { t: "file", up: f.up, status: "ready" });
+    }
+  }
+
   // ---------------- outbound ----------------
 
   async send(target: SendTarget, content: OutboundContent): Promise<SendResult> {
-    for (const c of this.bySender.get(target.conversationId) ?? []) this.out(c, { t: "message", from: "assistant", text: content.text, ts: this.now() });
+    for (const c of this.bySender.get(target.conversationId) ?? []) this.out(c, { t: "message", from: "assistant", text: content.text, ts: this.now(), ...(content.files?.length ? { files: content.files } : {}) });
     return {};
   }
 

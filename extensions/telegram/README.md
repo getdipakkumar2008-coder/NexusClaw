@@ -42,3 +42,5 @@ a domain or a certificate.
 
 It asks for the network (`api.telegram.org`) and one secret (`bot_token`). The network permission is **not
 enforced** by the system, so you are trusting this code, which is small and readable: `index.mjs`.
+
+- Files the assistant sends (it asks you to approve each one, and only into the conversation it is in) are uploaded to Telegram as a photo, audio or document. Pictures, PDF, audio and text up to 8 MB.

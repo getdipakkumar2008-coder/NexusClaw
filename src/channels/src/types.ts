@@ -8,6 +8,8 @@ export interface ChannelCapabilities {
   groups: boolean;
   /** Longest single message the platform accepts; longer replies are split. */
   maxTextChars: number;
+  /** Can deliver a file with a message (pictures, documents, audio). Absent means no. */
+  files?: boolean;
 }
 
 export type ChannelState = "starting" | "connected" | "degraded" | "auth_required" | "stopped";
@@ -26,8 +28,19 @@ export interface SendTarget {
   replyTo?: string;
 }
 
+/** A file on its way out. Already checked by the Gateway (type from content, size, metadata removed). */
+export interface OutboundFile {
+  name: string;
+  mime: string;
+  /** The file itself, base64. */
+  data: string;
+}
+
 export interface OutboundContent {
+  /** May be empty when a file is sent on its own. */
   text: string;
+  /** At most one file per message. */
+  files?: OutboundFile[];
 }
 
 export interface SendResult {

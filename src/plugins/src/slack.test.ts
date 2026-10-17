@@ -32,6 +32,12 @@ class FakeSlack {
   readonly acked = new Set<string>();
   readonly files = new Map<string, Buffer>();
   readonly fileGets: Array<{ url: string; auth: string | undefined }> = [];
+  /** The three steps of an upload: the form that asked for an address, the bytes that went there, and the final call. */
+  readonly slots: Array<{ form: Record<string, string>; auth: string | undefined }> = [];
+  readonly puts: Array<{ url: string; auth: string | undefined; type: string | undefined; data: Buffer }> = [];
+  readonly completes: Array<Record<string, unknown>> = [];
+  /** Where the next upload address points; the default is this server. */
+  uploadBase: string | undefined;
   opens = 0;
   connections = 0;
   validBot = BOT_TOKEN;
@@ -102,10 +108,19 @@ class FakeSlack {
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    let raw = "";
-    for await (const c of req) raw += c as string;
-    const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const bytes = Buffer.concat(chunks);
+    const raw = bytes.toString("utf8");
+    const type = String(req.headers["content-type"] ?? "");
+    const isForm = type.startsWith("application/x-www-form-urlencoded");
+    const body = raw && type.includes("json") ? (JSON.parse(raw) as Record<string, unknown>) : {};
     const auth = req.headers["authorization"];
+    if (req.method === "POST" && (req.url ?? "").startsWith("/upload/")) {
+      this.puts.push({ url: req.url!, auth, type: req.headers["content-type"], data: bytes });
+      res.writeHead(200);
+      return void res.end("OK");
+    }
     if (req.method === "GET" && (req.url ?? "").startsWith("/files/")) {
       // Slack's private file URLs need the bot token; record what was presented.
       this.fileGets.push({ url: req.url!, auth });
@@ -122,6 +137,14 @@ class FakeSlack {
     }
     if (auth !== `Bearer ${this.validBot}`) return this.reply(res, 200, { ok: false, error: "invalid_auth" });
     if (method === "auth.test") return this.reply(res, 200, { ok: true, user_id: BOT, user: "fakebot", team: "T1" });
+    if (method === "files.getUploadURLExternal") {
+      this.slots.push({ form: isForm ? Object.fromEntries(new URLSearchParams(raw)) : {}, auth });
+      return this.reply(res, 200, { ok: true, upload_url: `${this.uploadBase ?? this.base}/upload/F${this.slots.length}`, file_id: `F${this.slots.length}` });
+    }
+    if (method === "files.completeUploadExternal") {
+      this.completes.push(body);
+      return this.reply(res, 200, { ok: true, files: [{ id: (body["files"] as Array<{ id: string }>)[0]!.id }] });
+    }
     if (method === "chat.postMessage") {
       if (this.rateLimitOnce) {
         this.rateLimitOnce = false;
@@ -416,6 +439,45 @@ describe("the Slack plugin", () => {
       expect(att[0]).toMatchObject({ name: "pic.png", mime: "image/png" });
       expect(att[0]!.read()).toEqual(PNG);
       expect(fake.fileGets).toEqual([{ url: "/files/pic.png", auth: `Bearer ${BOT_TOKEN}` }]);
+    });
+
+    describe("sending a file out", () => {
+      async function talking(): Promise<{ r: Awaited<ReturnType<typeof rig>>; session: string }> {
+        const r = await ready();
+        fake.event({ ...dm, subtype: undefined, text: "hello" });
+        await waitFor(() => fake.sent.some((s) => s.text.includes("echo: hello")));
+        return { r, session: r.bed.sessions!.list()[0]!.id };
+      }
+      const stored = (r: Awaited<ReturnType<typeof rig>>, data: Buffer, mime: string, name: string) => ({ ...r.bed.blobs.put(data, mime), name, mime, bytes: data.length });
+
+      it("asks for an address, sends the bytes there, then shares the file into the conversation", async () => {
+        const { r, session } = await talking();
+        r.bed.manager.sendFile(session, stored(r, PNG, "image/png", "chart.png"), "here <you> go");
+        await waitFor(() => fake.completes.length === 1);
+        expect(fake.slots[0]).toEqual({ form: { filename: "chart.png", length: String(PNG.length) }, auth: `Bearer ${BOT_TOKEN}` });
+        expect(fake.puts).toHaveLength(1);
+        expect(fake.puts[0]!.data).toEqual(PNG);
+        expect(fake.puts[0]!.auth).toBeUndefined(); // the bot token goes to the API, not to the upload address
+        expect(fake.completes[0]).toMatchObject({ files: [{ id: "F1", title: "chart.png" }], channel_id: "D750", initial_comment: "here &lt;you&gt; go" });
+      });
+
+      it("will not upload to an address that is not Slack's, and never sends the token or the file there", async () => {
+        const { r, session } = await talking();
+        const seen: Array<string | undefined> = [];
+        const evil = createServer((req, res) => (seen.push(req.headers["authorization"]), res.writeHead(200).end("x")));
+        await new Promise<void>((resolve) => evil.listen(0, "127.0.0.1", resolve));
+        try {
+          fake.uploadBase = `http://127.0.0.1:${(evil.address() as { port: number }).port}`;
+          r.bed.manager.sendFile(session, stored(r, PNG, "image/png", "chart.png"));
+          await waitFor(() => fake.slots.length >= 1);
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          expect(seen).toEqual([]);
+          expect(fake.completes).toEqual([]);
+        } finally {
+          evil.closeAllConnections();
+          await new Promise<void>((resolve) => evil.close(() => resolve()));
+        }
+      });
     });
 
     it("never sends the bot token to an address that is not Slack's, however a file is described", async () => {

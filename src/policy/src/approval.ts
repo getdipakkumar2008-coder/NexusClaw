@@ -23,9 +23,12 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(walk(value));
 }
 
-/** Binds an approval to the exact call: tool name plus canonical arguments. */
-export function approvalKey(tool: string, args: unknown): string {
-  return createHash("sha256").update(`${tool}\n${canonicalJson(args)}`).digest("hex");
+/**
+ * Binds an approval to the exact call: tool name, canonical arguments and, when there is one, the conversation it was
+ * asked in. An approval the owner gave for a file to be sent into one chat cannot be spent in another.
+ */
+export function approvalKey(tool: string, args: unknown, session?: string): string {
+  return createHash("sha256").update(`${tool}\n${canonicalJson(args)}${session === undefined ? "" : `\nsession:${session}`}`).digest("hex");
 }
 
 export type ApprovalState = "pending" | "approved" | "denied" | "expired" | "consumed";
@@ -55,11 +58,12 @@ export class ApprovalStore {
     private readonly ttlMs = 5 * 60_000,
   ) {}
 
-  create(input: { tool: string; args: unknown; requester: string }): Approval {
+  create(input: { tool: string; args: unknown; requester: string; session?: string }): Approval {
     const t = this.now();
+    this.forget(t);
     const a: Approval = {
       id: randomBytes(16).toString("hex"),
-      key: approvalKey(input.tool, input.args),
+      key: approvalKey(input.tool, input.args, input.session),
       tool: input.tool,
       requester: input.requester,
       state: "pending",
@@ -81,12 +85,12 @@ export class ApprovalStore {
   }
 
   /** Atomically spend an approval for exactly this call. True only once, only if approved and unexpired. */
-  consume(id: string, tool: string, args: unknown): boolean {
+  consume(id: string, tool: string, args: unknown, session?: string): boolean {
     const a = this.items.get(id);
     if (!a) return false;
     this.live(id);
     if (a.state !== "approved") return false;
-    if (a.key !== approvalKey(tool, args)) return false;
+    if (a.key !== approvalKey(tool, args, session)) return false;
     a.state = "consumed";
     return true;
   }
@@ -102,6 +106,11 @@ export class ApprovalStore {
     if (!a) return undefined;
     this.live(id);
     return { ...a };
+  }
+
+  /** Finished approvals are dropped after an hour so the ledger cannot grow without bound. */
+  private forget(t: number): void {
+    for (const [id, a] of this.items) if (a.state !== "pending" && a.state !== "approved" && t - a.createdAt > 3_600_000) this.items.delete(id);
   }
 
   private live(id: string): Approval {

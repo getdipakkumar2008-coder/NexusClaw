@@ -4,3 +4,4 @@ export { createBackup, restoreBackup, verifyBackup, BACKUP_FORMAT, type Manifest
 export { runSetup, PROFILES, type SetupOptions, type SetupResult } from "./setup.js";
 export { startFromConfig, runGateway, acquireLock, type Running, type ServeOptions } from "./serve.js";
 export { loadConfig, writeConfig, defaultConfig, migrateConfigFile, configPath, type LoadedConfig } from "./configfile.js";
+export { runSecurityDoctor } from "./security.js";

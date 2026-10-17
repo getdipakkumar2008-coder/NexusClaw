@@ -19,6 +19,7 @@ Source: `req.odt` (vision-level requirements). Those requirements were analysed;
 | 08 | `08-release-engineering.md` | CI/CD, signing, release pipelines, test strategy, config migration |
 | 09 | `09-governance-contributing.md` | Foundation, contribution rules, licensing, code of conduct, policy |
 | 10 | `10-roadmap.md` | Phased delivery plan with exit criteria |
+| 16 | `16-external-review-brief.md` | What to hand an outside security reviewer: scope, evidence, known weaknesses, questions |
 | 11 | `11-open-questions-and-decisions.md` | **Decisions needed from you** + ADR log |
 | 12 | `12-clean-room-and-ip-policy.md` | **New (review 2):** rules for building the same functionality without reusing the reference project |
 | 13 | `13-review-log.md` | **New (review 2):** what the second review found and changed |

@@ -10,6 +10,15 @@
   var statusEl = document.getElementById("status");
   var noticeEl = document.getElementById("notice");
   var typingEl = document.getElementById("typing");
+  var attachEl = document.getElementById("attach");
+  var filesEl = document.getElementById("files");
+
+  // Files the visitor picked and has not sent yet. The Gateway decides what it will really accept; these are only sensible limits.
+  var MAX_FILES = 4;
+  var MAX_FILE = 8 * 1024 * 1024;
+  var CHUNK = 192 * 1024;
+  var chosen = [];
+  var sending = false;
 
   var memory = {};
   function store(name, value) {
@@ -56,9 +65,30 @@
     log.scrollTop = log.scrollHeight;
     return el;
   }
+  // A file from the assistant is offered as a download. It is never opened or shown in the page.
+  function addFile(file) {
+    var el = document.createElement("div");
+    el.className = "msg bot file";
+    try {
+      var raw = window.atob(String(file.data));
+      var bytes = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      var link = document.createElement("a");
+      link.href = window.URL.createObjectURL(new window.Blob([bytes], { type: "application/octet-stream" }));
+      link.download = String(file.name || "file").slice(0, 100);
+      link.rel = "noopener";
+      link.textContent = "Download " + link.download;
+      el.appendChild(link);
+    } catch {
+      el.textContent = "A file arrived but could not be shown.";
+    }
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  }
   function enable(on) {
     input.disabled = !on;
     sendButton.disabled = !on;
+    if (attachEl) attachEl.disabled = !on;
     if (on) input.focus();
   }
   function newId() {
@@ -121,9 +151,15 @@
       });
     } else if (f.t === "message") {
       typingEl.hidden = true;
-      addMessage("bot", f.text);
+      if (f.text) addMessage("bot", f.text);
+      (f.files || []).forEach(addFile);
     } else if (f.t === "typing") {
       typingEl.hidden = !f.on;
+    } else if (f.t === "file") {
+      if (f.status !== "ready") {
+        var why = { not_paired: "Files can be sent once the owner has approved you.", too_large: "That file is too large.", limited: "You have sent too many files for now.", too_many: "Too many files at once." };
+        showNotice(why[f.status] || "A file could not be sent.");
+      }
     } else if (f.t === "ack") {
       var el = pending[f.id];
       if (el) {
@@ -140,13 +176,88 @@
     }
   }
 
+  function showChosen() {
+    if (!filesEl) return;
+    filesEl.textContent = "";
+    chosen.forEach(function (f) {
+      var tag = document.createElement("span");
+      tag.textContent = f.name;
+      filesEl.appendChild(tag);
+    });
+    filesEl.hidden = chosen.length === 0;
+  }
+
+  function toBase64(bytes) {
+    var out = "";
+    for (var i = 0; i < bytes.length; i += 8192) out += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    return window.btoa(out);
+  }
+  function drained() {
+    return new Promise(function (resolve) {
+      (function check() {
+        if (!socket || !(socket.bufferedAmount > 1048576)) resolve();
+        else window.setTimeout(check, 50);
+      })();
+    });
+  }
+  // A file goes up in pieces so that no single frame is large; the Gateway puts them together and checks them.
+  function upload(file) {
+    var up = newId();
+    return file.arrayBuffer().then(function (buf) {
+      var bytes = new Uint8Array(buf);
+      var seq = 0;
+      function next(at) {
+        var end = Math.min(at + CHUNK, bytes.length);
+        return drained().then(function () {
+          socket.send(JSON.stringify({ t: "file", up: up, name: file.name, seq: seq++, last: end >= bytes.length, data: toBase64(bytes.subarray(at, end)) }));
+          return end >= bytes.length ? up : next(end);
+        });
+      }
+      return next(0);
+    });
+  }
+
   function submit() {
     var text = input.value.trim();
-    if (!text || !open) return;
+    if ((!text && chosen.length === 0) || !open || sending) return;
     var id = newId();
-    pending[id] = addMessage("you", text, "pending");
-    socket.send(JSON.stringify({ t: "message", id: id, text: text }));
+    var files = chosen;
+    chosen = [];
+    showChosen();
     input.value = "";
+    var shown = text + (files.length ? (text ? String.fromCharCode(10) : "") + "Attached: " + files.map(function (f) { return f.name; }).join(", ") : "");
+    pending[id] = addMessage("you", shown, "pending");
+    if (files.length === 0) return void socket.send(JSON.stringify({ t: "message", id: id, text: text }));
+    sending = true;
+    files
+      .reduce(function (p, f) {
+        return p.then(function (ids) {
+          return upload(f).then(function (up) {
+            ids.push(up);
+            return ids;
+          });
+        });
+      }, Promise.resolve([]))
+      .then(function (ids) {
+        socket.send(JSON.stringify({ t: "message", id: id, text: text, files: ids }));
+      })
+      .catch(function () {
+        showNotice("The files could not be read.");
+      })
+      .then(function () {
+        sending = false;
+      });
+  }
+
+  if (attachEl) {
+    attachEl.addEventListener("change", function () {
+      var picked = Array.prototype.slice.call(attachEl.files || []);
+      var kept = picked.filter(function (f) { return f.size > 0 && f.size <= MAX_FILE; }).slice(0, MAX_FILES);
+      chosen = kept;
+      showNotice(kept.length < picked.length ? "Up to " + MAX_FILES + " files of 8 MB each can be sent; some were left out." : "");
+      showChosen();
+      attachEl.value = "";
+    });
   }
 
   form.addEventListener("submit", function (e) {

@@ -58,10 +58,11 @@ export default {
         method,
         headers: {
           authorization: `Bot ${token}`,
-          "content-type": "application/json",
+          // A form (a file upload) sets its own content type with the boundary.
+          ...(body instanceof FormData ? {} : { "content-type": "application/json" }),
           "user-agent": "DiscordBot (https://github.com/getdipakkumar2008-coder/NexusClaw, 0.1.0)",
         },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(body === undefined ? {} : { body: body instanceof FormData ? body : JSON.stringify(body) }),
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (res.status === 204) return undefined;
@@ -301,7 +302,7 @@ export default {
 
     ctx.registerChannel({
       id: "discord",
-      capabilities: { typing: true, groups: true, maxTextChars: 2000 },
+      capabilities: { typing: true, groups: true, maxTextChars: 2000, files: true },
 
       async start(h) {
         host = h;
@@ -346,9 +347,19 @@ export default {
         if (target.replyTo && /^\d+$/.test(String(target.replyTo)) && servers.has(target.conversationId)) {
           body.message_reference = { message_id: String(target.replyTo), fail_if_not_exists: false };
         }
+        const file = Array.isArray(content.files) ? content.files[0] : undefined;
         for (let attempt = 0; ; attempt++) {
           try {
-            const sent = await api("POST", `/channels/${encodeURIComponent(target.conversationId)}/messages`, body);
+            let payload = body;
+            let timeoutMs = 15_000;
+            if (file) {
+              // The message and the file go up together as one form; the text becomes the file's caption.
+              payload = new FormData();
+              payload.append("payload_json", JSON.stringify({ ...body, attachments: [{ id: 0, filename: String(file.name).slice(0, 100) }] }));
+              payload.append("files[0]", new Blob([Buffer.from(file.data, "base64")], { type: file.mime }), String(file.name).slice(0, 100));
+              timeoutMs = 60_000;
+            }
+            const sent = await api("POST", `/channels/${encodeURIComponent(target.conversationId)}/messages`, payload, { timeoutMs });
             return { messageId: String(sent.id) };
           } catch (e) {
             // Discord says how long to wait when it is rate-limiting; honour short waits once, otherwise let the Gateway retry.

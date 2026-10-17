@@ -32,8 +32,8 @@ export default {
       const timeout = AbortSignal.timeout(timeoutMs);
       const res = await fetch(`${apiBase}/bot${token}/${method}`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body ?? {}),
+        // A form (a file upload) sets its own content type with the boundary.
+        ...(body instanceof FormData ? { body } : { headers: { "content-type": "application/json" }, body: JSON.stringify(body ?? {}) }),
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
       });
       let json;
@@ -172,9 +172,24 @@ export default {
       }
     }
 
+    /** One file, as a photo, audio or document. The Gateway has already checked what it is; Telegram only ever gets our bot's upload. */
+    async function sendFile(target, file, caption) {
+      const [method, field] = file.mime === "image/png" || file.mime === "image/jpeg" ? ["sendPhoto", "photo"] : file.mime === "audio/mpeg" || file.mime === "audio/mp4" ? ["sendAudio", "audio"] : ["sendDocument", "document"];
+      const form = new FormData();
+      form.append("chat_id", String(Number(target.conversationId)));
+      if (caption) form.append("caption", String(caption).slice(0, 1024));
+      form.append(field, new Blob([Buffer.from(file.data, "base64")], { type: file.mime }), String(file.name).slice(0, 100));
+      try {
+        const sent = await api(method, form, { timeoutMs: 60_000 });
+        return { messageId: `${target.conversationId}:${sent.message_id}` };
+      } catch (e) {
+        throw new Error(clean(e));
+      }
+    }
+
     ctx.registerChannel({
       id: "telegram",
-      capabilities: { typing: true, groups: true, maxTextChars: 4096 },
+      capabilities: { typing: true, groups: true, maxTextChars: 4096, files: true },
 
       async start(h) {
         host = h;
@@ -211,6 +226,8 @@ export default {
       },
 
       async send(target, content) {
+        const file = Array.isArray(content.files) ? content.files[0] : undefined;
+        if (file) return sendFile(target, file, content.text);
         const body = { chat_id: Number(target.conversationId), text: content.text, disable_web_page_preview: true };
         const replyId = target.replyTo ? Number(String(target.replyTo).split(":").pop()) : NaN;
         // Reply to the asking message in groups so people can tell who is being answered; direct chats need no thread.

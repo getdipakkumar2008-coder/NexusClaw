@@ -130,6 +130,9 @@ const SCHEMA: readonly string[] = [
      created_at INTEGER NOT NULL
    ) WITHOUT ROWID;
    ALTER TABLE messages ADD COLUMN attachments TEXT;`,
+  // v10: a reply can carry a file. The row names the stored file (id, name, type, size); the bytes are read from the
+  // blob store when the row is sent, so the outbox itself stays small.
+  `ALTER TABLE outbox ADD COLUMN files TEXT;`,
 ];
 
 export const SCHEMA_VERSION = SCHEMA.length;

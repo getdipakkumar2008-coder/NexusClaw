@@ -7,6 +7,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CONFORMANCE_LIMITS, createBed, defineConformance, waitFor, type Bed, type ConformanceBed, type ConformanceSetup } from "@clawnexus/channels";
 import { PluginHost, type SecretStore } from "./host.js";
+import { parseMultipart } from "./multipart.js";
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -31,6 +32,8 @@ class FakeDiscord {
   readonly identifies: Array<Record<string, unknown>> = [];
   readonly resumes: Array<Record<string, unknown>> = [];
   readonly files = new Map<string, Buffer>();
+  /** Files the bot uploaded with a message. */
+  readonly uploads: Array<{ channel: string; payload: Record<string, unknown>; file: { field: string; name: string; type: string; data: Buffer } }> = [];
   readonly cdnGets: Array<{ url: string; auth: string | undefined }> = [];
   connections = 0;
   validToken = TOKEN;
@@ -112,8 +115,12 @@ class FakeDiscord {
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    let raw = "";
-    for await (const c of req) raw += c as string;
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const bytes = Buffer.concat(chunks);
+    const raw = bytes.toString("utf8");
+    const contentType = String(req.headers["content-type"] ?? "");
+    const form = contentType.startsWith("multipart/form-data") ? parseMultipart(bytes, contentType) : undefined;
     if (req.method === "GET" && (req.url ?? "").startsWith("/cdn/")) {
       // Discord's file hosts need no credentials; seeing one here would mean the bot token leaked to a file download.
       this.cdnGets.push({ url: req.url!, auth: req.headers["authorization"] });
@@ -121,7 +128,8 @@ class FakeDiscord {
       res.writeHead(bytes ? 200 : 404);
       return void res.end(bytes ?? "gone");
     }
-    const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    const payloadPart = form?.find((p) => p.name === "payload_json");
+    const body = payloadPart ? (JSON.parse(payloadPart.data.toString("utf8")) as Record<string, unknown>) : raw && !form ? (JSON.parse(raw) as Record<string, unknown>) : {};
     const auth = req.headers["authorization"];
     this.restAuth.push(auth);
     if (auth !== `Bot ${this.validToken}`) return this.reply(res, 401, { message: "401: Unauthorized", code: 0 });
@@ -140,6 +148,8 @@ class FakeDiscord {
       this.failSends--;
       return this.reply(res, 500, { message: "Internal Server Error" });
     }
+    const filePart = form?.find((p) => p.filename !== undefined);
+    if (filePart) this.uploads.push({ channel: m[1]!, payload: body, file: { field: filePart.name, name: filePart.filename!, type: filePart.type ?? "", data: filePart.data } });
     this.sent.push({
       channel: m[1]!,
       content: body["content"] as string,
@@ -410,6 +420,21 @@ describe("the Discord plugin", () => {
       expect(att[0]).toMatchObject({ name: "pic.png", mime: "image/png" }); // not "text/html", whatever Discord was told
       expect(att[0]!.read()).toEqual(PNG);
       expect(fake.cdnGets).toEqual([{ url: "/cdn/pic.png", auth: undefined }]);
+    });
+
+    it("uploads a file with the message as one form, and still cannot ping anyone", async () => {
+      const r = await ready();
+      fake.push({ channel_id: "742", author: who, content: "hello", mentions: [] });
+      await waitFor(() => fake.sent.some((s) => s.content.includes("echo: hello")));
+      const session = r.bed.sessions!.list()[0]!.id;
+      const put = r.bed.blobs.put(PNG, "image/png");
+      r.bed.manager.sendFile(session, { id: put.id, name: "chart.png", mime: "image/png", bytes: PNG.length }, "@everyone here you go");
+      await waitFor(() => fake.uploads.length === 1);
+      const u = fake.uploads[0]!;
+      expect(u.channel).toBe("742");
+      expect(u.file).toMatchObject({ field: "files[0]", name: "chart.png", type: "image/png" });
+      expect(u.file.data).toEqual(PNG);
+      expect(u.payload).toMatchObject({ content: "@everyone here you go", allowed_mentions: { parse: [], replied_user: false }, attachments: [{ id: 0, filename: "chart.png" }] });
     });
 
     it("will not fetch a file from an address that is not Discord's, whatever the message says", async () => {

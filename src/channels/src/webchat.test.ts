@@ -447,3 +447,118 @@ describe("conversation", () => {
     expect(acks.some((a) => a["status"] === "limited")).toBe(true);
   });
 });
+
+describe("sending files from the browser", () => {
+  const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("....IHDR a small picture")]);
+  const EXE = Buffer.concat([Buffer.from("MZ"), Buffer.from([0x90, 0, 3, 0, 0, 0, 4, 0])]);
+
+  async function owner(r: Rig): Promise<Visitor> {
+    const link = r.adapter.createOwnerLink("http://127.0.0.1:1");
+    const v = r.visitor();
+    await v.open();
+    await v.hello({ redeem: /#owner=(.+)$/.exec(link.url)![1] });
+    return v;
+  }
+  const pieces = (v: Visitor, up: string, name: string, data: Buffer, size = 10): void => {
+    const n = Math.max(1, Math.ceil(data.length / size));
+    for (let i = 0; i < n; i++) v.send({ t: "file", up, name, seq: i, last: i === n - 1, data: data.subarray(i * size, (i + 1) * size).toString("base64") });
+  };
+  const status = async (v: Visitor, up: string): Promise<string> => {
+    await waitFor(() => v.frames.some((f) => f.t === "file" && f.up === up));
+    return String(v.frames.find((f) => f.t === "file" && f.up === up)!["status"]);
+  };
+
+  it("puts the pieces together and hands the whole file to the Gateway with the message", async () => {
+    current = await rig();
+    const v = await owner(current);
+    pieces(v, "up-pic-001", "pic.png", PNG);
+    expect(await status(v, "up-pic-001")).toBe("ready");
+    v.send({ t: "message", id: "msg-file-01", text: "what is this?", files: ["up-pic-001"] });
+    await waitFor(() => v.frames.some((f) => f.t === "ack" && f.id === "msg-file-01"));
+    expect(v.frames.find((f) => f.t === "ack" && f.id === "msg-file-01")!["status"]).toBe("accepted");
+    expect(current.bed.blobs.stats()).toEqual({ count: 1, bytes: PNG.length });
+    expect(current.bed.provider!.calls[0]!.attachments![0]).toMatchObject({ name: "pic.png", mime: "image/png" });
+  });
+
+  it("can be a message with only a file; a message with neither is a broken frame", async () => {
+    current = await rig();
+    const v = await owner(current);
+    pieces(v, "up-pic-002", "pic.png", PNG);
+    await status(v, "up-pic-002");
+    v.send({ t: "message", id: "msg-file-02", text: "", files: ["up-pic-002"] });
+    await waitFor(() => v.frames.some((f) => f.t === "ack" && f.id === "msg-file-02"));
+    v.send({ t: "message", id: "msg-file-03", text: "  " });
+    await waitFor(() => v.closed !== undefined);
+    expect(v.closed?.code).toBe(1008);
+  });
+
+  it("is judged by what the file is: a program is stored by no one and the message still goes through", async () => {
+    current = await rig();
+    const v = await owner(current);
+    pieces(v, "up-exe-001", "invoice.pdf", EXE);
+    expect(await status(v, "up-exe-001")).toBe("ready"); // the browser side only assembles; the Gateway decides
+    v.send({ t: "message", id: "msg-file-04", text: "open this", files: ["up-exe-001"] });
+    await waitFor(() => v.frames.some((f) => f.t === "ack" && f.id === "msg-file-04"));
+    expect(current.bed.blobs.stats().count).toBe(0);
+  });
+
+  it("is not available to someone who is not paired, and nothing is kept for them", async () => {
+    current = await rig();
+    const v = current.visitor();
+    await v.open();
+    await v.hello();
+    pieces(v, "up-stranger", "pic.png", PNG);
+    expect(await status(v, "up-stranger")).toBe("not_paired");
+    v.send({ t: "message", id: "msg-file-05", text: "hi", files: ["up-stranger"] });
+    await waitFor(() => v.frames.some((f) => f.t === "ack" && f.id === "msg-file-05"));
+    expect(v.frames.find((f) => f.t === "ack" && f.id === "msg-file-05")!["status"]).toBe("ignored");
+    expect(current.bed.blobs.stats().count).toBe(0);
+  });
+
+  it("refuses pieces out of order, damaged pieces, too many open files and files that are too big", async () => {
+    current = await rig();
+    const v = await owner(current);
+    v.send({ t: "file", up: "up-order-01", name: "a", seq: 1, last: true, data: "AAAA" });
+    expect(await status(v, "up-order-01")).toBe("bad_order");
+    v.send({ t: "file", up: "up-bad64-01", name: "a", seq: 0, last: true, data: "***!" });
+    expect(await status(v, "up-bad64-01")).toBe("damaged");
+    for (let i = 0; i < 9; i++) v.send({ t: "file", up: `up-open-${i}00`, name: "a", seq: 0, last: false, data: "AAAA" });
+    expect(await status(v, "up-open-800")).toBe("too_many");
+  });
+
+  it("stops a file that grows past the limit, and frees what it held", async () => {
+    current = await rig();
+    const v = await owner(current);
+    const piece = Buffer.alloc(192 * 1024, 65).toString("base64");
+    for (let i = 0; i < 44; i++) v.send({ t: "file", up: "up-big-0001", name: "a", seq: i, last: false, data: piece }); // 44 x 192 KB is over 8 MB
+    expect(await status(v, "up-big-0001")).toBe("too_large");
+    // the space is free again: a normal file still goes up
+    pieces(v, "up-after-01", "pic.png", PNG);
+    expect(await status(v, "up-after-01")).toBe("ready");
+  });
+
+  it("receives a file the assistant sends, in a frame of its own, and only on the browser it belongs to", async () => {
+    current = await rig();
+    const v = await owner(current);
+    const other = await owner(current);
+    await v.say("hello-0001", "hi");
+    await waitFor(() => v.texts().some((t) => t.includes("echo: hi")));
+    const session = current.bed.sessions!.list()[0]!.id;
+    const put = current.bed.blobs.put(PNG, "image/png");
+    current.bed.manager.sendFile(session, { id: put.id, name: "chart.png", mime: "image/png", bytes: PNG.length }, "here");
+    await waitFor(() => v.frames.some((f) => Array.isArray(f["files"])));
+    const frame = v.frames.find((f) => Array.isArray(f["files"]))!;
+    expect(frame).toMatchObject({ t: "message", from: "assistant", text: "here", files: [{ name: "chart.png", mime: "image/png" }] });
+    expect(Buffer.from((frame["files"] as Array<{ data: string }>)[0]!.data, "base64")).toEqual(PNG);
+    expect(other.frames.some((f) => Array.isArray(f["files"]))).toBe(false);
+  });
+
+  it("closes a connection that sends a large frame before saying hello", async () => {
+    current = await rig();
+    const v = current.visitor();
+    await v.open();
+    v.send({ t: "hello", secret: "x".repeat(40_000), redeem: null });
+    await waitFor(() => v.closed !== undefined);
+    expect([1009, 1008]).toContain(v.closed?.code);
+  });
+});

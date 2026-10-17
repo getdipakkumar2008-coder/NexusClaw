@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /** Semver of this SDK. Only symbols exported here are public API (docs/04 section 4). */
-export const SDK_VERSION = "0.3.1";
+export const SDK_VERSION = "0.3.2";
 
 export const pluginKindSchema = z.enum(["code", "bundle"]);
 
@@ -155,6 +155,8 @@ export const channelRegistrationSchema = z.strictObject({
     typing: z.boolean(),
     groups: z.boolean(),
     maxTextChars: z.number().int().min(1).max(100_000),
+    /** Can send a file with a message (see `send`). Leave out if not. */
+    files: z.boolean().optional(),
   }),
 });
 export type ChannelRegistration = z.infer<typeof channelRegistrationSchema>;
@@ -214,7 +216,11 @@ export interface PluginChannelDefinition extends ChannelRegistration {
   start(host: PluginChannelHost): void | Promise<void>;
   /** Disconnect. Called before the plugin process ends. */
   stop(): void | Promise<void>;
-  /** Send text to a conversation. The Gateway already splits it to `maxTextChars`; throw to have it retried. */
-  send(target: ChannelTarget, content: { text: string }): { messageId?: string } | void | Promise<{ messageId?: string } | void>;
+  /**
+   * Send text to a conversation. The Gateway already splits it to `maxTextChars`; throw to have it retried.
+   * If you declared `files: true`, `content.files` may hold one file (at most 8 MB, `data` is base64). `text` may then be
+   * empty, and is a caption. The Gateway has already checked the file; upload it to the platform's own hosts only.
+   */
+  send(target: ChannelTarget, content: { text: string; files?: Array<{ name: string; mime: string; data: string }> }): { messageId?: string } | void | Promise<{ messageId?: string } | void>;
   typing?(target: ChannelTarget, on: boolean): void | Promise<void>;
 }

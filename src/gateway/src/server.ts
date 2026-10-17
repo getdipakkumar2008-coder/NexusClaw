@@ -20,7 +20,7 @@ import {
   type ErrorBody,
 } from "@clawnexus/protocol";
 import { DeviceError, DeviceRegistry } from "@clawnexus/devices";
-import { BlobStore, isBlobId } from "@clawnexus/blobs";
+import { BlobStore, findScanHook, isBlobId, scanHook } from "@clawnexus/blobs";
 import { isLoopback, type Config } from "@clawnexus/config";
 import { EventLog, CursorExpiredError, openDb, type Db, type StoredEvent } from "@clawnexus/store";
 import { PairingError, PairingService } from "@clawnexus/pairing";
@@ -31,6 +31,7 @@ import { ChannelManager, WEBCHAT_ID, WebChatAdapter } from "@clawnexus/channels"
 import { PluginError, PluginHost, type HostOptions } from "@clawnexus/plugins";
 import { LocalVault, VaultError } from "@clawnexus/vault";
 import { SessionError, SessionManager, type Provider, type Session, type SessionManagerOptions } from "@clawnexus/sessions";
+import { fileSendTool } from "./filetool.js";
 import { MemoryError, MemoryStore, memoryTools, renderContext, type MemoryScope, type ScopeDecision } from "@clawnexus/memory";
 
 export interface GatewayOptions {
@@ -227,7 +228,7 @@ export class Gateway {
       events: this.events,
       approvals: this.approvals,
       guard: new WorkspaceGuard([workspace]),
-      tools: [...BUILTIN_TOOLS, ...memoryTools({ store: this.memory, scopeFor: (env) => this.memoryScopeFor(env.principal, env.session) })],
+      tools: [...BUILTIN_TOOLS, ...memoryTools({ store: this.memory, scopeFor: (env) => this.memoryScopeFor(env.principal, env.session) }), fileSendTool({ channels: () => this.channels, sessions: () => this.sessions, blobs: () => this.blobs })],
     });
     this.vault = new LocalVault(opts.dataDir);
     this.plugins = new PluginHost({ dataDir: opts.dataDir, db: this.db, events: this.events, tools: this.tools, secrets: this.vault, channels: { attach: (a) => this.channels.attach(a), detach: (id) => this.channels.detach(id) }, now: this.o.now, ...opts.plugins });
@@ -241,7 +242,8 @@ export class Gateway {
       principalOf: (externalId) => this.pairing.principalOf({ channel: WEBCHAT_ID, accountId: "default", externalId }),
       now: this.o.now,
     });
-    this.channels = new ChannelManager({ db: this.db, events: this.events, pairing: this.pairing, sessions: this.sessions, blobs: this.blobs, now: this.o.now });
+    const scanner = findScanHook(opts.dataDir);
+    this.channels = new ChannelManager({ db: this.db, events: this.events, pairing: this.pairing, sessions: this.sessions, blobs: this.blobs, ...(scanner ? { scan: scanHook(scanner) } : {}), now: this.o.now });
     this.channels.register(this.webchat);
 
     const handler = (req: IncomingMessage, res: import("node:http").ServerResponse): void => this.handleHttp(req, res);
@@ -532,6 +534,7 @@ export class Gateway {
           /* a damaged row refers to nothing */
         }
       }
+      for (const id of this.channels.outboxFileIds()) referenced.add(id); // files still waiting to be sent
       return this.blobs.gc(referenced);
     } catch {
       return { removed: 0, freed: 0 };

@@ -101,6 +101,8 @@ try {
   check(/gateway\.listening/.test(cli("logs").out), "the log records the start");
   check(!/[0-9]{6,}:[A-Za-z0-9_-]{30,}|xox[bp]-/.test(cli("logs", "--lines", "500").out), "and holds no credentials");
   check(cli("doctor").out.includes("database"), "doctor runs");
+  const sec = cli("doctor", "--security");
+  check(sec.code === 0 && sec.out.includes("sec:exposure"), "doctor --security passes on the installed default");
 
   const made = cli("tls", "init", "--host", "gw.example.org");
   check(made.code === 0 && /fingerprint: [0-9A-F]{2}(:[0-9A-F]{2}){31}/.test(made.out), "a certificate can be made (no openssl needed)");

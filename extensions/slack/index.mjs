@@ -48,8 +48,9 @@ export default {
     async function api(method, token, body, { timeoutMs = 15_000 } = {}) {
       const res = await fetch(`${apiBase}/${method}`, {
         method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify(body ?? {}),
+        // Starting an upload is the one call Slack wants as a form; everything else is JSON.
+        headers: { authorization: `Bearer ${token}`, "content-type": body instanceof URLSearchParams ? "application/x-www-form-urlencoded" : "application/json; charset=utf-8" },
+        body: body instanceof URLSearchParams ? body : JSON.stringify(body ?? {}),
         signal: AbortSignal.timeout(timeoutMs),
       });
       let json;
@@ -265,9 +266,42 @@ export default {
       }
     }
 
+    /**
+     * Upload one file in Slack's three steps: ask for an upload address, send the bytes there, then share the file into
+     * the conversation. The address must be on Slack's own file host (never a name taken from anywhere else), and the bot
+     * token is sent only to the API, not to the upload address.
+     */
+    async function sendFile(target, file, caption) {
+      const bytes = Buffer.from(file.data, "base64");
+      const name = String(file.name).slice(0, 100);
+      try {
+        const slot = await api("files.getUploadURLExternal", botToken, new URLSearchParams({ filename: name, length: String(bytes.length) }), { timeoutMs: 30_000 });
+        let u;
+        try {
+          u = new URL(String(slot.upload_url));
+        } catch {
+          throw new Error("Slack gave an unusable upload address");
+        }
+        const hosts = new Set(["files.slack.com", new URL(apiBase).host]);
+        if (!hosts.has(u.host) || (u.protocol !== "https:" && !isLocal(`${u.protocol}//${u.host}`))) throw new Error("Slack gave an upload address that is not Slack's");
+        const up = await fetch(u, { method: "POST", headers: { "content-type": "application/octet-stream" }, body: bytes, signal: AbortSignal.timeout(60_000) });
+        if (!up.ok) throw new Error(`the upload was refused (${up.status})`);
+        const thread = target.replyTo ? threads.get(String(target.replyTo)) : undefined;
+        const done = await api(
+          "files.completeUploadExternal",
+          botToken,
+          { files: [{ id: slot.file_id, title: name }], channel_id: target.conversationId, ...(caption ? { initial_comment: escapeOut(caption) } : {}), ...(thread ? { thread_ts: thread } : {}) },
+          { timeoutMs: 30_000 },
+        );
+        return { messageId: `${target.conversationId}:${done.files?.[0]?.id ?? slot.file_id}` };
+      } catch (e) {
+        throw new Error(clean(e));
+      }
+    }
+
     ctx.registerChannel({
       id: "slack",
-      capabilities: { typing: false, groups: true, maxTextChars: 3000 },
+      capabilities: { typing: false, groups: true, maxTextChars: 3000, files: true },
 
       async start(h) {
         host = h;
@@ -303,6 +337,8 @@ export default {
       },
 
       async send(target, content) {
+        const file = Array.isArray(content.files) ? content.files[0] : undefined;
+        if (file) return sendFile(target, file, content.text);
         const body = { channel: target.conversationId, text: escapeOut(content.text), mrkdwn: false, link_names: false, unfurl_links: false, unfurl_media: false };
         // In channels, answer in the thread of the message that asked, so replies stay together.
         const thread = target.replyTo ? threads.get(String(target.replyTo)) : undefined;

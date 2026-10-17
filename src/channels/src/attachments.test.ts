@@ -111,3 +111,50 @@ describe("files that come with a message", () => {
     expect(await say(adapter, "m2", { text: "x", attachments: four })).toMatchObject({ result: "invalid" });
   });
 });
+
+describe("files going out", () => {
+  async function talking(caps: Record<string, unknown> = { files: true }): Promise<{ adapter: FakeAdapter; bed: Bed; session: string }> {
+    const adapter = new FakeAdapter("fake", caps);
+    bed = await createBed({ adapters: [adapter], provider: new FakeProvider({ chunkSize: 1000, reply: () => "seen" }) });
+    bed.pairing.registerOwner({ channel: "fake", accountId: "default", externalId: "owner1" });
+    await say(adapter, "m1", { text: "hello" });
+    await waitFor(() => adapter.sent.length === 1);
+    return { adapter, bed, session: bed.sessions!.list()[0]!.id };
+  }
+  const file = (b: Bed, data = PNG, mime = "image/png") => ({ ...b.blobs.put(data, mime), name: "x.png", mime, bytes: data.length });
+
+  it("goes to the conversation of the session, in order after earlier replies, with the stored bytes", async () => {
+    const { adapter, bed: b, session } = await talking();
+    b.manager.sendFile(session, file(b), "caption");
+    await waitFor(() => adapter.sent.length === 2);
+    expect(adapter.sent[1]).toMatchObject({ conversationId: "owner1", text: "caption", files: [{ name: "x.png", mime: "image/png", data: b64(PNG) }] });
+    await waitFor(() => b.events.readSince(0, { limit: 5000 }).some((e) => e.type === "channel.file_sent"));
+    expect(JSON.stringify(b.events.readSince(0, { limit: 5000 }))).not.toContain(b64(PNG));
+  });
+
+  it("is refused, with words the model can use, when the channel cannot carry files or the session is not on a channel", async () => {
+    const { bed: b, session } = await talking({});
+    expect(() => b.manager.sendFile(session, file(b))).toThrow(/cannot carry files/);
+    const local = b.sessions!.getOrCreate({ channel: "local", conversation: "main", scope: "owner" });
+    expect(() => b.manager.sendFile(local.id, file(b))).toThrow(/not on a running messaging channel/);
+  });
+
+  it("is given up on, not sent empty, when the stored file has gone", async () => {
+    const { adapter, bed: b, session } = await talking();
+    const f = file(b, Buffer.concat([PNG, Buffer.from("gone soon")]));
+    adapter.failSends = 1; // the first attempt fails, so the reply is still waiting when the file goes missing
+    b.manager.sendFile(session, f, "will not arrive");
+    await waitFor(() => b.manager.outbox.summary().pending === 1 && adapter.failSends === 0);
+    b.blobs.gc(new Set(), 0); // the store loses it before the reply is sent
+    await waitFor(() => b.manager.outbox.summary().failed >= 1 || adapter.sent.length > 1);
+    expect(adapter.sent).toHaveLength(1);
+  });
+
+  it("waits in the outbox while the platform is down and arrives when it is back", async () => {
+    const { adapter, bed: b, session } = await talking();
+    adapter.failSends = 1;
+    b.manager.sendFile(session, file(b));
+    await waitFor(() => adapter.sent.length === 2, 10_000);
+    expect(adapter.sent[1]!.files).toHaveLength(1);
+  });
+});

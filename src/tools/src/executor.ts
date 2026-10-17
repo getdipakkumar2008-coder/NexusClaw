@@ -182,7 +182,7 @@ export class ToolExecutor {
       if (approvals.list().filter((x) => x.requester === req.principalId).length >= MAX_PENDING_PER_REQUESTER) {
         return this.finish(req, "denied", { status: "denied", reason: "too many approvals are already waiting for the owner" }, def);
       }
-      const a = approvals.create({ tool: def.name, args, requester: req.principalId });
+      const a = approvals.create({ tool: def.name, args, requester: req.principalId, ...(req.session === undefined ? {} : { session: req.session }) });
       this.o.events.append([
         {
           type: "approval.requested",
@@ -199,7 +199,7 @@ export class ToolExecutor {
     if (existing.state === "pending") return { status: "approval_required", approvalId: existing.id, reason: "still waiting for the owner" };
     if (existing.state === "denied") return this.finish(req, "denied", { status: "denied", reason: "the owner denied this call" }, def);
     // approved: spend it. Fails if it is for different arguments, expired or already used.
-    if (!approvals.consume(req.approvalId, def.name, args)) {
+    if (!approvals.consume(req.approvalId, def.name, args, req.session)) {
       return this.finish(req, "error", { status: "error", code: "BAD_APPROVAL", message: `approval is ${existing.state} or does not match this call` }, def);
     }
     return undefined;

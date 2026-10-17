@@ -61,7 +61,7 @@ class FakeSocket {
 }
 
 function load(hash = "") {
-  const ids = ["log", "form", "input", "send", "status", "notice", "typing"];
+  const ids = ["log", "form", "input", "send", "status", "notice", "typing", "attach", "files"];
   const els = Object.fromEntries(ids.map((i) => [i, new El()])) as Record<string, El>;
   els["notice"]!.hidden = true;
   const storage: Record<string, string> = {};
@@ -70,6 +70,18 @@ function load(hash = "") {
   const win = {
     location: { hash, pathname: "/webchat", protocol: "http:", host: "127.0.0.1:7391" },
     history: { replaceState: (_a: unknown, _b: string, url: string) => replaced.push(url) },
+    btoa: (s: string) => Buffer.from(s, "latin1").toString("base64"),
+    atob: (s: string) => {
+      if (/[^A-Za-z0-9+/=]/.test(s)) throw new Error("InvalidCharacterError"); // like the browser's
+      return Buffer.from(s, "base64").toString("latin1");
+    },
+    URL: { createObjectURL: () => "blob:fake" },
+    Blob: class {
+      constructor(
+        readonly parts: unknown[],
+        readonly options: { type?: string },
+      ) {}
+    },
     localStorage: { getItem: (k: string) => storage[k] ?? null, setItem: (k: string, v: string) => void (storage[k] = v) },
     crypto: { randomUUID: () => "11111111-2222-3333-4444-555555555555", getRandomValues: (a: Uint8Array) => a },
     setTimeout: (fn: () => void) => timers.push(fn),
@@ -81,6 +93,7 @@ function load(hash = "") {
     JSON,
     Array,
     Uint8Array,
+    Promise,
   };
   FakeSocket.last = undefined;
   vm.runInNewContext(readFileSync(new URL("../assets/app.js", import.meta.url), "utf8"), sandbox);
@@ -205,5 +218,52 @@ describe("the browser page script", () => {
     p.sock.onmessage?.({ data: "not json" });
     p.sock.deliver({ t: "unknown-frame", x: 1 });
     expect(p.els["log"]!.children).toHaveLength(0);
+  });
+
+  it("sends picked files in pieces, then the message that names them, and shows names as text", async () => {
+    const p = load();
+    p.sock.onopen?.();
+    p.sock.deliver({ t: "ready", role: "guest" });
+    const big = new Uint8Array(200 * 1024).fill(65); // more than one piece
+    const el = p.els["attach"] as unknown as { files: unknown[]; value: string };
+    el.files = [
+      { name: "<b>pic</b>.png", size: big.length, arrayBuffer: async () => big.buffer },
+      { name: "empty.txt", size: 0, arrayBuffer: async () => new ArrayBuffer(0) },
+    ];
+    p.els["attach"]!.fire("change");
+    expect(p.els["files"]!.hidden).toBe(false);
+    expect(p.els["files"]!.children.map((c) => c.textContent)).toEqual(["<b>pic</b>.png"]); // the empty one is left out
+    p.els["input"]!.value = "look";
+    p.els["form"]!.fire("submit", { preventDefault() {} });
+    await new Promise((r) => setTimeout(r, 20));
+    const frames = p.sock.sent.slice(1) as Array<Record<string, unknown>>;
+    expect(frames.map((x) => x["t"])).toEqual(["file", "file", "message"]);
+    expect(frames[0]).toMatchObject({ seq: 0, last: false, name: "<b>pic</b>.png" });
+    expect(frames[1]).toMatchObject({ seq: 1, last: true });
+    expect(frames[2]).toMatchObject({ text: "look", files: [frames[0]!["up"]] });
+    expect(Buffer.from(frames[0]!["data"] as string, "base64").length + Buffer.from(frames[1]!["data"] as string, "base64").length).toBe(big.length);
+    expect(p.els["log"]!.children[0]!.textContent).toBe("look\nAttached: <b>pic</b>.png");
+    expect(p.els["files"]!.hidden).toBe(true);
+  });
+
+  it("offers a file from the assistant as a download, never as something to open in the page", () => {
+    const p = load();
+    p.sock.onopen?.();
+    p.sock.deliver({ t: "ready", role: "owner" });
+    p.sock.deliver({ t: "message", from: "assistant", text: "", files: [{ name: "<img src=x>.png", mime: "text/html", data: Buffer.from("<script>alert(1)</script>").toString("base64") }] });
+    const entry = p.els["log"]!.children[0] as unknown as { className: string; children: Array<{ href: string; download: string; textContent: string; rel: string }> };
+    expect(entry.className).toBe("msg bot file");
+    const link = entry.children[0]!;
+    expect(link).toMatchObject({ href: "blob:fake", download: "<img src=x>.png", textContent: "Download <img src=x>.png", rel: "noopener" });
+    p.sock.deliver({ t: "message", from: "assistant", text: "", files: [{ name: "x", mime: "text/plain", data: "%%%not base64%%%" }] });
+    expect(p.els["log"]!.children[1]!.textContent).toMatch(/could not be shown/);
+  });
+
+  it("explains why a file did not go up", () => {
+    const p = load();
+    p.sock.onopen?.();
+    p.sock.deliver({ t: "ready", role: "unpaired" });
+    p.sock.deliver({ t: "file", up: "x", status: "not_paired" });
+    expect(p.els["notice"]!.textContent).toMatch(/approved/);
   });
 });

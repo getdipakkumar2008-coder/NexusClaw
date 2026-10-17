@@ -8,7 +8,7 @@ the plugin connects out to Slack, so you do not need a public address, a domain 
 1. Go to api.slack.com/apps and create an app (from scratch) in your workspace.
 2. **Socket Mode**: turn it on. Slack asks you to create an app-level token with the `connections:write` scope; copy it
    (it starts with `xapp-`).
-3. **OAuth & Permissions**: add the bot scopes `chat:write`, `im:history`, `app_mentions:read` and `files:read`. Install the app to
+3. **OAuth & Permissions**: add the bot scopes `chat:write`, `im:history`, `app_mentions:read`, `files:read` and `files:write`. Install the app to
    the workspace and copy the **Bot User OAuth Token** (it starts with `xoxb-`).
 4. **Event Subscriptions**: turn them on and subscribe the bot to the events `message.im` and `app_mention`. Nothing
    else is needed.
@@ -53,3 +53,5 @@ the plugin connects out to Slack, so you do not need a public address, a domain 
 
 It asks for the network (`slack.com` and its sub-domains) and two secrets (`bot_token`, `app_token`). The network
 permission is **not enforced** by the system, so you are trusting this code, which is small and readable: `index.mjs`.
+
+- Files the assistant sends (it asks you to approve each one, and only into the conversation it is in) are uploaded to Slack's own file host (files.slack.com). Pictures, PDF, audio and text up to 8 MB. This needs the bot scope `files:write`.

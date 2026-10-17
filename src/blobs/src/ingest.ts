@@ -1,5 +1,12 @@
 import { BlobError, type BlobStore } from "./store.js";
-import { sniff } from "./sniff.js";
+import { sniff, type BlobMime } from "./sniff.js";
+import { stripMetadata } from "./clean.js";
+
+/**
+ * An optional check run on every file that passed the type test, before it is kept. It returns a reason to refuse the file,
+ * or undefined to accept it. If it throws, the file is refused: a check that cannot run is not a check that passed.
+ */
+export type ScanFile = (file: { bytes: Buffer; name: string; mime: BlobMime }) => Promise<string | undefined>;
 
 /** What an adapter hands over for one attached file. `data` is the file itself, base64; without it only a note can be made. */
 export interface RawAttachment {
@@ -44,30 +51,68 @@ const B64 = /^[A-Za-z0-9+/_-]*={0,2}$/;
  * Decide what to do with each file that came with a message, and store the ones that are acceptable. Every file ends up
  * in the result, accepted or not, so the model and the owner can see that something was sent and what became of it.
  */
-export function ingestAttachments(raw: readonly RawAttachment[], store: BlobStore, limits: IngestLimits = DEFAULT_INGEST): AttachmentRef[] {
+export async function ingestAttachments(raw: readonly RawAttachment[], store: BlobStore, limits: IngestLimits = DEFAULT_INGEST, scan?: ScanFile): Promise<AttachmentRef[]> {
   const out: AttachmentRef[] = [];
   let total = 0;
-  raw.forEach((a, i) => {
+  for (const [i, a] of raw.entries()) {
     const name = safeName(a.name, i);
     const drop = (why: string): void => void out.push({ name, ...(a.bytes !== undefined ? { bytes: a.bytes } : {}), dropped: why });
-    if (i >= limits.maxFiles) return drop(`only the first ${limits.maxFiles} files of a message are taken`);
-    if (a.data === undefined) return drop("the file was not downloaded");
-    if (a.data.length > Math.ceil((limits.maxFileBytes * 4) / 3) + 8) return drop("the file is too large");
-    if (!B64.test(a.data)) return drop("the file's data is damaged");
-    const bytes = Buffer.from(a.data, "base64");
-    if (bytes.length === 0) return drop("the file is empty");
-    if (bytes.length > limits.maxFileBytes) return drop("the file is too large");
-    if (total + bytes.length > limits.maxMessageBytes) return drop("this message's files are too large together");
-    const mime = sniff(bytes);
-    if (mime === undefined) return drop("this kind of file is not accepted (images, PDF, audio and text are)");
+    if (i >= limits.maxFiles) {
+      drop(`only the first ${limits.maxFiles} files of a message are taken`);
+      continue;
+    }
+    if (a.data === undefined) {
+      drop("the file was not downloaded");
+      continue;
+    }
+    if (a.data.length > Math.ceil((limits.maxFileBytes * 4) / 3) + 8) {
+      drop("the file is too large");
+      continue;
+    }
+    if (!B64.test(a.data)) {
+      drop("the file's data is damaged");
+      continue;
+    }
+    const original = Buffer.from(a.data, "base64");
+    if (original.length === 0) {
+      drop("the file is empty");
+      continue;
+    }
+    if (original.length > limits.maxFileBytes) {
+      drop("the file is too large");
+      continue;
+    }
+    if (total + original.length > limits.maxMessageBytes) {
+      drop("this message's files are too large together");
+      continue;
+    }
+    const mime = sniff(original);
+    if (mime === undefined) {
+      drop("this kind of file is not accepted (images, PDF, audio and text are)");
+      continue;
+    }
+    // Hidden personal data in pictures (location, camera, owner name) is cut out before the file is looked at or kept.
+    const bytes = stripMetadata(original, mime);
+    if (scan) {
+      let verdict: string | undefined;
+      try {
+        verdict = await scan({ bytes, name, mime });
+      } catch {
+        verdict = "the file check could not be run";
+      }
+      if (verdict !== undefined) {
+        drop(verdict);
+        continue;
+      }
+    }
     try {
       const { id } = store.put(bytes, mime);
-      total += bytes.length;
+      total += original.length;
       out.push({ id, name, mime, bytes: bytes.length });
     } catch (e) {
-      if (e instanceof BlobError) return drop(e.code === "FULL" ? "the attachment store is full" : e.message);
-      throw e;
+      if (e instanceof BlobError) drop(e.code === "FULL" ? "the attachment store is full" : e.message);
+      else throw e;
     }
-  });
+  }
   return out;
 }

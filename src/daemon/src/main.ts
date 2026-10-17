@@ -7,6 +7,7 @@ import { BRAND } from "@clawnexus/brand";
 import { CliError, defaultDataDir, parseArgs, reportError, runCli, strFlag, systemIo, type Io } from "@clawnexus/cli";
 import { createBackup, restoreBackup } from "./backup.js";
 import { formatChecks, runDoctor } from "./doctor.js";
+import { runSecurityDoctor } from "./security.js";
 import { runGateway } from "./serve.js";
 import { runMcpBridge } from "./mcpbridge.js";
 import { runProviderTest } from "./providertest.js";
@@ -82,7 +83,7 @@ export async function main(argv: readonly string[], io: Io = systemIo()): Promis
         return await runProviderTest({ dataDir, io, json, prompt: strFlag(p, "prompt"), timeoutMs: strFlag(p, "timeout") === undefined ? undefined : Number(strFlag(p, "timeout")) * 1000 });
       }
       case "doctor": {
-        const checks = await runDoctor({ dataDir, fix: p.flags.fix === true, ...(port === undefined ? {} : { port }) });
+        const checks = p.flags.security === true ? await runSecurityDoctor({ dataDir, fix: false, ...(port === undefined ? {} : { port }) }) : await runDoctor({ dataDir, fix: p.flags.fix === true, ...(port === undefined ? {} : { port }) });
         io.out(json ? `${JSON.stringify(checks, null, 2)}\n` : formatChecks(checks));
         return checks.some((c) => c.status === "fail") ? 1 : 0;
       }

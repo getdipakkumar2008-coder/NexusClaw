@@ -77,4 +77,25 @@ describe("ApprovalStore", () => {
     expect(store.get("nope")).toBeUndefined();
     expect(() => store.decide("nope", true, owner)).toThrow(/unknown/);
   });
+
+  it("cannot be spent in a different conversation than the one it was asked in", () => {
+    const { store } = mk();
+    const a = store.create({ tool: "file.send", args: { path: "a.png" }, requester: "x", session: "s1" });
+    store.decide(a.id, true, owner);
+    expect(store.consume(a.id, "file.send", { path: "a.png" }, "s2")).toBe(false);
+    expect(store.consume(a.id, "file.send", { path: "a.png" })).toBe(false);
+    expect(store.consume(a.id, "file.send", { path: "a.png" }, "s1")).toBe(true);
+  });
+
+  it("forgets finished approvals after an hour, and never forgets one still waiting", () => {
+    let t = 0;
+    const store = new ApprovalStore(() => t, 2 * 3_600_000);
+    const done = store.create({ tool: "t", args: {}, requester: "x" });
+    store.decide(done.id, false, owner);
+    const waiting = store.create({ tool: "t", args: { n: 2 }, requester: "x" });
+    t += 3_600_001;
+    store.create({ tool: "t", args: { n: 3 }, requester: "x" });
+    expect(store.get(done.id)).toBeUndefined();
+    expect(store.get(waiting.id)?.state).toBe("pending");
+  });
 });

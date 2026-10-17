@@ -1,6 +1,6 @@
 import { PairingError, type PairingService } from "@clawnexus/pairing";
-import { ingestAttachments, safeName, DEFAULT_INGEST, type AttachmentRef, type BlobStore, type IngestLimits } from "@clawnexus/blobs";
-import { Outbox } from "./outbox.js";
+import { ingestAttachments, safeName, DEFAULT_INGEST, type AttachmentRef, type BlobStore, type IngestLimits, type ScanFile } from "@clawnexus/blobs";
+import { Outbox, type OutboxFile } from "./outbox.js";
 import { SessionError, type SessionManager } from "@clawnexus/sessions";
 import type { Db, EventLog, StoredEvent } from "@clawnexus/store";
 import {
@@ -14,8 +14,12 @@ import {
   type ChannelStatus,
   type InboundMessage,
   type InboundOutcome,
+  type OutboundContent,
   type SendTarget,
 } from "./types.js";
+
+/** Why a file could not be sent; the message is written for the model and the owner. */
+export class ChannelFileError extends Error {}
 
 export interface ChannelManagerOptions {
   db: Db;
@@ -23,6 +27,8 @@ export interface ChannelManagerOptions {
   blobs?: BlobStore;
   /** Limits on the files taken from one message. */
   ingest?: Partial<IngestLimits>;
+  /** A check run on each accepted-looking file before it is kept (see docs/05). */
+  scan?: ScanFile;
   events: EventLog;
   pairing: PairingService;
   /** Absent when no model provider is configured; paired senders then get a "not ready" notice. */
@@ -347,7 +353,7 @@ export class ChannelManager {
     if (msg.attachments && msg.attachments.length > 0) {
       const blobs = this.c.blobs;
       refs = blobs
-        ? ingestAttachments(msg.attachments, blobs, { ...DEFAULT_INGEST, ...this.c.ingest })
+        ? await ingestAttachments(msg.attachments, blobs, { ...DEFAULT_INGEST, ...this.c.ingest }, this.c.scan)
         : msg.attachments.map((a, i) => ({ name: safeName(a.name, i), dropped: "this Gateway does not take attachments" }));
       const kept = refs.filter((r) => r.id !== undefined).length;
       if (kept < refs.length) this.audit("channel.attachments_dropped", { channel: msg.channel, count: refs.length - kept, reasons: [...new Set(refs.flatMap((r) => (r.dropped ? [r.dropped] : [])))].slice(0, 5) });
@@ -502,6 +508,30 @@ export class ChannelManager {
     }
   }
 
+  // ---------------- files out ----------------
+
+  /**
+   * Send one already-stored file to the conversation a session belongs to. There is no destination argument: a file can
+   * only go back to the people the session is with. Throws a ChannelFileError whose message is fit to show the model.
+   */
+  sendFile(sessionId: string, file: OutboxFile, caption = ""): void {
+    const sessions = this.c.sessions;
+    if (!sessions) throw new ChannelFileError("the assistant is not ready");
+    const s = sessions.get(sessionId);
+    const bar = s.conversation.indexOf("|");
+    const entry = this.entries.get(s.channel);
+    if (bar < 1 || !entry || entry.detached || !entry.started) throw new ChannelFileError("this conversation is not on a running messaging channel, so there is nobody to send a file to");
+    if (!entry.adapter.capabilities.files) throw new ChannelFileError(`the ${s.channel} channel cannot carry files`);
+    const target: SendTarget = { channel: s.channel, accountId: s.conversation.slice(0, bar), conversationId: s.conversation.slice(bar + 1) };
+    if (!this.outbox.enqueueFile(target, file, caption.slice(0, entry.adapter.capabilities.maxTextChars))) throw new ChannelFileError("too many messages are waiting to be delivered");
+    void this.pump(target.channel, target.accountId, target.conversationId);
+  }
+
+  /** Stored files that waiting replies still need. */
+  outboxFileIds(): string[] {
+    return this.outbox.fileIds();
+  }
+
   // ---------------- outbox ----------------
 
   /** Put the replies that gave up back in the queue and try again. */
@@ -548,10 +578,22 @@ export class ChannelManager {
           this.wakeLater(key, wait, { channel, accountId, conversationId });
           return;
         }
+        let content: OutboundContent = { text: row.text };
+        if (row.files) {
+          const f = row.files[0] as OutboxFile;
+          const bytes = entry.adapter.capabilities.files ? this.c.blobs?.read(f.id) : undefined;
+          if (bytes === undefined) {
+            this.outbox.failGroup(row.group, entry.adapter.capabilities.files ? "the file is no longer stored" : "this channel cannot carry files");
+            this.audit("channel.send_failed", { channel, accountId, error: "file could not be read" });
+            continue;
+          }
+          content = { text: row.text, files: [{ name: f.name, mime: f.mime, data: bytes.toString("base64") }] };
+        }
         this.outbox.begin(row.id);
         try {
-          await withTimeout(entry.adapter.send(row.target, { text: row.text }), this.o.adapterTimeoutMs, `sending on ${channel}`);
+          await withTimeout(entry.adapter.send(row.target, content), this.o.adapterTimeoutMs, `sending on ${channel}`);
           this.outbox.done(row.id);
+          if (row.files) this.audit("channel.file_sent", { channel, accountId, mime: row.files[0]?.mime, bytes: row.files[0]?.bytes });
         } catch (e) {
           if (this.stopped) return;
           const error = scrub(e instanceof Error ? e.message : "send failed");

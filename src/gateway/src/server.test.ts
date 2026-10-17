@@ -442,7 +442,7 @@ describe("tools over the wire", () => {
     await boot();
     const c = await authed();
     await c.call("events.subscribe");
-    expect((await c.call("tool.list")).result.tools.map((t: { name: string }) => t.name)).toEqual(["fs.read", "fs.list", "fs.write", "exec.run", "memory.search", "memory.read", "memory.write", "memory.delete"]);
+    expect((await c.call("tool.list")).result.tools.map((t: { name: string }) => t.name)).toEqual(["fs.read", "fs.list", "fs.write", "exec.run", "memory.search", "memory.read", "memory.write", "memory.delete", "file.send"]);
 
     const w = await c.call("tool.call", { tool: "fs.write", args: { path: "hello.txt", content: "hi" } });
     expect(w.result.status).toBe("ok");
@@ -494,7 +494,7 @@ describe("tool bridge credentials (model-driven tool calls)", () => {
     await boot();
     const { c } = await agent();
     const tools = (await c.call("tool.list")).result.tools as Array<{ name: string; inputSchema: { type: string; properties: Record<string, unknown> } }>;
-    expect(tools.map((t) => t.name)).toEqual(["fs.read", "fs.list", "fs.write", "exec.run", "memory.search", "memory.read", "memory.write", "memory.delete"]);
+    expect(tools.map((t) => t.name)).toEqual(["fs.read", "fs.list", "fs.write", "exec.run", "memory.search", "memory.read", "memory.write", "memory.delete", "file.send"]);
     expect(tools.find((t) => t.name === "fs.write")?.inputSchema.properties).toHaveProperty("content");
     expect(JSON.stringify(tools)).not.toContain("$schema");
   });

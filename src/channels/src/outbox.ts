@@ -9,11 +9,20 @@ import type { SendTarget } from "./types.js";
  * message and the row being deleted, that message is sent again. The attempt is counted BEFORE sending, so a message that
  * keeps crashing the Gateway still gives up.
  */
+/** A stored file waiting to go out with a reply. */
+export interface OutboxFile {
+  id: string;
+  name: string;
+  mime: string;
+  bytes: number;
+}
+
 export interface OutboxRow {
   id: number;
   group: string;
   target: SendTarget;
   text: string;
+  files?: OutboxFile[];
   createdAt: number;
   attempts: number;
   nextAt: number;
@@ -29,6 +38,7 @@ interface Raw {
   conversation_id: string;
   reply_to: string | null;
   text: string;
+  files: string | null;
   created_at: number;
   attempts: number;
   next_at: number;
@@ -36,11 +46,25 @@ interface Raw {
   last_error: string | null;
 }
 
+function parseFiles(raw: string | null): OutboxFile[] | undefined {
+  if (raw === null) return undefined;
+  try {
+    const list = (JSON.parse(raw) as unknown[]).filter((f): f is OutboxFile => {
+      const x = f as Partial<OutboxFile> | null;
+      return typeof x?.id === "string" && typeof x.name === "string" && typeof x.mime === "string" && typeof x.bytes === "number";
+    });
+    return list.length ? list : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const toRow = (r: Raw): OutboxRow => ({
   id: r.id,
   group: r.grp,
   target: { channel: r.channel, accountId: r.account_id, conversationId: r.conversation_id, ...(r.reply_to === null ? {} : { replyTo: r.reply_to }) },
   text: r.text,
+  ...(parseFiles(r.files) ? { files: parseFiles(r.files) as OutboxFile[] } : {}),
   createdAt: r.created_at,
   attempts: r.attempts,
   nextAt: r.next_at,
@@ -92,6 +116,25 @@ export class Outbox {
       pieces.forEach((text, i) => ins.run(grp, target.channel, target.accountId, target.conversationId, i === 0 ? (target.replyTo ?? null) : null, text, at, at));
     });
     return true;
+  }
+
+  /** Queue one file, with an optional caption, as a single message. Returns false if the outbox is full. */
+  enqueueFile(target: SendTarget, file: OutboxFile, caption = ""): boolean {
+    const total = (this.db.prepare("SELECT COUNT(*) AS n FROM outbox WHERE state = 'pending'").get() as { n: number }).n;
+    const mine = (this.db.prepare("SELECT COUNT(*) AS n FROM outbox WHERE state = 'pending' AND channel = ? AND account_id = ? AND conversation_id = ?").get(target.channel, target.accountId, target.conversationId) as { n: number }).n;
+    if (total + 1 > this.maxPending || mine + 1 > this.maxPerConversation) return false;
+    const at = this.now();
+    this.db
+      .prepare("INSERT INTO outbox(grp, channel, account_id, conversation_id, reply_to, text, files, created_at, next_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(randomBytes(8).toString("hex"), target.channel, target.accountId, target.conversationId, target.replyTo ?? null, caption, JSON.stringify([file]), at, at);
+    return true;
+  }
+
+  /** Ids of the stored files that rows still need (so the store does not clean them up). */
+  fileIds(): string[] {
+    const ids: string[] = [];
+    for (const r of this.db.prepare("SELECT files FROM outbox WHERE files IS NOT NULL").all() as unknown as Array<{ files: string }>) for (const f of parseFiles(r.files) ?? []) ids.push(f.id);
+    return ids;
   }
 
   /** The next piece to send for one conversation, if any. Expired pieces (and the rest of their reply) are failed first. */

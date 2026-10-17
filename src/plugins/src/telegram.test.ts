@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CONFORMANCE_LIMITS, createBed, defineConformance, waitFor, type Bed, type ConformanceBed, type ConformanceSetup } from "@clawnexus/channels";
 import { PluginHost, type SecretStore } from "./host.js";
+import { parseMultipart } from "./multipart.js";
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -31,6 +32,8 @@ class FakeTelegram {
   /** Files a person has sent, by Telegram file id. */
   readonly files = new Map<string, Buffer>();
   readonly fileGets: string[] = [];
+  /** Files the bot uploaded: which method, the fields, and the file. */
+  readonly uploads: Array<{ method: string; fields: Record<string, string>; file: { field: string; name: string; type: string; data: Buffer } }> = [];
   validToken = TOKEN;
   failSends = 0;
   rateLimitOnce = false;
@@ -66,8 +69,10 @@ class FakeTelegram {
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    let raw = "";
-    for await (const c of req) raw += c as string;
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    const bytes = Buffer.concat(chunks);
+    const raw = bytes.toString("utf8");
     const fileUrl = /^\/file\/bot([^/]+)\/dl\/(.+)$/.exec(req.url ?? "");
     if (fileUrl) {
       this.fileGets.push(`${fileUrl[1]}:${fileUrl[2]}`);
@@ -76,11 +81,26 @@ class FakeTelegram {
       return void res.end(bytes ?? "not found");
     }
     const m = /^\/bot([^/]+)\/(\w+)$/.exec(req.url ?? "");
-    const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    const contentType = String(req.headers["content-type"] ?? "");
+    const form = contentType.startsWith("multipart/form-data") ? parseMultipart(bytes, contentType) : undefined;
+    const body = form ? {} : raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
     if (!m) return this.reply(res, 404, { ok: false, error_code: 404, description: "Not Found" });
     const [, token, method] = m as unknown as [string, string, string];
     this.calls.push({ method, token, body });
     if (token !== this.validToken) return this.reply(res, 401, { ok: false, error_code: 401, description: "Unauthorized" });
+    if (form) {
+      const file = form.find((p) => p.filename !== undefined);
+      if (this.failSends > 0) {
+        this.failSends--;
+        return this.reply(res, 500, { ok: false, error_code: 500, description: "Internal Server Error" });
+      }
+      this.uploads.push({
+        method,
+        fields: Object.fromEntries(form.filter((p) => p.filename === undefined).map((p) => [p.name, p.data.toString("utf8")])),
+        file: { field: file?.name ?? "", name: file?.filename ?? "", type: file?.type ?? "", data: file?.data ?? Buffer.alloc(0) },
+      });
+      return this.reply(res, 200, { ok: true, result: { message_id: this.nextMessage++ } });
+    }
     switch (method) {
       case "getMe":
         return this.reply(res, 200, { ok: true, result: BOT });
@@ -340,6 +360,48 @@ describe("the Telegram plugin", () => {
       const refs = r.bed.provider!.calls[0]!.messages.at(-1)!.attachments!;
       expect(refs.find((x) => x.name === "voice.ogg")).toMatchObject({ mime: "audio/ogg" });
       expect(refs.find((x) => x.name === "invoice.pdf")?.dropped).toMatch(/not accepted/);
+    });
+
+    describe("sending a file out", () => {
+      async function talking(): Promise<{ r: Awaited<ReturnType<typeof rig>>; session: string }> {
+        const r = await ready();
+        fake.push({ ...dm, text: "hello" });
+        await waitFor(() => fake.sent.some((s) => s.text.includes("echo: hello")));
+        return { r, session: r.bed.sessions!.list()[0]!.id };
+      }
+      const stored = (r: Awaited<ReturnType<typeof rig>>, data: Buffer, mime: string, name: string) => ({ ...r.bed.blobs.put(data, mime), name, mime, bytes: data.length });
+
+      it("uploads a picture as a photo with its caption, to the chat it belongs to", async () => {
+        const { r, session } = await talking();
+        r.bed.manager.sendFile(session, stored(r, PNG, "image/png", "chart.png"), "here you go");
+        await waitFor(() => fake.uploads.length === 1);
+        const u = fake.uploads[0]!;
+        expect(u.method).toBe("sendPhoto");
+        expect(u.fields).toMatchObject({ chat_id: "20", caption: "here you go" });
+        expect(u.file).toMatchObject({ field: "photo", name: "chart.png", type: "image/png" });
+        expect(u.file.data).toEqual(PNG);
+        expect(fake.calls.filter((c) => c.method === "sendPhoto").every((c) => c.token === TOKEN)).toBe(true);
+      });
+
+      it("uploads other kinds as documents or audio, and a file alone needs no caption", async () => {
+        const { r, session } = await talking();
+        const text = Buffer.from("just some notes");
+        r.bed.manager.sendFile(session, stored(r, text, "text/plain", "notes.txt"));
+        r.bed.manager.sendFile(session, stored(r, Buffer.concat([Buffer.from("ID3"), Buffer.from([3, 0, 0, 0, 0, 0, 0])]), "audio/mpeg", "song.mp3"));
+        await waitFor(() => fake.uploads.length === 2);
+        expect(fake.uploads.map((u) => [u.method, u.file.field, u.file.name, u.fields["caption"]])).toEqual([
+          ["sendDocument", "document", "notes.txt", undefined],
+          ["sendAudio", "audio", "song.mp3", undefined],
+        ]);
+      });
+
+      it("keeps a file in the outbox and retries it when Telegram fails, without losing it", async () => {
+        const { r, session } = await talking();
+        fake.failSends = 1;
+        r.bed.manager.sendFile(session, stored(r, PNG, "image/png", "retry.png"));
+        await waitFor(() => fake.uploads.length === 1, 15_000);
+        await waitFor(() => (r.bed.db.prepare("SELECT COUNT(*) AS n FROM outbox").get() as { n: number }).n === 0, 10_000);
+      });
     });
 
     it("notes videos and stickers without fetching them, and does not fetch what is too big", async () => {

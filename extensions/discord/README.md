@@ -49,3 +49,5 @@ Discord, so you do not need a public address, a domain or a certificate.
 
 It asks for the network (`discord.com`, `gateway.discord.gg`) and one secret (`bot_token`). The network permission is
 **not enforced** by the system, so you are trusting this code, which is small and readable: `index.mjs`.
+
+- Files the assistant sends (it asks you to approve each one, and only into the conversation it is in) are uploaded to Discord together with the message. Pictures, PDF, audio and text up to 8 MB.

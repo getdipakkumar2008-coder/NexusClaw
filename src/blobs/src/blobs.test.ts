@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb, type Db } from "@clawnexus/store";
-import { BlobError, BlobStore, DEFAULT_INGEST, ingestAttachments, isBlobId, safeName, sniff } from "./index.js";
+import { BlobError, BlobStore, DEFAULT_INGEST, ingestAttachments, isBlobId, safeName, scanHook, sniff, stripMetadata } from "./index.js";
 
 const b = (...parts: Array<number[] | string>): Buffer => Buffer.concat(parts.map((p) => (typeof p === "string" ? Buffer.from(p, "latin1") : Buffer.from(p))));
 const PNG = b([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], "....IHDR rest of a picture");
@@ -166,17 +166,17 @@ describe("ingestAttachments", () => {
   });
   const att = (buf: Buffer, name = "f", extra: Record<string, unknown> = {}) => ({ name, data: buf.toString("base64"), ...extra });
 
-  it("stores what is acceptable and says what it is, from its content", () => {
-    const refs = ingestAttachments([att(PNG, "../photo.png", { mimeType: "application/x-msdownload" }), att(Buffer.from("notes"), "n.txt")], store);
+  it("stores what is acceptable and says what it is, from its content", async () => {
+    const refs = await ingestAttachments([att(PNG, "../photo.png", { mimeType: "application/x-msdownload" }), att(Buffer.from("notes"), "n.txt")], store);
     expect(refs[0]).toMatchObject({ name: "photo.png", mime: "image/png", bytes: PNG.length }); // the claimed type is ignored
     expect(refs[1]).toMatchObject({ name: "n.txt", mime: "text/plain" });
     expect(refs.every((r) => r.id !== undefined && r.dropped === undefined)).toBe(true);
     expect(store.read(refs[0]!.id!)).toEqual(PNG);
   });
 
-  it("drops, with a reason, what it cannot or will not take, and stores none of it", () => {
+  it("drops, with a reason, what it cannot or will not take, and stores none of it", async () => {
     const exe = b("MZ", [0x90, 0, 3, 0]);
-    const refs = ingestAttachments(
+    const refs = await ingestAttachments(
       [
         att(Buffer.alloc(DEFAULT_INGEST.maxFileBytes + 1, 65), "huge.txt"),
         att(exe, "invoice.pdf", { mimeType: "application/pdf" }), // a program called a PDF
@@ -198,27 +198,143 @@ describe("ingestAttachments", () => {
     expect(store.stats().count).toBe(0);
   });
 
-  it("takes only the first few files and a bounded total", () => {
+  it("takes only the first few files and a bounded total", async () => {
     const many = Array.from({ length: 6 }, (_, i) => att(Buffer.from(`file number ${i}`), `f${i}.txt`));
-    const refs = ingestAttachments(many, store);
+    const refs = await ingestAttachments(many, store);
     expect(refs).toHaveLength(6);
     expect(refs.filter((r) => r.id).length).toBe(4);
     expect(refs[4]?.dropped).toMatch(/first 4/);
     const big = (n: number) => att(Buffer.alloc(n, 66), `big${n}.txt`);
-    const together = ingestAttachments([big(6_000_000), big(6_000_001), big(6_000_002)], store, { ...DEFAULT_INGEST, maxMessageBytes: 13_000_000 });
+    const together = await ingestAttachments([big(6_000_000), big(6_000_001), big(6_000_002)], store, { ...DEFAULT_INGEST, maxMessageBytes: 13_000_000 });
     expect(together.map((r) => (r.id ? "kept" : "dropped"))).toEqual(["kept", "kept", "dropped"]);
     expect(together[2]?.dropped).toMatch(/together/);
   });
 
-  it("says when the store is full rather than failing the message", () => {
+  it("says when the store is full rather than failing the message", async () => {
     const small = new BlobStore(join(dir, "tiny"), db, { maxTotalBytes: 10 });
-    const refs = ingestAttachments([att(Buffer.from("this is longer than ten bytes"), "t.txt")], small);
+    const refs = await ingestAttachments([att(Buffer.from("this is longer than ten bytes"), "t.txt")], small);
     expect(refs[0]).toMatchObject({ dropped: "the attachment store is full" });
   });
 
-  it("does not trust a name for anything", () => {
-    const refs = ingestAttachments([att(Buffer.from("x"), "../../../etc/cron.d/evil\u0000.sh")], store);
+  it("does not trust a name for anything", async () => {
+    const refs = await ingestAttachments([att(Buffer.from("x"), "../../../etc/cron.d/evil\u0000.sh")], store);
     expect(refs[0]?.name).toBe("evil.sh");
     expect(readFileSync(join(dir, "blobs", refs[0]!.id!.slice(0, 2), refs[0]!.id!), "utf8")).toBe("x"); // stored under its hash, whatever it was called
+  });
+});
+
+const u16 = (n: number): number[] => [n >> 8, n & 255];
+const u32 = (n: number): number[] => [n >>> 24, (n >> 16) & 255, (n >> 8) & 255, n & 255];
+const jpegSeg = (marker: number, body: string): Buffer => b([0xff, marker], u16(body.length + 2), body);
+const pngChunk = (type: string, body: string): Buffer => b(u32(body.length), type, body, [0, 0, 0, 0]);
+
+describe("stripMetadata: personal data out of pictures", () => {
+  const jpeg = (...segs: Buffer[]): Buffer => Buffer.concat([b([0xff, 0xd8]), ...segs, b([0xff, 0xda], u16(4), [0, 0], "SCANDATA", [0xff, 0xd9])]);
+  const png = (...chunks: Buffer[]): Buffer => Buffer.concat([b([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), pngChunk("IHDR", "0123456789012"), ...chunks, pngChunk("IDAT", "pixels"), pngChunk("IEND", "")]);
+
+  it("removes location, camera and comments from a JPEG and keeps the picture and its colour profile", () => {
+    const dirty = jpeg(jpegSeg(0xe0, "JFIF-ok"), jpegSeg(0xe1, "Exif GPS 51.5N 0.1W"), jpegSeg(0xe1, "XMP owner name"), jpegSeg(0xe2, "ICC-profile"), jpegSeg(0xed, "IPTC caption"), jpegSeg(0xfe, "a comment"));
+    const clean = stripMetadata(dirty, "image/jpeg");
+    const text = clean.toString("latin1");
+    for (const gone of ["GPS", "XMP", "IPTC", "comment"]) expect(text).not.toContain(gone);
+    for (const kept of ["JFIF-ok", "ICC-profile", "SCANDATA"]) expect(text).toContain(kept);
+    expect(sniff(clean)).toBe("image/jpeg");
+  });
+
+  it("removes text, EXIF and time chunks from a PNG and keeps the rest intact", () => {
+    const dirty = png(pngChunk("tEXt", "Author Someone"), pngChunk("eXIf", "GPS data"), pngChunk("tIME", "1234567"), pngChunk("iCCP", "profile"), pngChunk("zTXt", "x"), pngChunk("iTXt", "y"));
+    const clean = stripMetadata(dirty, "image/png");
+    const text = clean.toString("latin1");
+    for (const gone of ["tEXt", "eXIf", "tIME", "zTXt", "iTXt", "Someone"]) expect(text).not.toContain(gone);
+    for (const kept of ["IHDR", "iCCP", "IDAT", "IEND"]) expect(text).toContain(kept);
+    expect(clean.length).toBeLessThan(dirty.length);
+  });
+
+  it("returns anything it cannot follow exactly as it came, and never throws", () => {
+    const odd: Array<[Buffer, "image/jpeg" | "image/png"]> = [
+      [b([0xff, 0xd8, 0xff, 0xe1, 0xff, 0xff], "short"), "image/jpeg"], // a block longer than the file
+      [b([0xff, 0xd8]), "image/jpeg"],
+      [PNG, "image/png"], // not made of chunks
+      [Buffer.concat([png(), b("trailing bytes")]), "image/png"], // data after the end
+      [b([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], u32(0xffffffff), "IHDR"), "image/png"],
+    ];
+    for (const [file, mime] of odd) expect(stripMetadata(file, mime)).toEqual(file);
+    expect(stripMetadata(GIF, "image/jpeg")).toEqual(GIF);
+  });
+
+  it("is applied before a picture is kept, so the stored copy has none of it", async () => {
+    const dir2 = mkdtempSync(join(tmpdir(), "cn-clean-"));
+    const db2 = openDb(join(dir2, "g.db"));
+    try {
+      const store2 = new BlobStore(join(dir2, "blobs"), db2);
+      const dirty = jpeg(jpegSeg(0xe1, "Exif GPS 51.5N"));
+      const [ref] = await ingestAttachments([{ name: "p.jpg", data: dirty.toString("base64") }], store2);
+      expect(ref?.id).toBeDefined();
+      expect(store2.read(ref!.id!)?.toString("latin1")).not.toContain("GPS");
+      expect(ref?.bytes).toBe(store2.read(ref!.id!)?.length);
+    } finally {
+      db2.close();
+      rmSync(dir2, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+});
+
+describe("the file check", () => {
+  it("can refuse a file, is told what it is, and a check that fails refuses too", async () => {
+    const dir2 = mkdtempSync(join(tmpdir(), "cn-scan-"));
+    const db2 = openDb(join(dir2, "g.db"));
+    try {
+      const store2 = new BlobStore(join(dir2, "blobs"), db2);
+      const seen: string[] = [];
+      const files = [{ name: "a.txt", data: Buffer.from("fine").toString("base64") }, { name: "b.txt", data: Buffer.from("bad one").toString("base64") }, { name: "c.txt", data: Buffer.from("boom").toString("base64") }];
+      const refs = await ingestAttachments(files, store2, DEFAULT_INGEST, async (f) => {
+        seen.push(`${f.name}:${f.mime}`);
+        if (f.bytes.toString() === "bad one") return "the file check refused it";
+        if (f.bytes.toString() === "boom") throw new Error("scanner crashed");
+        return undefined;
+      });
+      expect(seen).toEqual(["a.txt:text/plain", "b.txt:text/plain", "c.txt:text/plain"]);
+      expect(refs.map((r) => r.dropped)).toEqual([undefined, "the file check refused it", "the file check could not be run"]);
+      expect(store2.stats().count).toBe(1);
+    } finally {
+      db2.close();
+      rmSync(dir2, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+});
+
+describe("an installed file check program", () => {
+  let dir2: string;
+  beforeEach(() => void (dir2 = mkdtempSync(join(tmpdir(), "cn-hook-"))));
+  afterEach(() => rmSync(dir2, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const program = (code: string): { program: string; args: string[]; workDir: string } => {
+    const script = join(dir2, "scan.cjs");
+    writeFileSync(script, code);
+    return { program: process.execPath, args: [script], workDir: join(dir2, "work") };
+  };
+  const file = { bytes: Buffer.from("hello"), name: "n.txt", mime: "text/plain" as const };
+
+  it("accepts on exit 0, refuses otherwise with a short printable reason, and gets only a copy under a name made here", async () => {
+    const seen = join(dir2, "seen.txt");
+    const code = [
+      'const fs = require("fs");',
+      "const p = process.argv[2];",
+      "const body = fs.readFileSync(p, 'utf8');",
+      `fs.appendFileSync(${JSON.stringify(seen)}, p + '|' + body + '\\n');`,
+      "if (body === 'virus') { console.log('Eicar\\u0007 found'); process.exit(1); }",
+    ].join("\n");
+    const scan = scanHook(program(code));
+    expect(await scan(file)).toBeUndefined();
+    expect(await scan({ ...file, bytes: Buffer.from("virus"), name: "../../etc/passwd" })).toBe("the file check refused it: Eicar found");
+    const lines = readFileSync(seen, "utf8").trim().split("\n");
+    expect(lines).toHaveLength(2);
+    for (const l of lines) expect(l.split("|")[0]).toMatch(/scan-[0-9a-f]{16}\.txt$/); // never the name the sender gave
+    expect(readdirSync(join(dir2, "work"))).toEqual([]); // copies are removed
+  });
+
+  it("refuses when the program is missing or takes too long", async () => {
+    expect(await scanHook({ program: join(dir2, "nope"), workDir: join(dir2, "w") })(file)).toBe("the file check could not be run");
+    const slow = scanHook({ ...program("setTimeout(() => {}, 60000)"), timeoutMs: 300 });
+    expect(await slow(file)).toBe("the file check timed out");
   });
 });

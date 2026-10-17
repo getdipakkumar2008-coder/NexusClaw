@@ -17,9 +17,12 @@
     <div id="notice" class="notice" role="alert" hidden></div>
     <div id="log" role="log" aria-live="polite" aria-label="Conversation"></div>
     <p id="typing" class="typing" hidden>The assistant is typing…</p>
+    <div id="files" class="files" hidden></div>
     <form id="form" autocomplete="off">
       <label for="input" class="sr-only">Your message</label>
       <textarea id="input" rows="2" maxlength="8000" placeholder="Type a message. Enter sends, Shift+Enter adds a line." disabled></textarea>
+      <input type="file" id="attach" class="sr-only" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,audio/*,text/plain" disabled>
+      <label for="attach" class="attach">Attach</label>
       <button type="submit" id="send" disabled>Send</button>
     </form>
   </main>

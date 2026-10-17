@@ -82,7 +82,7 @@ Usage: ${BRAND.cli} <command> [options]
 Run the Gateway
   gateway run [--fake-provider]   start the Gateway in this terminal
   setup [--profile P] [--yes]     create the data directory, config and token
-  doctor [--fix]                  check this installation and (with --fix) repair what is safe to repair
+  doctor [--fix | --security]     check this installation; --fix repairs what is safe, --security also reviews risky choices
   devices pair [--name N] [--scopes read,chat,approve]   one-time code for a phone or another computer
   devices list | devices revoke ID
   devices enroll --url wss://HOST:PORT/v1/ws --code CODE [--fingerprint HEX | --ca FILE]   make THIS computer a device of another Gateway
@@ -95,7 +95,7 @@ Run the Gateway
 Talk to a running Gateway
   status                          show Gateway health
   chat <text>                     send a message and stream the reply  [--session ID]
-  sessions list|show|export|delete [ID]  [--format jsonl|markdown]
+  sessions list|show|export|delete [ID]  [--format jsonl|markdown] [--out DIR: also saves the files]
   attachment get ID --out FILE    save a file that came with a message (ids are shown by "sessions show")
   pairing list|approve|deny [CODE]  |  pairing owner <channel> <your-id>
   webchat link                    one-time link that makes a browser the owner (opens the chat page)
@@ -355,8 +355,35 @@ const sessions: Handler = (c) =>
       show(c, r, () => r.messages.map((m) => `[${m.role}${m.sender ? ` ${m.sender}` : ""}] ${m.content}${files(m)}`).join("\n") + "\n");
     } else if (sub === "export") {
       const format = strFlag(c.p, "format") ?? "jsonl";
-      const r = await g.call<{ content: string }>("session.export", { session: need(c.p, 2, "session id"), format });
-      c.io.out(r.content);
+      const session = need(c.p, 2, "session id");
+      const r = await g.call<{ content: string }>("session.export", { session, format });
+      const dir = strFlag(c.p, "out");
+      if (dir === undefined) c.io.out(r.content);
+      else {
+        // A folder holds the transcript and the files that came with it, so nothing in the conversation is left behind.
+        const root = resolve(dir);
+        if (existsSync(root) && readdirSync(root).length > 0 && c.p.flags["force"] !== true) throw new CliError("EXISTS", `${root} is not empty`, "Choose a new folder, or pass --force.");
+        mkdirSync(join(root, "files"), { recursive: true });
+        writeFileSync(join(root, format === "markdown" ? "transcript.md" : "transcript.jsonl"), r.content);
+        const ids = new Map<string, string>();
+        if (format === "jsonl") {
+          for (const line of r.content.split(String.fromCharCode(10))) {
+            if (!line.includes('"files"')) continue;
+            for (const f of (JSON.parse(line) as { files?: Array<{ id?: string; name: string }> }).files ?? []) if (f.id) ids.set(f.id, f.name);
+          }
+        } else {
+          const m = await g.call<{ messages: Array<{ attachments?: Array<{ id?: string; name: string }> }> }>("session.get", { session });
+          for (const msg of m.messages) for (const f of msg.attachments ?? []) if (f.id) ids.set(f.id, f.name);
+        }
+        let saved = 0;
+        for (const [id, name] of ids) {
+          const b = await g.call<{ data: string }>("blob.get", { id });
+          const bare = (name.split(/[\\/]/).pop() ?? "file").replace(/[^\w. -]/g, "_") || "file";
+          writeFileSync(join(root, "files", `${id.slice(0, 12)}-${bare}`), Buffer.from(b.data, "base64"), { mode: 0o600 });
+          saved++;
+        }
+        show(c, { exported: root, files: saved }, () => `Saved the conversation and ${saved} file(s) to ${root}.\nThe files came from message senders: open them with care.\n`);
+      }
     } else if (sub === "delete") {
       await g.call("session.delete", { session: need(c.p, 2, "session id") });
       show(c, { deleted: true }, () => "Deleted.\n");

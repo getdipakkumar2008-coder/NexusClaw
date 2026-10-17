@@ -68,7 +68,7 @@ export class FakeAdapter implements ChannelAdapter {
   readonly id: string;
   readonly capabilities: ChannelCapabilities;
   host!: ChannelHost;
-  readonly sent: Array<{ conversationId: string; text: string }> = [];
+  readonly sent: Array<{ conversationId: string; text: string; files?: Array<{ name: string; mime: string; data: string }> }> = [];
   readonly typingLog: Array<{ conversationId: string; on: boolean }> = [];
   /** Fail this many upcoming sends. */
   failSends = 0;
@@ -94,7 +94,7 @@ export class FakeAdapter implements ChannelAdapter {
       this.failSends--;
       throw new Error("platform unavailable");
     }
-    this.sent.push({ conversationId: target.conversationId, text: content.text });
+    this.sent.push({ conversationId: target.conversationId, text: content.text, ...(content.files ? { files: content.files } : {}) });
     return { messageId: `out-${this.sent.length}` };
   }
   async typing(target: SendTarget, on: boolean): Promise<void> {

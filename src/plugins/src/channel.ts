@@ -49,7 +49,7 @@ export class PluginChannelAdapter implements ChannelAdapter {
   async send(target: SendTarget, content: OutboundContent): Promise<SendResult> {
     const r = (await this.proc.call(
       "channel:send",
-      { target: { accountId: target.accountId, conversationId: target.conversationId, ...(target.replyTo ? { replyTo: target.replyTo } : {}) }, content: { text: content.text } },
+      { target: { accountId: target.accountId, conversationId: target.conversationId, ...(target.replyTo ? { replyTo: target.replyTo } : {}) }, content: { text: content.text, ...(content.files?.length ? { files: content.files } : {}) } },
       { timeoutMs: this.timeoutMs },
     )) as { messageId?: unknown } | null;
     const messageId = clip(r?.messageId, 256);

@@ -172,3 +172,29 @@ describe("keeping files tidy", () => {
     expect(existsSync(join(dir, "blobs", id.slice(0, 2), id))).toBe(false);
   });
 });
+
+describe("exporting a conversation that has files", () => {
+  it("records which files came with each message, in both formats, without their bytes", async () => {
+    await boot();
+    const o = await owner();
+    const { sessionId, id } = await messageWithPicture();
+    const jsonl = (await o.call("session.export", { session: sessionId, format: "jsonl" })).result.content as string;
+    const userLine = jsonl.split("\n").map((l) => (l ? JSON.parse(l) : null)).find((m) => m?.role === "user");
+    expect(userLine.files).toEqual([{ id, name: "pic.png", mime: "image/png", bytes: PNG.length }]);
+    expect(jsonl).not.toContain(PNG.toString("base64"));
+    const md = (await o.call("session.export", { session: sessionId, format: "markdown" })).result.content as string;
+    expect(md).toContain(`- file "pic.png" (image/png, ${PNG.length} bytes, ${id.slice(0, 12)})`);
+  });
+
+  it("can be imported again; the record of files is read but not brought back as files", async () => {
+    await boot();
+    const o = await owner();
+    const { sessionId } = await messageWithPicture();
+    const jsonl = (await o.call("session.export", { session: sessionId, format: "jsonl" })).result.content as string;
+    await o.call("session.delete", { session: sessionId });
+    const imported = await o.call("session.import", { content: jsonl });
+    expect(imported.ok).toBe(true);
+    const msgs = (await o.call("session.get", { session: imported.result.session.id })).result.messages as Array<{ attachments?: unknown }>;
+    expect(msgs.every((m) => m.attachments === undefined)).toBe(true);
+  });
+});

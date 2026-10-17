@@ -301,6 +301,21 @@ export class SessionManager {
     await this.idle();
   }
 
+  // ---------------- files in a conversation ----------------
+
+  /** Whether a stored file was part of this session's conversation (sent to it or by it). */
+  hasFile(sessionId: string, blobId: string): boolean {
+    if (!/^[0-9a-f]{64}$/.test(blobId)) return false;
+    return this.db.prepare("SELECT 1 AS x FROM messages WHERE session_id = ? AND attachments LIKE ? LIMIT 1").get(sessionId, `%"id":"${blobId}"%`) !== undefined;
+  }
+
+  /** Record that the assistant sent a file into the conversation, so it shows in the transcript and the file is kept. */
+  recordFileSent(sessionId: string, ref: AttachmentRef, caption: string): void {
+    this.get(sessionId);
+    const content = caption.trim() === "" ? `[sent the file ${JSON.stringify(ref.name)}]` : `[sent the file ${JSON.stringify(ref.name)}] ${caption}`;
+    this.db.prepare("INSERT INTO messages(session_id, role, sender, content, ts, attachments) VALUES (?, 'assistant', '', ?, ?, ?)").run(sessionId, content, this.o.now(), JSON.stringify([ref]));
+  }
+
   // ---------------- transcripts ----------------
 
   exportTranscript(sessionId: string): Transcript {
@@ -310,7 +325,7 @@ export class SessionManager {
       conversation: s.conversation,
       scope: s.scope,
       createdAt: s.createdAt,
-      messages: this.messages(sessionId, { limit: 10_000 }).map((m) => ({ role: m.role, sender: m.sender, content: m.content, ts: m.ts })),
+      messages: this.messages(sessionId, { limit: 10_000 }).map((m) => ({ role: m.role, sender: m.sender, content: m.content, ts: m.ts, ...(m.attachments?.length ? { files: m.attachments } : {}) })),
     };
   }
 

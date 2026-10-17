@@ -5,11 +5,21 @@ export const TRANSCRIPT_VERSION = 1;
 export const MAX_IMPORT_BYTES = 16 * 1024 * 1024;
 export const MAX_IMPORT_MESSAGES = 50_000;
 
+/** A file that came with a message: what it is and where the store keeps it, or why it was not taken. Never the bytes. */
+export interface TranscriptFile {
+  id?: string;
+  name: string;
+  mime?: string;
+  bytes?: number;
+  dropped?: string;
+}
+
 export interface TranscriptMessage {
   role: "user" | "assistant" | "system";
   sender: string;
   content: string;
   ts: number;
+  files?: TranscriptFile[];
 }
 
 export interface Transcript {
@@ -28,18 +38,26 @@ const header = z.strictObject({
   scope: z.string().min(1).max(256),
   createdAt: z.number().int().nonnegative(),
 });
+const file = z.strictObject({
+  id: z.string().max(64).optional(),
+  name: z.string().max(200),
+  mime: z.string().max(100).optional(),
+  bytes: z.number().int().nonnegative().optional(),
+  dropped: z.string().max(300).optional(),
+});
 const message = z.strictObject({
   t: z.literal("message"),
   role: z.enum(["user", "assistant", "system"]),
   sender: z.string().max(256),
   content: z.string().max(256 * 1024),
   ts: z.number().int().nonnegative(),
+  files: z.array(file).max(32).optional(),
 });
 
 export function toJsonl(t: Transcript): string {
   const lines = [
     JSON.stringify({ t: "session", version: TRANSCRIPT_VERSION, channel: t.channel, conversation: t.conversation, scope: t.scope, createdAt: t.createdAt }),
-    ...t.messages.map((m) => JSON.stringify({ t: "message", role: m.role, sender: m.sender, content: m.content, ts: m.ts })),
+    ...t.messages.map((m) => JSON.stringify({ t: "message", role: m.role, sender: m.sender, content: m.content, ts: m.ts, ...(m.files?.length ? { files: m.files } : {}) })),
   ];
   return lines.join("\n") + "\n";
 }
@@ -60,6 +78,7 @@ export function fromJsonl(text: string): Transcript {
   const messages = lines.slice(1).map((l, i): TranscriptMessage => {
     try {
       const m = message.parse(JSON.parse(l));
+      // The files are a record of what was sent, not something to bring back: the store may not hold them here.
       return { role: m.role, sender: m.sender, content: m.content, ts: m.ts };
     } catch {
       throw new TranscriptError(`line ${i + 2} is not a valid message`);
@@ -72,6 +91,11 @@ export function toMarkdown(t: Transcript): string {
   const out = [`# Conversation ${t.channel} / ${t.conversation}`, ""];
   for (const m of t.messages) {
     out.push(`**${m.role}${m.sender ? ` (${m.sender})` : ""}** · ${new Date(m.ts).toISOString()}`, "", m.content, "");
+    for (const f of m.files ?? []) {
+      const label = JSON.stringify(f.name);
+      out.push(f.dropped !== undefined ? `- file ${label}: not taken (${f.dropped})` : `- file ${label} (${f.mime ?? "unknown type"}, ${f.bytes ?? "?"} bytes${f.id ? `, ${f.id.slice(0, 12)}` : ""})`);
+    }
+    if (m.files?.length) out.push("");
   }
   return out.join("\n");
 }

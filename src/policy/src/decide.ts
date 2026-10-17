@@ -69,6 +69,10 @@ export function decide(tool: ToolDescriptor, ctx: CallContext): Decision {
 
     case "owner":
       return decideOwner(r, ctx);
+
+    default:
+      // A principal this code does not know is refused, never waved through (the type says it cannot happen; data from outside might).
+      return deny("unknown principal");
   }
 }
 
