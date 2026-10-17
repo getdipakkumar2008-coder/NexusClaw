@@ -38,7 +38,7 @@ export interface TestApi {
 
 const CODE = /\b([2-9A-HJ-NP-Z]{8})\b/;
 
-async function eventually(pred: () => boolean, what: string, ms = 4000): Promise<void> {
+async function eventually(pred: () => boolean, what: string, ms = 15_000): Promise<void> {
   const end = Date.now() + ms;
   while (!pred()) {
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);

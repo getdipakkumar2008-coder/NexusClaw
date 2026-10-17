@@ -6,8 +6,15 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "dependencies": {
     "@clawnexus/channels": "workspace:*",
     "@clawnexus/plugin-sdk": "workspace:*",
@@ -15,5 +22,9 @@
     "@clawnexus/store": "workspace:*",
     "@clawnexus/tools": "workspace:*",
     "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "ws": "^8.18.0",
+    "@types/ws": "^8.5.0"
   }
 }
